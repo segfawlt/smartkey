@@ -1,0 +1,6 @@
+/target
+/data/sources/
+**/*.rs.bk
+*.swp
+.DS_Store
+.worktrees/

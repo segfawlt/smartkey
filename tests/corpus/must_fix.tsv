@@ -1,0 +1,89 @@
+# SmartKey Golden Must-Fix Corpus
+# Columns (tab-separated): prev_word ('-' for none, '^' for sentence start) | typed_token | boundary_punct ('-' for Space) | expected_output
+
+# --- Real typos captured directly from design session ---
+-	chagnes	-	changes
+-	woryr	-	worry
+-	nothiong	-	nothing
+-	analyssi	-	analysis
+-	suport	-	support
+-	imporovement	-	improvement
+-	prodcut	-	product
+-	soemtimes	-	sometimes
+-	osmething	-	something
+-	beahviour	-	behavior
+-	serveral	-	several
+-	nnext	-	next
+-	implmenet	-	implement
+-	hstiautoin	-	situation
+-	tohught	-	thought
+-	preventation	-	prevention
+-	hte	-	the
+-	everyhtihng	-	everything
+-	hcange	-	change
+-	dictioanry	-	dictionary
+-	apdater	-	adapter
+-	ttoally	-	totally
+-	liek	-	like
+-	cna	-	can
+-	disctionary	-	dictionary
+-	reaosnable	-	reasonable
+
+# --- Contextual bigram disambiguation ---
+over	ther	-	there
+in	ther	-	their
+too	mcu	-	much
+
+# --- Contractions & standalone 'i' ---
+-	im	-	I'm
+-	dont	-	don't
+-	doesnt	-	doesn't
+-	didnt	-	didn't
+-	cant	-	can't
+-	wont	-	won't
+-	ive	-	I've
+-	thats	-	that's
+-	i	-	I
+
+# --- Pinky semicolon & transposed apostrophe contractions ---
+-	don;t	-	don't
+-	can;t	-	can't
+-	didn;t	-	didn't
+-	i;m	-	I'm
+-	do'nt	-	don't
+-	does'nt	-	doesn't
+-	ca'nt	-	can't
+
+# --- Physical Shift & CapsLock timing slips ---
+-	THat's	-	That's
+-	THis	-	This
+-	THen	-	Then
+-	APple	-	Apple
+-	CHagnes	-	Changes
+-	situatioN	:	situation
+-	hellO	!	hello
+-	tHIS	-	This
+-	hELLO	-	Hello
+-	iS	-	Is
+^	tHis	-	This
+^	tHe	-	The
+^	wHat	-	What
+
+# --- Mechanical switch chatter & key bounces ---
+-	thhe	-	the
+-	reallly	-	really
+-	wword	-	word
+-	prooblem	-	problem
+
+# --- Spacebar thumb bottom-row clips & unmerged compounds ---
+-	inbthe	-	in the
+-	andnthe	-	and the
+-	ofthe	-	of the
+-	alot	-	a lot
+-	aswell	-	as well
+-	atleast	-	at least
+-	infront	-	in front
+
+# --- Outer single-quote preservation + lowercase brand case preservation ---
+-	'chagnes'	-	'changes'
+-	githbu	-	github

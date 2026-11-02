@@ -1,0 +1,20 @@
+[package]
+name = "smartkey-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust on-device PC autocorrect and deterministic backspace-learning engine"
+
+[features]
+default = ["bundled-en"]
+bundled-en = []
+
+[dependencies]
+fst.workspace = true
+levenshtein_automata.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

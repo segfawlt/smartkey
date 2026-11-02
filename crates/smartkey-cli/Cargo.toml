@@ -1,0 +1,19 @@
+[package]
+name = "smartkey-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI evaluation suite, score explainer, lexicon compiler, and interactive REPL for SmartKey"
+
+[features]
+default = ["bundled-en"]
+bundled-en = ["smartkey-core/bundled-en"]
+
+[[bin]]
+name = "smartkey"
+path = "src/main.rs"
+
+[dependencies]
+smartkey-core = { path = "../smartkey-core", default-features = false }
+serde_json.workspace = true
+libc = "0.2"
