@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use smartkey_core::{
-    compile_skdict_from_sources, Dialect, EmptyUserRules, EnglishLexicon, EnglishScorer,
-    EvalContext, EvalOutcome, LanguageScorer, ScorerConfig,
+    apply_key_to_buffer, compile_skdict_from_sources, Dialect, EmptyUserRules, EnglishLexicon,
+    EnglishScorer, EvalContext, EvalOutcome, KeyInput, LanguageScorer, Preset, RuleStore,
+    ScorerConfig, SessionAction, SmartKeyEngine, SmartKeySession,
 };
 
 fn workspace_root() -> PathBuf {
@@ -15,6 +16,20 @@ fn workspace_root() -> PathBuf {
         .and_then(|p| p.parent())
         .expect("workspace root")
         .to_path_buf()
+}
+
+fn default_config_dir() -> PathBuf {
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
+        if !xdg.trim().is_empty() {
+            return PathBuf::from(xdg).join("smartkey");
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        if !home.trim().is_empty() {
+            return PathBuf::from(home).join(".config/smartkey");
+        }
+    }
+    PathBuf::from(".smartkey")
 }
 
 fn load_scorer() -> Result<EnglishScorer, String> {
@@ -33,6 +48,131 @@ fn load_scorer() -> Result<EnglishScorer, String> {
     })?;
     let lex = EnglishLexicon::from_owned_bytes(bytes).map_err(|e| e.to_string())?;
     Ok(EnglishScorer::new(lex))
+}
+
+fn load_rule_store(dir: &Path, preset: Preset) -> Result<RuleStore, String> {
+    let rules_path = dir.join("rules.toml");
+    let state_path = dir.join("learner_state.json");
+    RuleStore::load_or_init(rules_path, state_path, preset).map_err(|e| e.to_string())
+}
+
+fn cmd_init(args: &[String]) -> Result<(), String> {
+    let mut dir = default_config_dir();
+    let mut preset = Preset::Balanced;
+    let mut force = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                i += 1;
+                dir = PathBuf::from(args.get(i).ok_or("--dir requires a path")?);
+            }
+            "--preset" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--preset requires a name")?;
+                preset = Preset::parse(raw).ok_or_else(|| {
+                    format!(
+                        "unknown preset {:?} (expected balanced, chat_casual, or developer_strict)",
+                        raw
+                    )
+                })?;
+            }
+            "--force" => {
+                force = true;
+            }
+            other => {
+                return Err(format!(
+                    "unknown flag {other} (usage: smartkey init [--preset balanced|chat_casual|developer_strict] [--dir <path>] [--force])"
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    let rules_path = dir.join("rules.toml");
+    if rules_path.exists() && !force {
+        println!(
+            "Already initialized at {} (pass --force to overwrite with fresh preset)",
+            rules_path.display()
+        );
+        return Ok(());
+    }
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::write(&rules_path, preset.initial_toml()).map_err(|e| e.to_string())?;
+    println!(
+        "Initialized SmartKey rules ({preset:?}) at {}",
+        rules_path.display()
+    );
+    Ok(())
+}
+
+fn cmd_rules(args: &[String]) -> Result<(), String> {
+    let mut dir = default_config_dir();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                i += 1;
+                dir = PathBuf::from(args.get(i).ok_or("--dir requires a path")?);
+            }
+            other => {
+                return Err(format!(
+                    "unknown flag {other} (usage: smartkey rules [--dir <path>])"
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    let store = load_rule_store(&dir, Preset::Balanced)?;
+    let c = store.compiled();
+    let st = store.state();
+
+    println!("=== SmartKey Personal Rule Brain ===");
+    println!(
+        "Rules File           : {}",
+        store
+            .rules_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<in-memory>".to_string())
+    );
+    println!(
+        "Settings             : enabled={} | dialect={:?} | aggressiveness={:?} | undo_window={}ms",
+        c.enabled, c.scorer_config.dialect, c.scorer_config.aggressiveness, c.undo_window_ms
+    );
+    println!("Personal Dict (en)   : {} words", c.personal_dict.len());
+    println!("Blocklist Pairs      : {} pairs", c.blocklist.len());
+    println!(
+        "Learned Corrections  : {} unigram | {} contextual",
+        c.corrections.len(),
+        c.context_corrections.len()
+    );
+    println!("Snippets             : {} triggers", c.snippets.len());
+    println!(
+        "Telex Passthrough    : {} ASCII words",
+        c.telex_passthrough.len()
+    );
+    println!(
+        "Staging Counters     : {} edits | {} context | {} unknowns | {} trouble words",
+        st.staged_corrections.len(),
+        st.staged_context.len(),
+        st.untouched_unknowns.len(),
+        st.trouble_words.len()
+    );
+    if !st.skipped_edits.is_empty() {
+        println!(
+            "\nRecent Guard-Rejected Edits ({}):",
+            st.skipped_edits.len()
+        );
+        for entry in st.skipped_edits.iter().rev().take(10) {
+            println!(
+                "  [{}x] ({}) prev={:?} {:?} -> {:?} ({})",
+                entry.count, entry.lang, entry.prev_word, entry.orig, entry.fixed, entry.reason
+            );
+        }
+    }
+    Ok(())
 }
 
 fn cmd_build_lexicon() -> Result<(), String> {
@@ -66,7 +206,6 @@ fn cmd_build_lexicon() -> Result<(), String> {
     }
     fs::write(&out_path, &image).map_err(|e| e.to_string())?;
 
-    // Smoke-verify generated image loads cleanly
     let loaded = EnglishLexicon::from_owned_bytes(image.clone()).map_err(|e| e.to_string())?;
     println!(
         "Built {} ({:.2} MiB, {} smash-rescue words) in {:.2}s",
@@ -232,8 +371,9 @@ fn cmd_eval() -> Result<(), String> {
 fn cmd_explain(args: &[String]) -> Result<(), String> {
     let mut prev: Option<String> = None;
     let mut punct: Option<char> = None;
-    let mut dialect = Dialect::Mixed;
+    let mut dialect: Option<Dialect> = None;
     let mut sentence_start = false;
+    let mut dir: Option<PathBuf> = None;
     let mut token: Option<String> = None;
 
     let mut i = 0;
@@ -249,11 +389,15 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
             }
             "--dialect" => {
                 i += 1;
-                dialect = match args.get(i).map(String::as_str) {
+                dialect = Some(match args.get(i).map(String::as_str) {
                     Some("us" | "en_US") => Dialect::EnUs,
                     Some("gb" | "uk" | "en_GB") => Dialect::EnGb,
                     _ => Dialect::Mixed,
-                };
+                });
+            }
+            "--dir" => {
+                i += 1;
+                dir = args.get(i).map(PathBuf::from);
             }
             "--sentence-start" => {
                 sentence_start = true;
@@ -267,23 +411,30 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
 
     let Some(tok) = token else {
         return Err(
-            "usage: smartkey explain [--prev <word>] [--punct <char>] [--dialect mixed|us|gb] [--sentence-start] <token>"
+            "usage: smartkey explain [--prev <word>] [--punct <char>] [--dialect mixed|us|gb] [--dir <path>] [--sentence-start] <token>"
                 .to_string(),
         );
     };
 
     let scorer = load_scorer()?;
-    let config = ScorerConfig {
-        dialect,
-        ..ScorerConfig::default()
+    let cfg_dir = dir.unwrap_or_else(default_config_dir);
+    let mut store = if cfg_dir.join("rules.toml").exists() {
+        load_rule_store(&cfg_dir, Preset::Balanced)?
+    } else {
+        RuleStore::in_memory(Preset::Balanced)
     };
+    if let Some(d) = dialect {
+        store.scorer_config_mut().dialect = d;
+    }
+
+    let engine = SmartKeyEngine::new(Some(scorer), store);
     let ctx = EvalContext {
         prev_word: prev.as_deref(),
         boundary_punct: punct,
         at_sentence_start: sentence_start,
         ..EvalContext::default()
     };
-    let exp = scorer.explain(&tok, &ctx, &config, &EmptyUserRules);
+    let exp = engine.explain_token(&tok, &ctx);
     println!("{}", serde_json::to_string_pretty(&exp).unwrap());
     Ok(())
 }
@@ -321,28 +472,59 @@ impl Drop for RawTermGuard {
     }
 }
 
-fn cmd_repl() -> Result<(), String> {
-    let scorer = load_scorer()?;
-    let config = ScorerConfig::default();
+fn cmd_repl(args: &[String]) -> Result<(), String> {
+    let mut dir = default_config_dir();
+    let mut in_memory = false;
 
-    println!("SmartKey Interactive REPL (Press Ctrl-C or Esc to quit)");
-    println!("Type naturally — Space/punctuation triggers Layer 1 autocorrect; 1x BackSpace right after an autocorrect snaps back!\n");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                i += 1;
+                dir = PathBuf::from(args.get(i).ok_or("--dir requires a path")?);
+            }
+            "--in-memory" => {
+                in_memory = true;
+            }
+            other => {
+                return Err(format!(
+                    "unknown flag {other} (usage: smartkey repl [--dir <path>] [--in-memory])"
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    let scorer = load_scorer()?;
+    let store = if in_memory {
+        RuleStore::in_memory(Preset::Balanced)
+    } else {
+        load_rule_store(&dir, Preset::Balanced)?
+    };
+
+    let rules_label = store
+        .rules_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<in-memory>".to_string());
+
+    let mut engine = SmartKeyEngine::new(Some(scorer), store);
+    let mut session = SmartKeySession::new();
+    let t0 = Instant::now();
+
+    println!("SmartKey Interactive REPL — Layer 1 + Layer 2 Learning Active");
+    println!("Rules brain: {rules_label}  (Ctrl-C or Esc to quit, Ctrl-W for word-backspace)\n");
 
     let _guard =
         RawTermGuard::enter().map_err(|e| format!("REPL requires an interactive TTY ({e})"))?;
 
     let mut line_buf = String::new();
-    let mut composing = String::new();
-    let mut prev_word: Option<String> = None;
-    let mut last_event_note = String::from("ready");
-    // `(raw_typed, replacement_with_punct_len_chars)`
-    let mut undo_slot: Option<(String, usize)> = None;
+    let mut last_note = String::from("ready");
 
     let redraw = |line: &str, note: &str| {
         print!("\r\x1b[2K> {line}    \x1b[90m[{note}]\x1b[0m");
         let _ = io::stdout().flush();
     };
-    redraw(&line_buf, &last_event_note);
+    redraw(&line_buf, &last_note);
 
     let mut stdin = io::stdin();
     let mut byte_buf = [0u8; 4];
@@ -351,125 +533,78 @@ fn cmd_repl() -> Result<(), String> {
         if stdin.read(&mut byte_buf[..1]).map_err(|e| e.to_string())? == 0 {
             break;
         }
+        let now_ms = t0.elapsed().as_millis() as u64;
         let b0 = byte_buf[0];
+
         if b0 == 3 || b0 == 27 {
+            let _ = session.reset(&mut engine);
             println!("\nBye!");
             break;
         }
-        if b0 == b'\r' || b0 == b'\n' {
+
+        let key = if b0 == b'\r' || b0 == b'\n' {
+            KeyInput::Enter
+        } else if b0 == 0x7f || b0 == 0x08 {
+            KeyInput::BackSpace
+        } else if b0 == 0x17 {
+            KeyInput::CtrlBackSpace
+        } else if b0 == b'\t' {
+            KeyInput::Tab
+        } else {
+            let width = if b0 < 0x80 {
+                1
+            } else if (b0 & 0xE0) == 0xC0 {
+                2
+            } else if (b0 & 0xF0) == 0xE0 {
+                3
+            } else {
+                4
+            };
+            if width > 1 {
+                stdin
+                    .read_exact(&mut byte_buf[1..width])
+                    .map_err(|e| e.to_string())?;
+            }
+            let Ok(s) = std::str::from_utf8(&byte_buf[..width]) else {
+                continue;
+            };
+            let Some(ch) = s.chars().next() else {
+                continue;
+            };
+            KeyInput::Char(ch)
+        };
+
+        if key == KeyInput::Enter {
+            let out = session.process_key(&mut engine, key, now_ms);
             line_buf.clear();
-            composing.clear();
-            prev_word = None;
-            undo_slot = None;
             println!();
-            last_event_note = "newline".to_string();
-            redraw(&line_buf, &last_event_note);
-            continue;
-        }
-        // BackSpace (`0x7f` or `0x08`)
-        if b0 == 0x7f || b0 == 0x08 {
-            if let Some((raw_word, replaced_chars)) = undo_slot.take() {
-                for _ in 0..replaced_chars {
-                    line_buf.pop();
-                }
-                line_buf.push_str(&raw_word);
-                last_event_note = format!("UNDO -> restored \"{raw_word}\"");
-                composing = raw_word;
+            last_note = if out.learn_events.is_empty() {
+                "newline".to_string()
             } else {
-                line_buf.pop();
-                composing.pop();
-                last_event_note = "backspace".to_string();
+                format!("newline | {:?}", out.learn_events)
+            };
+            redraw(&line_buf, &last_note);
+            continue;
+        }
+
+        let out = session.process_key(&mut engine, key, now_ms);
+        apply_key_to_buffer(&mut line_buf, key, &out.action);
+
+        let mut notes = Vec::new();
+        if let SessionAction::Replace { insert, .. } = &out.action {
+            if key == KeyInput::BackSpace {
+                notes.push(format!("UNDO -> {insert:?}"));
+            } else if let Some(kind) = out.matched_kind {
+                notes.push(format!("fix -> {:?} ({kind:?})", insert.trim_end()));
             }
-            redraw(&line_buf, &last_event_note);
-            continue;
         }
-
-        // Decode UTF-8 scalar char
-        let width = if b0 < 0x80 {
-            1
-        } else if (b0 & 0xE0) == 0xC0 {
-            2
-        } else if (b0 & 0xF0) == 0xE0 {
-            3
-        } else {
-            4
-        };
-        if width > 1 {
-            stdin
-                .read_exact(&mut byte_buf[1..width])
-                .map_err(|e| e.to_string())?;
+        if !out.learn_events.is_empty() {
+            notes.push(format!("learned: {:?}", out.learn_events));
         }
-        let Ok(s) = std::str::from_utf8(&byte_buf[..width]) else {
-            continue;
-        };
-        let Some(ch) = s.chars().next() else {
-            continue;
-        };
-
-        undo_slot = None;
-
-        let is_word_char =
-            ch.is_alphabetic() || ch == '\'' || ch == '’' || (ch == ';' && !composing.is_empty());
-
-        if is_word_char {
-            composing.push(ch);
-            line_buf.push(ch);
-            redraw(&line_buf, &last_event_note);
-        } else {
-            // Word boundary (`Space`, `,`, `.`, `:`, `!`, `?`, etc.)
-            if !composing.is_empty() {
-                let boundary_punct = if ch == ' ' { None } else { Some(ch) };
-                let ctx = EvalContext {
-                    prev_word: prev_word.as_deref(),
-                    boundary_punct,
-                    at_sentence_start: prev_word.is_none(),
-                    ..EvalContext::default()
-                };
-                let outcome = scorer.evaluate(&composing, &ctx, &config, &EmptyUserRules);
-                match outcome {
-                    EvalOutcome::Autocorrect {
-                        replacement, kind, ..
-                    } => {
-                        let old_chars = composing.chars().count();
-                        for _ in 0..old_chars {
-                            line_buf.pop();
-                        }
-                        line_buf.push_str(&replacement);
-                        line_buf.push(ch);
-                        let replaced_total_chars = replacement.chars().count() + 1;
-                        last_event_note = format!("{composing} -> {replacement} ({kind:?})");
-                        undo_slot = Some((composing.clone(), replaced_total_chars));
-                        prev_word = if ch == ' ' {
-                            Some(
-                                replacement
-                                    .split_whitespace()
-                                    .last()
-                                    .unwrap_or(&replacement)
-                                    .to_string(),
-                            )
-                        } else {
-                            None
-                        };
-                    }
-                    EvalOutcome::Unchanged { reason, .. } => {
-                        line_buf.push(ch);
-                        last_event_note = format!("kept \"{composing}\" ({reason:?})");
-                        prev_word = if ch == ' ' {
-                            Some(composing.clone())
-                        } else {
-                            None
-                        };
-                    }
-                }
-                composing.clear();
-            } else {
-                line_buf.push(ch);
-                if ch != ' ' {
-                    prev_word = None;
-                }
-            }
-            redraw(&line_buf, &last_event_note);
+        if !notes.is_empty() {
+            last_note = notes.join(" | ");
         }
+        redraw(&line_buf, &last_note);
     }
 
     Ok(())
@@ -478,12 +613,14 @@ fn cmd_repl() -> Result<(), String> {
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let res = match args.first().map(String::as_str) {
+        Some("init") => cmd_init(&args[1..]),
+        Some("rules") => cmd_rules(&args[1..]),
         Some("build-lexicon") => cmd_build_lexicon(),
         Some("eval") => cmd_eval(),
         Some("explain") => cmd_explain(&args[1..]),
-        Some("repl") => cmd_repl(),
+        Some("repl") => cmd_repl(&args[1..]),
         _ => {
-            eprintln!("Usage: smartkey <build-lexicon | eval | explain | repl>");
+            eprintln!("Usage: smartkey <init | rules | build-lexicon | eval | explain | repl>");
             std::process::exit(2);
         }
     };

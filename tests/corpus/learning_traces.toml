@@ -1,0 +1,108 @@
+# SmartKey Layer 2 Deterministic Learning & Lookahead Golden Traces
+# Special tokens in `keys`:
+#   <BS>    = BackSpace
+#   <CBS>   = Ctrl+BackSpace
+#   <ENTER> = Enter / Newline
+#   <NAV>   = Arrow key / Mouse click (`g_mouseClicked`)
+
+[[trace]]
+name = "row1_undo_and_edit_blocks_wrong_suggestion_immediately"
+steps = [
+  { keys = "fomr <BS><BS><BS>rm ", expect_buf = "form " },
+  { keys = "fomr ", expect_buf = "form form " },
+]
+
+[[trace]]
+name = "row2_undo_and_keep_verbatim_session_shield_1x"
+steps = [
+  { keys = "alot <BS> ", expect_buf = "alot " },
+  { keys = "alot ", expect_buf = "alot alot " },
+]
+
+[[trace]]
+name = "row3_self_confirm_cancel_on_accidental_backspace"
+steps = [
+  { keys = "chagnes <BS><BS><BS><BS><BS>nges ", expect_buf = "changes " },
+  { keys = "chagnes ", expect_buf = "changes changes " },
+]
+
+[[trace]]
+name = "clause_erase_cancel_past_word_start"
+steps = [
+  { keys = "hello chagnes <BS><BS><BS><BS><BS><BS><BS><BS><BS>", expect_buf = "hello" },
+  { keys = " chagnes ", expect_buf = "hello changes " },
+]
+
+[[trace]]
+name = "row4_post_space_manual_fix_2x_graduation"
+steps = [
+  { keys = "adpatr <BS><BS><BS><BS><BS>apter ", expect_buf = "adapter " },
+  { keys = "adpatr ", expect_buf = "adapter adpatr " },
+  { keys = "<BS><BS><BS><BS><BS>apter ", expect_buf = "adapter adapter " },
+  { keys = "adpatr ", expect_buf = "adapter adapter adapter " },
+]
+
+[[trace]]
+name = "row4_pre_space_mid_word_fix_2x_graduation"
+steps = [
+  { keys = "adpatr<BS><BS><BS><BS>apter ", expect_buf = "adapter " },
+  { keys = "adpatr<BS><BS><BS><BS>apter ", expect_buf = "adapter adapter " },
+  { keys = "adpatr ", expect_buf = "adapter adapter adapter " },
+]
+
+[[trace]]
+name = "row4_contextual_valid_word_fix_apart_from"
+steps = [
+  { keys = "apart form <CBS>from ", expect_buf = "apart from " },
+  { keys = "apart form <CBS>from ", expect_buf = "apart from apart from " },
+  { keys = "apart form ", expect_buf = "apart from apart from apart from " },
+  { keys = "the form ", expect_buf = "apart from apart from apart from the form " },
+]
+
+[[trace]]
+name = "row5_untouched_unknown_graduates_at_3x_only"
+steps = [
+  { keys = "khum one khum two khum three ", expect_buf = "khum one khum two khum three " },
+]
+
+[[trace]]
+name = "row6_delta_span_suffix_rewrite_never_learns"
+steps = [
+  { keys = "prodcut<BS><BS><BS>uction ", expect_buf = "production " },
+  { keys = "prodcut<BS><BS><BS>uction ", expect_buf = "production production " },
+  { keys = "interac<BS><BS><BS>rnal ", expect_buf = "production production internal " },
+  { keys = "interac<BS><BS><BS>rnal ", expect_buf = "production production internal internal " },
+]
+
+[[trace]]
+name = "row6_two_word_erase_never_learns"
+steps = [
+  { keys = "good adpatr <BS><BS><BS><BS><BS><BS><BS><BS><BS><BS><BS><BS>bad adapter ", expect_buf = "bad adapter " },
+  { keys = "good adpatr <BS><BS><BS><BS><BS><BS><BS><BS><BS><BS><BS><BS>bad adapter ", expect_buf = "bad adapter bad adapter " },
+  { keys = "adpatr ", expect_buf = "bad adapter bad adapter adpatr " },
+]
+
+[[trace]]
+name = "provisional_dot_colon_semicolon_and_quotes"
+steps = [
+  { keys = "teh.com ", expect_buf = "teh.com " },
+  { keys = "config.json. ", expect_buf = "teh.com config.json. " },
+  { keys = "localhost:8080 ", expect_buf = "teh.com config.json. localhost:8080 " },
+  { keys = "chagnes. ", expect_buf = "teh.com config.json. localhost:8080 changes. " },
+  { keys = "situatioN: ", expect_buf = "teh.com config.json. localhost:8080 changes. situation: " },
+  { keys = "don;t ", expect_buf = "teh.com config.json. localhost:8080 changes. situation: don't " },
+  { keys = "chagnes; ", expect_buf = "teh.com config.json. localhost:8080 changes. situation: don't changes; " },
+  { keys = "(teh) \"chagnes\" 'chagnes' ", expect_buf = "teh.com config.json. localhost:8080 changes. situation: don't changes; (the) \"changes\" 'changes' " },
+]
+
+[[trace]]
+name = "markdown_inline_code_and_identifier_immunity"
+steps = [
+  { keys = "check `teh chagnes` and teh_var and teh-flag then teh ", expect_buf = "check `teh chagnes` and teh_var and teh-flag then the " },
+]
+
+[[trace]]
+name = "multi_boundary_comma_space_single_backspace_undo"
+steps = [
+  { keys = "chagnes, <BS>, ", expect_buf = "chagnes, " },
+]
