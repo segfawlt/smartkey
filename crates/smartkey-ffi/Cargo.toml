@@ -1,0 +1,16 @@
+[package]
+name = "smartkey-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Panic-safe C ABI and mobile word-level FFI for SmartKey (fcitx5-lotus & HeliBoard)"
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[features]
+default = ["bundled-en"]
+bundled-en = ["smartkey-core/bundled-en"]
+
+[dependencies]
+smartkey-core = { path = "../smartkey-core", default-features = false }

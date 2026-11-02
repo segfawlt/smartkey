@@ -1,0 +1,477 @@
+#![allow(clippy::missing_safety_doc)]
+
+use std::ffi::{c_char, CStr};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::ptr;
+use std::slice;
+
+use smartkey_core::{
+    AppProfile, EnglishLexicon, EnglishScorer, KeyInput, LangId, LearnEvent, Preset, RuleStore,
+    SessionAction, SmartKeyEngine, SmartKeySession, UserRuleView,
+};
+
+pub const SMARTKEY_PRESET_BALANCED: u8 = 0;
+pub const SMARTKEY_PRESET_CHAT_CASUAL: u8 = 1;
+pub const SMARTKEY_PRESET_DEVELOPER_STRICT: u8 = 2;
+
+pub const SMARTKEY_PROFILE_BYPASS: u8 = 0;
+pub const SMARTKEY_PROFILE_BROWSER: u8 = 1;
+pub const SMARTKEY_PROFILE_CHAT: u8 = 2;
+pub const SMARTKEY_PROFILE_PROSE: u8 = 3;
+
+pub const SMARTKEY_KEY_CHAR: u8 = 0;
+pub const SMARTKEY_KEY_BACKSPACE: u8 = 1;
+pub const SMARTKEY_KEY_CTRL_BACKSPACE: u8 = 2;
+pub const SMARTKEY_KEY_ENTER: u8 = 3;
+pub const SMARTKEY_KEY_TAB: u8 = 4;
+pub const SMARTKEY_KEY_NAV_OR_CLICK: u8 = 5;
+pub const SMARTKEY_KEY_FOCUS_LOST: u8 = 6;
+
+pub const SMARTKEY_ACTION_PASS_THROUGH: u8 = 0;
+pub const SMARTKEY_ACTION_REPLACE: u8 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SmartKeyAction {
+    pub kind: u8,
+    pub delete_chars: u32,
+    pub insert_utf8: *const c_char,
+    pub insert_byte_len: u32,
+}
+
+impl Default for SmartKeyAction {
+    fn default() -> Self {
+        Self {
+            kind: SMARTKEY_ACTION_PASS_THROUGH,
+            delete_chars: 0,
+            insert_utf8: ptr::null(),
+            insert_byte_len: 0,
+        }
+    }
+}
+
+pub struct SmartKeyEngineHandle {
+    inner: SmartKeyEngine,
+}
+
+pub struct SmartKeySessionHandle {
+    inner: SmartKeySession,
+    /// NUL-terminated scratch buffer keeping `SmartKeyAction::insert_utf8` valid with zero leaks.
+    scratch_insert: Vec<u8>,
+}
+
+fn decode_preset(preset: u8) -> Preset {
+    match preset {
+        SMARTKEY_PRESET_CHAT_CASUAL => Preset::ChatCasual,
+        SMARTKEY_PRESET_DEVELOPER_STRICT => Preset::DeveloperStrict,
+        _ => Preset::Balanced,
+    }
+}
+
+fn decode_profile(profile: u8) -> AppProfile {
+    match profile {
+        SMARTKEY_PROFILE_BYPASS => AppProfile::Bypass,
+        SMARTKEY_PROFILE_BROWSER => AppProfile::Browser,
+        SMARTKEY_PROFILE_CHAT => AppProfile::Chat,
+        _ => AppProfile::Prose,
+    }
+}
+
+unsafe fn opt_cstr(ptr: *const c_char) -> Option<&'static str> {
+    if ptr.is_null() {
+        return None;
+    }
+    CStr::from_ptr(ptr).to_str().ok().filter(|s| !s.is_empty())
+}
+
+fn build_store(
+    rules_path_utf8: *const c_char,
+    state_path_utf8: *const c_char,
+    preset: u8,
+) -> Result<RuleStore, ()> {
+    let p = decode_preset(preset);
+    let rules_opt = unsafe { opt_cstr(rules_path_utf8) };
+    let state_opt = unsafe { opt_cstr(state_path_utf8) };
+
+    match rules_opt {
+        None => Ok(RuleStore::in_memory(p)),
+        Some(rp) => {
+            let r_path = PathBuf::from(rp);
+            let s_path = match state_opt {
+                Some(sp) => PathBuf::from(sp),
+                None => r_path.with_file_name("learner_state.json"),
+            };
+            RuleStore::load_or_init(r_path, s_path, p).map_err(|_| ())
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_new(
+    rules_path_utf8: *const c_char,
+    state_path_utf8: *const c_char,
+    preset: u8,
+) -> *mut SmartKeyEngineHandle {
+    catch_unwind(|| {
+        let Ok(store) = build_store(rules_path_utf8, state_path_utf8, preset) else {
+            return ptr::null_mut();
+        };
+        #[cfg(feature = "bundled-en")]
+        let scorer = EnglishScorer::new_bundled().ok();
+        #[cfg(not(feature = "bundled-en"))]
+        let scorer: Option<EnglishScorer> = None;
+
+        Box::into_raw(Box::new(SmartKeyEngineHandle {
+            inner: SmartKeyEngine::new(scorer, store),
+        }))
+    })
+    .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_new_with_lexicon_bytes(
+    skdict_bytes: *const u8,
+    skdict_len: usize,
+    rules_path_utf8: *const c_char,
+    state_path_utf8: *const c_char,
+    preset: u8,
+) -> *mut SmartKeyEngineHandle {
+    catch_unwind(|| {
+        let Ok(store) = build_store(rules_path_utf8, state_path_utf8, preset) else {
+            return ptr::null_mut();
+        };
+        let scorer = if !skdict_bytes.is_null() && skdict_len > 0 {
+            let bytes = slice::from_raw_parts(skdict_bytes, skdict_len).to_vec();
+            let Ok(lex) = EnglishLexicon::from_owned_bytes(bytes) else {
+                return ptr::null_mut();
+            };
+            Some(EnglishScorer::new(lex))
+        } else {
+            None
+        };
+        Box::into_raw(Box::new(SmartKeyEngineHandle {
+            inner: SmartKeyEngine::new(scorer, store),
+        }))
+    })
+    .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_free(engine: *mut SmartKeyEngineHandle) {
+    if !engine.is_null() {
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            drop(Box::from_raw(engine));
+        }));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn smartkey_session_new() -> *mut SmartKeySessionHandle {
+    catch_unwind(|| {
+        Box::into_raw(Box::new(SmartKeySessionHandle {
+            inner: SmartKeySession::new(),
+            scratch_insert: vec![0],
+        }))
+    })
+    .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_session_free(session: *mut SmartKeySessionHandle) {
+    if !session.is_null() {
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            drop(Box::from_raw(session));
+        }));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_session_reset(
+    session: *mut SmartKeySessionHandle,
+    engine: *mut SmartKeyEngineHandle,
+) {
+    if session.is_null() || engine.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let _ = (*session).inner.reset(&mut (*engine).inner);
+    }));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_session_set_profile(
+    session: *mut SmartKeySessionHandle,
+    profile: u8,
+) {
+    if session.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        (*session).inner.set_profile(decode_profile(profile));
+    }));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_session_set_lang(
+    session: *mut SmartKeySessionHandle,
+    lang_utf8: *const c_char,
+) {
+    if session.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(lang) = opt_cstr(lang_utf8) {
+            (*session).inner.set_lang(LangId(lang.to_string()));
+        }
+    }));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_session_process_key(
+    session: *mut SmartKeySessionHandle,
+    engine: *mut SmartKeyEngineHandle,
+    key_kind: u8,
+    codepoint: u32,
+    now_ms: u64,
+    out_action: *mut SmartKeyAction,
+) -> bool {
+    if out_action.is_null() {
+        return false;
+    }
+    *out_action = SmartKeyAction::default();
+    if session.is_null() || engine.is_null() {
+        return false;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| {
+        let key = match key_kind {
+            SMARTKEY_KEY_CHAR => {
+                let Some(ch) = char::from_u32(codepoint) else {
+                    return false;
+                };
+                KeyInput::Char(ch)
+            }
+            SMARTKEY_KEY_BACKSPACE => KeyInput::BackSpace,
+            SMARTKEY_KEY_CTRL_BACKSPACE => KeyInput::CtrlBackSpace,
+            SMARTKEY_KEY_ENTER => KeyInput::Enter,
+            SMARTKEY_KEY_TAB => KeyInput::Tab,
+            SMARTKEY_KEY_NAV_OR_CLICK => KeyInput::NavOrClick,
+            SMARTKEY_KEY_FOCUS_LOST => KeyInput::FocusLost,
+            _ => return false,
+        };
+
+        let sess = &mut *session;
+        let eng = &mut *engine;
+        let out = sess.inner.process_key(&mut eng.inner, key, now_ms);
+
+        match out.action {
+            SessionAction::PassThrough => {
+                *out_action = SmartKeyAction::default();
+            }
+            SessionAction::Replace {
+                delete_chars,
+                insert,
+            } => {
+                sess.scratch_insert.clear();
+                sess.scratch_insert.extend_from_slice(insert.as_bytes());
+                sess.scratch_insert.push(0);
+                *out_action = SmartKeyAction {
+                    kind: SMARTKEY_ACTION_REPLACE,
+                    delete_chars: delete_chars as u32,
+                    insert_utf8: sess.scratch_insert.as_ptr() as *const c_char,
+                    insert_byte_len: insert.len() as u32,
+                };
+            }
+        }
+        true
+    }))
+    .unwrap_or(false)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_is_english_word(
+    engine: *const SmartKeyEngineHandle,
+    word_utf8: *const c_char,
+    out_freq: *mut u8,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(word) = opt_cstr(word_utf8) else {
+            return false;
+        };
+        let lower = word.to_lowercase();
+        let eng = &(*engine).inner;
+        if eng.store().is_personal_word(&lower) {
+            if !out_freq.is_null() {
+                *out_freq = 200;
+            }
+            return true;
+        }
+        if let Some(lex) = eng.lexicon() {
+            let dialect = eng.store().scorer_config().dialect;
+            if let Some(meta) = lex.lookup_word(&lower) {
+                if meta.is_valid_for_dialect(dialect) {
+                    if !out_freq.is_null() {
+                        *out_freq = meta.effective_freq(dialect);
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }))
+    .unwrap_or(false)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_is_telex_passthrough(
+    engine: *const SmartKeyEngineHandle,
+    raw_ascii_utf8: *const c_char,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(w) = opt_cstr(raw_ascii_utf8) else {
+            return false;
+        };
+        (*engine).inner.is_telex_passthrough(w)
+    }))
+    .unwrap_or(false)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_session_record_telex_passthrough_repair(
+    session: *mut SmartKeySessionHandle,
+    engine: *mut SmartKeyEngineHandle,
+    raw_ascii_utf8: *const c_char,
+) -> bool {
+    if session.is_null() || engine.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(w) = opt_cstr(raw_ascii_utf8) else {
+            return false;
+        };
+        matches!(
+            (*session)
+                .inner
+                .on_lotus_passthrough_repair(&mut (*engine).inner, w),
+            LearnEvent::GraduatedTelexPassthrough { .. }
+        )
+    }))
+    .unwrap_or(false)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_is_pair_blocked(
+    engine: *const SmartKeyEngineHandle,
+    typed_utf8: *const c_char,
+    candidate_utf8: *const c_char,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(t), Some(c)) = (opt_cstr(typed_utf8), opt_cstr(candidate_utf8)) else {
+            return false;
+        };
+        (*engine)
+            .inner
+            .store()
+            .is_pair_blocked(&t.to_lowercase(), &c.to_lowercase())
+    }))
+    .unwrap_or(false)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_is_personal_word(
+    engine: *const SmartKeyEngineHandle,
+    word_utf8: *const c_char,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(w) = opt_cstr(word_utf8) else {
+            return false;
+        };
+        (*engine).inner.store().is_personal_word(&w.to_lowercase())
+    }))
+    .unwrap_or(false)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_mobile_on_auto_commit(
+    session: *mut SmartKeySessionHandle,
+    raw_typed_utf8: *const c_char,
+    applied_utf8: *const c_char,
+) {
+    if session.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let (Some(raw), Some(app)) = (opt_cstr(raw_typed_utf8), opt_cstr(applied_utf8)) {
+            (*session).inner.on_mobile_auto_commit(raw, app);
+        }
+    }));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_mobile_on_undo_keep(
+    session: *mut SmartKeySessionHandle,
+    engine: *mut SmartKeyEngineHandle,
+    raw_typed_utf8: *const c_char,
+    rejected_utf8: *const c_char,
+) {
+    if session.is_null() || engine.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let (Some(raw), Some(rej)) = (opt_cstr(raw_typed_utf8), opt_cstr(rejected_utf8)) {
+            let _ = (*session)
+                .inner
+                .on_mobile_undo_keep(&mut (*engine).inner, raw, rej);
+        }
+    }));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_mobile_on_manual_fix(
+    session: *mut SmartKeySessionHandle,
+    engine: *mut SmartKeyEngineHandle,
+    orig_utf8: *const c_char,
+    fixed_utf8: *const c_char,
+) {
+    if session.is_null() || engine.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let (Some(orig), Some(fixed)) = (opt_cstr(orig_utf8), opt_cstr(fixed_utf8)) {
+            let _ = (*session)
+                .inner
+                .on_mobile_manual_fix(&mut (*engine).inner, orig, fixed);
+        }
+    }));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_mobile_on_untouched_commit(
+    session: *mut SmartKeySessionHandle,
+    engine: *mut SmartKeyEngineHandle,
+    word_utf8: *const c_char,
+) {
+    if session.is_null() || engine.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(word) = opt_cstr(word_utf8) {
+            let _ = (*session)
+                .inner
+                .on_mobile_untouched_commit(&mut (*engine).inner, word);
+        }
+    }));
+}

@@ -20,19 +20,29 @@ Privacy-first, 100% on-device **PC-first autocorrect and deterministic backspace
 - [Architecture & Implementation Plan (v3.2)](./docs/architecture-and-plan.md)
 - [Competitor & Ecosystem Analysis](./docs/competitor-analysis.md)
 
+## Workspace Crates
+
+- **`crates/smartkey-core`** — Pure-Rust Layer 1 scorer, `SmartKeySession` shadow-buffer learner, and comment-preserving `toml_edit` `RuleStore` (zero OS/C-sys/`$HOME` dependencies).
+- **`crates/smartkey-ffi`** — Panic-safe `extern "C"` ABI (`include/smartkey.h`) for `fcitx5-lotus` on Linux Wayland and portable word-level JNI hooks for Android `HeliBoard`.
+- **`crates/smartkey-cli`** — Developer CLI (`init`, `rules`, `eval`, `explain`, `repl`, `build-lexicon`).
+
 ## Quick Start
 
 ```bash
-# Run golden corpus evaluation (must_fix.tsv + must_not_touch.txt + learning_traces)
-cargo test
-cargo run -p smartkey-cli -- eval
+# Run full test suite (golden corpus, learning traces, proptest fuzzing, C++17 FFI link test)
+cargo test --workspace
+cargo run --release -p smartkey-cli -- eval
+
+# Initialize ~/.config/smartkey/rules.toml (presets: balanced | chat_casual | developer_strict)
+cargo run --release -p smartkey-cli -- init --preset balanced
+cargo run --release -p smartkey-cli -- rules
 
 # Inspect how SmartKey scores and explains a token
-cargo run -p smartkey-cli -- explain "hstiautoin"
-cargo run -p smartkey-cli -- explain --prev "over" "ther"
+cargo run --release -p smartkey-cli -- explain "hstiautoin"
+cargo run --release -p smartkey-cli -- explain --prev "over" "ther"
 
-# Launch interactive terminal typing + backspace-learning sandbox
-cargo run -p smartkey-cli -- repl
+# Launch interactive terminal typing + live backspace-learning sandbox
+cargo run --release -p smartkey-cli -- repl
 ```
 
 ## License
