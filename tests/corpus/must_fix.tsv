@@ -87,3 +87,6 @@ too	mcu	-	much
 # --- Outer single-quote preservation + lowercase brand case preservation ---
 -	'chagnes'	-	'changes'
 -	githbu	-	github
+-	conitnuing	-	continuing
+-	ahve	-	have
+-	implementintion	-	implementation

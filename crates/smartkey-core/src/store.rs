@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::scorer::UserRuleView;
-use crate::types::{Aggressiveness, Dialect, LangId, ScorerConfig};
+use crate::types::{Aggressiveness, Dialect, LangId, MatchKind, ScorerConfig};
 
 /// Built-in onboarding presets (`smartkey init --preset ...`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -89,8 +89,47 @@ pub struct SkippedEditEntry {
     pub count: u32,
 }
 
-/// High-churn staging counters stored in `learner_state.json` (kept out of `rules.toml` until graduation).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UndoResolution {
+    /// `1x BackSpace` just snapped the word back; user has not finished re-committing yet.
+    Triggered,
+    /// User kept their raw word verbatim (`1x` session shield, `2x` permanent).
+    KeptVerbatim,
+    /// User edited the restored word into a third word (`1x` permanent block + `2x` edit stage).
+    EditedToThird { final_word: String },
+    /// User retyped the exact suggestion they just undid (`Self-Confirm Cancel`).
+    SelfConfirmCancelled,
+    /// User held `BackSpace` past index 0 to erase the clause (`Clause-Erase Cancel`).
+    ClauseErased,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum DiagnosticEvent {
+    AutocorrectApplied {
+        typed: String,
+        applied: String,
+        kind: MatchKind,
+        total_count: u32,
+    },
+    BackspaceUndo {
+        typed: String,
+        rejected: String,
+        resolution: UndoResolution,
+        undo_count: u32,
+    },
+    ManualBackspaceFix {
+        orig: String,
+        fixed: String,
+        outcome: String,
+        attempt_count: u32,
+    },
+}
+
+/// High-churn staging counters and diagnostic log stored in `learner_state.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LearnerState {
     pub staged_corrections: BTreeMap<String, u32>,
     pub staged_context: BTreeMap<String, u32>,
@@ -99,9 +138,26 @@ pub struct LearnerState {
     pub staged_telex_passthrough: BTreeMap<String, u32>,
     pub trouble_words: BTreeMap<String, u32>,
     pub skipped_edits: Vec<SkippedEditEntry>,
+    /// Cumulative `1x, 2x, 3x+` counts per `typed->applied` autocorrect pair.
+    pub applied_counts: BTreeMap<String, u32>,
+    /// Cumulative `1x, 2x, 3x+` counts per `typed->rejected` backspace undo.
+    pub undo_counts: BTreeMap<String, u32>,
+    /// Cumulative `1x, 2x, 3x+` counts per `orig->fixed` manual backspace edit.
+    pub manual_fix_counts: BTreeMap<String, u32>,
+    /// Bounded ring buffer (`<= 256`) of recent autocorrects, backspace undos, and manual fixes.
+    pub recent_events: Vec<DiagnosticEvent>,
 }
 
+const MAX_RECENT_EVENTS: usize = 256;
+
 impl LearnerState {
+    pub fn push_event(&mut self, ev: DiagnosticEvent) {
+        if self.recent_events.len() >= MAX_RECENT_EVENTS {
+            self.recent_events.remove(0);
+        }
+        self.recent_events.push(ev);
+    }
+
     pub fn record_skipped(
         &mut self,
         lang: &str,
@@ -155,6 +211,7 @@ pub struct RuleStore {
     rules_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
     last_mtime: Option<SystemTime>,
+    last_state_mtime: Option<SystemTime>,
     parse_locked: bool,
     doc: DocumentMut,
     compiled: CompiledRules,
@@ -174,6 +231,7 @@ impl RuleStore {
             rules_path: None,
             state_path: None,
             last_mtime: None,
+            last_state_mtime: None,
             parse_locked: false,
             doc,
             compiled,
@@ -193,6 +251,7 @@ impl RuleStore {
             rules_path: None,
             state_path: None,
             last_mtime: None,
+            last_state_mtime: None,
             parse_locked: false,
             doc,
             compiled,
@@ -229,6 +288,7 @@ impl RuleStore {
             }
         };
 
+        let last_state_mtime = fs::metadata(&state_path).and_then(|m| m.modified()).ok();
         let state: LearnerState = if state_path.exists() {
             fs::read_to_string(&state_path)
                 .ok()
@@ -243,6 +303,7 @@ impl RuleStore {
             rules_path: Some(rules_path),
             state_path: Some(state_path),
             last_mtime,
+            last_state_mtime,
             parse_locked,
             doc,
             compiled,
@@ -300,6 +361,17 @@ impl RuleStore {
             .insert((typed_lower.to_string(), rejected_lower.to_string()));
     }
 
+    /// Reloads `rules.toml` and `learner_state.json` from disk if modified externally
+    /// (e.g. user edited `rules.toml`, Syncthing synced, or `smartkey log --clear` ran).
+    pub fn reload_if_modified(&mut self) {
+        self.sync_external_edits_before_write();
+        self.sync_external_state_before_write();
+    }
+
+    pub fn state_path(&self) -> Option<&Path> {
+        self.state_path.as_deref()
+    }
+
     /// Reloads `rules.toml` from disk if modified externally (e.g. Syncthing or user editor) before writing.
     fn sync_external_edits_before_write(&mut self) {
         let Some(path) = self.rules_path.as_ref() else {
@@ -323,6 +395,22 @@ impl RuleStore {
         }
     }
 
+    fn sync_external_state_before_write(&mut self) {
+        let Some(path) = self.state_path.as_ref() else {
+            return;
+        };
+        let current_mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+        if current_mtime != self.last_state_mtime {
+            if let Some(fresh_state) = fs::read_to_string(path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<LearnerState>(&s).ok())
+            {
+                self.state = fresh_state;
+                self.last_state_mtime = current_mtime;
+            }
+        }
+    }
+
     pub fn flush_rules(&mut self) -> io::Result<()> {
         if self.parse_locked {
             return Ok(());
@@ -337,15 +425,116 @@ impl RuleStore {
         Ok(())
     }
 
-    pub fn flush_state(&self) -> io::Result<()> {
-        if let Some(path) = self.state_path.as_ref() {
+    pub fn flush_state(&mut self) -> io::Result<()> {
+        if let Some(path) = self.state_path.as_ref().cloned() {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
             let json = serde_json::to_string_pretty(&self.state).map_err(io::Error::other)?;
-            fs::write(path, json)?;
+            let tmp_path = path.with_extension("json.tmp");
+            fs::write(&tmp_path, json)?;
+            fs::rename(&tmp_path, &path)?;
+            self.last_state_mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
         }
         Ok(())
+    }
+
+    pub fn log_autocorrect_applied(&mut self, typed: &str, applied: &str, kind: MatchKind) {
+        self.sync_external_state_before_write();
+        let key = format!("{}->{}", typed.to_lowercase(), applied.to_lowercase());
+        let total_count = {
+            let e = self.state.applied_counts.entry(key).or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        };
+        self.state.push_event(DiagnosticEvent::AutocorrectApplied {
+            typed: typed.to_string(),
+            applied: applied.to_string(),
+            kind,
+            total_count,
+        });
+        let _ = self.flush_state();
+    }
+
+    pub fn log_backspace_undo(&mut self, typed: &str, rejected: &str, resolution: UndoResolution) {
+        self.sync_external_state_before_write();
+        let key = format!("{}->{}", typed.to_lowercase(), rejected.to_lowercase());
+        let undo_count = {
+            let e = self.state.undo_counts.entry(key).or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        };
+        self.state.push_event(DiagnosticEvent::BackspaceUndo {
+            typed: typed.to_string(),
+            rejected: rejected.to_string(),
+            resolution,
+            undo_count,
+        });
+        let _ = self.flush_state();
+    }
+
+    /// Updates the most recent `Triggered` `BackspaceUndo` entry in place once the user finishes
+    /// keeping, editing, self-confirming, or erasing the restored word.
+    pub fn resolve_pending_undo_log(
+        &mut self,
+        typed: &str,
+        rejected: &str,
+        resolution: UndoResolution,
+    ) {
+        self.sync_external_state_before_write();
+        if let Some(DiagnosticEvent::BackspaceUndo {
+            typed: t,
+            rejected: r,
+            resolution: res_slot,
+            ..
+        }) = self.state.recent_events.iter_mut().rev().find(|ev| {
+            matches!(
+                ev,
+                DiagnosticEvent::BackspaceUndo {
+                    resolution: UndoResolution::Triggered,
+                    ..
+                }
+            )
+        }) {
+            if t == typed && r == rejected {
+                *res_slot = resolution;
+                let _ = self.flush_state();
+                return;
+            }
+        }
+        self.log_backspace_undo(typed, rejected, resolution);
+    }
+
+    pub fn log_manual_backspace_fix(&mut self, orig: &str, fixed: &str, outcome: &str) {
+        self.sync_external_state_before_write();
+        let orig_l = orig.trim().to_lowercase();
+        let fixed_l = fixed.trim().to_lowercase();
+        if orig_l.is_empty() || fixed_l.is_empty() || orig_l == fixed_l {
+            return;
+        }
+        let key = format!("{orig_l}->{fixed_l}");
+        let attempt_count = {
+            let e = self.state.manual_fix_counts.entry(key).or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        };
+        self.state.push_event(DiagnosticEvent::ManualBackspaceFix {
+            orig: orig.trim().to_string(),
+            fixed: fixed.trim().to_string(),
+            outcome: outcome.to_string(),
+            attempt_count,
+        });
+        let _ = self.flush_state();
+    }
+
+    pub fn clear_diagnostic_logs(&mut self) -> io::Result<()> {
+        self.sync_external_state_before_write();
+        self.state.applied_counts.clear();
+        self.state.undo_counts.clear();
+        self.state.manual_fix_counts.clear();
+        self.state.recent_events.clear();
+        self.state.skipped_edits.clear();
+        self.flush_state()
     }
 
     /// Permanently adds `(typed, rejected)` to `blocklist` in `rules.toml` (comment-preserving).

@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use smartkey_core::{
-    apply_key_to_buffer, compile_skdict_from_sources, Dialect, EmptyUserRules, EnglishLexicon,
-    EnglishScorer, EvalContext, EvalOutcome, KeyInput, LanguageScorer, Preset, RuleStore,
-    ScorerConfig, SessionAction, SmartKeyEngine, SmartKeySession,
+    apply_key_to_buffer, compile_skdict_from_sources, DiagnosticEvent, Dialect, EmptyUserRules,
+    EnglishLexicon, EnglishScorer, EvalContext, EvalOutcome, KeyInput, LanguageScorer, MatchKind,
+    Preset, RuleStore, ScorerConfig, SessionAction, SmartKeyEngine, SmartKeySession,
+    UndoResolution,
 };
 
 fn workspace_root() -> PathBuf {
@@ -172,6 +173,181 @@ fn cmd_rules(args: &[String]) -> Result<(), String> {
             );
         }
     }
+    Ok(())
+}
+
+fn match_kind_slug(kind: MatchKind) -> &'static str {
+    match kind {
+        MatchKind::Bypass => "bypass",
+        MatchKind::ValidWord => "valid_word",
+        MatchKind::StretchedWord => "stretched_word",
+        MatchKind::UserSnippet => "user_snippet",
+        MatchKind::UserContextRule => "user_context_rule",
+        MatchKind::UserCorrectionRule => "user_correction_rule",
+        MatchKind::ShiftSlip => "shift_slip",
+        MatchKind::DialectNormalization => "dialect_normalization",
+        MatchKind::Contraction => "contraction",
+        MatchKind::UnmergedCompound => "unmerged_compound",
+        MatchKind::SemicolonContraction => "semicolon_contraction",
+        MatchKind::TransposedApostrophe => "transposed_apostrophe",
+        MatchKind::KnownTypoDict => "known_typo_dict",
+        MatchKind::SwitchChatter => "switch_chatter",
+        MatchKind::MissedSpaceSplit => "missed_space_split",
+        MatchKind::FuzzyLexicon => "fuzzy_lexicon",
+        MatchKind::SmashRescue => "smash_rescue",
+    }
+}
+
+fn undo_resolution_label(res: &UndoResolution) -> String {
+    match res {
+        UndoResolution::Triggered => "triggered".to_string(),
+        UndoResolution::KeptVerbatim => "kept_verbatim".to_string(),
+        UndoResolution::EditedToThird { final_word } => {
+            format!("edited_to_third -> {final_word:?}")
+        }
+        UndoResolution::SelfConfirmCancelled => "self_confirm_cancelled".to_string(),
+        UndoResolution::ClauseErased => "clause_erased".to_string(),
+    }
+}
+
+fn print_top_pairs(title: &str, map: &std::collections::BTreeMap<String, u32>, max_items: usize) {
+    if map.is_empty() {
+        return;
+    }
+    let mut pairs: Vec<(&String, &u32)> = map.iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    println!("\n{title}:");
+    for (pair, count) in pairs.into_iter().take(max_items) {
+        if let Some((lhs, rhs)) = pair.split_once("->") {
+            println!("  [{count}x] {lhs:?} -> {rhs:?}");
+        } else {
+            println!("  [{count}x] {pair}");
+        }
+    }
+}
+
+fn cmd_log(args: &[String]) -> Result<(), String> {
+    let mut dir = default_config_dir();
+    let mut limit: usize = 50;
+    let mut clear = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                i += 1;
+                dir = PathBuf::from(args.get(i).ok_or("--dir requires a path")?);
+            }
+            "--limit" | "-n" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--limit requires a number")?;
+                limit = raw
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --limit {raw:?} (expected integer)"))?;
+            }
+            "--clear" => {
+                clear = true;
+            }
+            other => {
+                return Err(format!(
+                    "unknown flag {other} (usage: smartkey log [--limit <N>] [--clear] [--dir <path>])"
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    let mut store = load_rule_store(&dir, Preset::Balanced)?;
+    let state_label = store
+        .state_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<in-memory>".to_string());
+
+    if clear {
+        store.clear_diagnostic_logs().map_err(|e| e.to_string())?;
+        println!("Cleared SmartKey diagnostic logs at {state_label}");
+        return Ok(());
+    }
+
+    let st = store.state();
+    let total_applied: u32 = st.applied_counts.values().copied().sum();
+    let total_undos: u32 = st.undo_counts.values().copied().sum();
+    let total_manual: u32 = st.manual_fix_counts.values().copied().sum();
+
+    println!("=== SmartKey Diagnostic Log ===");
+    println!("State File           : {state_label}");
+    println!(
+        "Autocorrects Applied : {} total ({} unique pairs)",
+        total_applied,
+        st.applied_counts.len()
+    );
+    println!(
+        "Backspace Undos      : {} total ({} unique pairs)",
+        total_undos,
+        st.undo_counts.len()
+    );
+    println!(
+        "Manual Backspace Fix : {} total ({} unique pairs)",
+        total_manual,
+        st.manual_fix_counts.len()
+    );
+
+    print_top_pairs("Backspace Undo Counts (1x / 2x / 3x+)", &st.undo_counts, 10);
+    print_top_pairs(
+        "Manual Backspace Fix Counts (1x / 2x / 3x+)",
+        &st.manual_fix_counts,
+        10,
+    );
+    print_top_pairs("Top Autocorrects Applied", &st.applied_counts, 10);
+
+    if st.recent_events.is_empty() {
+        println!("\nRecent Events: (none yet)");
+        return Ok(());
+    }
+
+    let total_events = st.recent_events.len();
+    let start = total_events.saturating_sub(limit);
+    let shown = &st.recent_events[start..];
+    println!(
+        "\nRecent Events (showing {} of {}, oldest -> newest):",
+        shown.len(),
+        total_events
+    );
+    for ev in shown {
+        match ev {
+            DiagnosticEvent::AutocorrectApplied {
+                typed,
+                applied,
+                kind,
+                total_count,
+            } => {
+                println!(
+                    "  [{total_count}x] AUTOCORRECT ({}) {typed:?} -> {applied:?}",
+                    match_kind_slug(*kind)
+                );
+            }
+            DiagnosticEvent::BackspaceUndo {
+                typed,
+                rejected,
+                resolution,
+                undo_count,
+            } => {
+                println!(
+                    "  [{undo_count}x] BACKSPACE_UNDO ({}) {typed:?} -> {rejected:?}",
+                    undo_resolution_label(resolution)
+                );
+            }
+            DiagnosticEvent::ManualBackspaceFix {
+                orig,
+                fixed,
+                outcome,
+                attempt_count,
+            } => {
+                println!("  [{attempt_count}x] MANUAL_FIX ({outcome}) {orig:?} -> {fixed:?}");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -615,12 +791,15 @@ fn main() {
     let res = match args.first().map(String::as_str) {
         Some("init") => cmd_init(&args[1..]),
         Some("rules") => cmd_rules(&args[1..]),
+        Some("log") => cmd_log(&args[1..]),
         Some("build-lexicon") => cmd_build_lexicon(),
         Some("eval") => cmd_eval(),
         Some("explain") => cmd_explain(&args[1..]),
         Some("repl") => cmd_repl(&args[1..]),
         _ => {
-            eprintln!("Usage: smartkey <init | rules | build-lexicon | eval | explain | repl>");
+            eprintln!(
+                "Usage: smartkey <init | rules | log | build-lexicon | eval | explain | repl>"
+            );
             std::process::exit(2);
         }
     };

@@ -4,7 +4,7 @@ use crate::casing::is_expressive_stretch;
 use crate::keyboard::damerau_levenshtein_chars;
 use crate::lexicon::EnglishLexicon;
 use crate::scorer::UserRuleView;
-use crate::store::RuleStore;
+use crate::store::{RuleStore, UndoResolution};
 use crate::types::LangId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,11 +210,13 @@ pub fn resolve_restored_edit(
 
     // Row 3: Accidental BackSpace (`"chagnes " -> "changes " -> BS -> "changes "`)
     if fin_lower == rej_lower {
+        store.resolve_pending_undo_log(raw_typed, rejected, UndoResolution::SelfConfirmCancelled);
         return vec![LearnEvent::SelfConfirmCancelled];
     }
 
     // Row 2: Kept verbatim (`"hok " -> "hot " -> BS -> "hok "`)
     if fin_lower == raw_lower {
+        store.resolve_pending_undo_log(raw_typed, rejected, UndoResolution::KeptVerbatim);
         return vec![record_undo_keep_verbatim(store, lang, raw_typed, rejected)];
     }
 
@@ -222,6 +224,13 @@ pub fn resolve_restored_edit(
     // Run `Delta-Span` / `MindChangeDistance` guards first so clearing a word at index 0 to write
     // a brand-new sentence (`"chagnes" -> "hello"`) or completing an early-space suffix
     // (`"prodcut" -> "product" -> BS -> "production"`) never poisons `blocklist`.
+    store.resolve_pending_undo_log(
+        raw_typed,
+        rejected,
+        UndoResolution::EditedToThird {
+            final_word: final_committed.to_string(),
+        },
+    );
     let edit_ev = record_manual_edit(store, lexicon, lang, prev_word, raw_typed, final_committed);
     if matches!(
         edit_ev,
@@ -243,8 +252,40 @@ pub fn resolve_restored_edit(
     ]
 }
 
-/// Row 4 & Row 6: Evaluates a manual edit (`orig -> fixed`) through `Delta-Span Check` + Guards 1–3.
+/// Row 4 & Row 6: Evaluates a manual edit (`orig -> fixed`) through `Delta-Span Check` + Guards 1–3,
+/// and logs the `1x, 2x, 3x+` manual backspace fix attempt.
 pub fn record_manual_edit(
+    store: &mut RuleStore,
+    lexicon: Option<&EnglishLexicon>,
+    lang: &LangId,
+    prev_word: Option<&str>,
+    orig_raw: &str,
+    fixed_raw: &str,
+) -> LearnEvent {
+    let ev = record_manual_edit_inner(store, lexicon, lang, prev_word, orig_raw, fixed_raw);
+    let label = match &ev {
+        LearnEvent::StagedCorrection { count, .. } => Some(format!("staged ({count}x)")),
+        LearnEvent::GraduatedCorrection { .. } => Some("graduated".to_string()),
+        LearnEvent::StagedContextCorrection { count, .. } => {
+            Some(format!("staged_context ({count}x)"))
+        }
+        LearnEvent::GraduatedContextCorrection { .. } => Some("graduated_context".to_string()),
+        LearnEvent::Ignored(
+            reason @ (SkipReason::TargetNotValidWord
+            | SkipReason::DeltaSpanRewrite
+            | SkipReason::MindChangeDistance
+            | SkipReason::ValidWordNoContext
+            | SkipReason::WeakContextAsymmetry),
+        ) => Some(format!("skipped:{}", reason.as_str())),
+        _ => None,
+    };
+    if let Some(outcome_str) = label {
+        store.log_manual_backspace_fix(orig_raw, fixed_raw, &outcome_str);
+    }
+    ev
+}
+
+fn record_manual_edit_inner(
     store: &mut RuleStore,
     lexicon: Option<&EnglishLexicon>,
     lang: &LangId,

@@ -7,7 +7,7 @@ use crate::learner::{
 };
 use crate::lexicon::EnglishLexicon;
 use crate::scorer::{EnglishScorer, EvalContext, LanguageScorer, UserRuleView};
-use crate::store::RuleStore;
+use crate::store::{RuleStore, UndoResolution};
 use crate::types::{
     AppProfile, Candidate, EvalOutcome, Explanation, InputOrigin, LangId, MatchKind,
 };
@@ -310,10 +310,12 @@ impl SmartKeySession {
         self.mobile_pending_undo = None;
     }
 
-    /// Flushes any confirmed untouched unknown word before resetting session state.
+    /// Flushes any confirmed untouched unknown word before resetting session state,
+    /// and hot-reloads `rules.toml` / `learner_state.json` if modified externally.
     pub fn reset(&mut self, engine: &mut SmartKeyEngine) -> Vec<LearnEvent> {
         let mut events = Vec::new();
         self.flush_pending_unknown(engine, &mut events);
+        engine.store.reload_if_modified();
         self.reset_state_only();
         events
     }
@@ -424,7 +426,7 @@ impl SmartKeySession {
                 SessionOutput::with_events(events)
             }
             KeyInput::BackSpace => self.handle_backspace(engine, now_ms),
-            KeyInput::CtrlBackSpace => self.handle_ctrl_backspace(),
+            KeyInput::CtrlBackSpace => self.handle_ctrl_backspace(engine),
             KeyInput::Char(ch) => self.handle_char(engine, ch, now_ms),
         }
     }
@@ -455,6 +457,17 @@ impl SmartKeySession {
                         &buf,
                     );
                     events.extend(evs.into_iter().filter(|e| !matches!(e, LearnEvent::None)));
+                } else if is_snippet && !buf.is_empty() {
+                    let res = if buf.eq_ignore_ascii_case(&raw_typed) {
+                        UndoResolution::KeptVerbatim
+                    } else if buf.eq_ignore_ascii_case(&rejected) {
+                        UndoResolution::SelfConfirmCancelled
+                    } else {
+                        UndoResolution::EditedToThird { final_word: buf }
+                    };
+                    engine
+                        .store
+                        .resolve_pending_undo_log(&raw_typed, &rejected, res);
                 }
             }
             Mode::EditingPrevious {
@@ -517,7 +530,7 @@ impl SmartKeySession {
         }
     }
 
-    fn handle_backspace(&mut self, engine: &SmartKeyEngine, now_ms: u64) -> SessionOutput {
+    fn handle_backspace(&mut self, engine: &mut SmartKeyEngine, now_ms: u64) -> SessionOutput {
         let mode = std::mem::replace(&mut self.mode, Mode::Idle);
         match mode {
             Mode::Idle => {
@@ -534,6 +547,11 @@ impl SmartKeySession {
             } => {
                 let undo_window = engine.store.compiled().undo_window_ms;
                 if now_ms.saturating_sub(corrected_at_ms) <= undo_window {
+                    engine.store.log_backspace_undo(
+                        &raw_typed,
+                        &applied,
+                        UndoResolution::Triggered,
+                    );
                     let delete_chars =
                         applied.chars().count() + trailing_boundaries.chars().count();
                     let restored = raw_typed.clone();
@@ -567,6 +585,11 @@ impl SmartKeySession {
             } => {
                 if buf.is_empty() {
                     // Clause-Erase Cancel: user held BackSpace past index 0 into previous word!
+                    engine.store.resolve_pending_undo_log(
+                        &raw_typed,
+                        &rejected,
+                        UndoResolution::ClauseErased,
+                    );
                     self.prev_word = None;
                 } else {
                     buf.pop();
@@ -668,7 +691,7 @@ impl SmartKeySession {
         }
     }
 
-    fn handle_ctrl_backspace(&mut self) -> SessionOutput {
+    fn handle_ctrl_backspace(&mut self, engine: &mut SmartKeyEngine) -> SessionOutput {
         let mode = std::mem::replace(&mut self.mode, Mode::Idle);
         match mode {
             Mode::AfterWord {
@@ -701,14 +724,23 @@ impl SmartKeySession {
                 prev_word_before,
                 buf,
                 is_snippet,
-            } if !buf.is_empty() => {
-                self.mode = Mode::EditingRestored {
-                    raw_typed,
-                    rejected,
-                    prev_word_before,
-                    buf: String::new(),
-                    is_snippet,
-                };
+            } => {
+                if buf.is_empty() {
+                    engine.store.resolve_pending_undo_log(
+                        &raw_typed,
+                        &rejected,
+                        UndoResolution::ClauseErased,
+                    );
+                    self.prev_word = None;
+                } else {
+                    self.mode = Mode::EditingRestored {
+                        raw_typed,
+                        rejected,
+                        prev_word_before,
+                        buf: String::new(),
+                        is_snippet,
+                    };
+                }
             }
             Mode::Composing {
                 buf,
@@ -812,7 +844,9 @@ impl SmartKeySession {
                 mut buf,
                 is_snippet,
             } => {
-                if Self::is_immediate_boundary(ch) || matches!(ch, '.' | ':' | ';') {
+                if Self::is_immediate_boundary(ch)
+                    || (!buf.is_empty() && matches!(ch, '.' | ':' | ';'))
+                {
                     if !is_snippet && !buf.is_empty() {
                         let lex = engine.scorer.as_ref().map(|s| s.lexicon());
                         let evs = resolve_restored_edit(
@@ -826,6 +860,19 @@ impl SmartKeySession {
                         );
                         learn_events
                             .extend(evs.into_iter().filter(|e| !matches!(e, LearnEvent::None)));
+                    } else if is_snippet && !buf.is_empty() {
+                        let res = if buf.eq_ignore_ascii_case(&raw_typed) {
+                            UndoResolution::KeptVerbatim
+                        } else if buf.eq_ignore_ascii_case(&rejected) {
+                            UndoResolution::SelfConfirmCancelled
+                        } else {
+                            UndoResolution::EditedToThird {
+                                final_word: buf.clone(),
+                            }
+                        };
+                        engine
+                            .store
+                            .resolve_pending_undo_log(&raw_typed, &rejected, res);
                     }
                     let is_space = ch == ' ' || ch == '\t';
                     let punct = if is_space { None } else { Some(ch) };
@@ -856,7 +903,9 @@ impl SmartKeySession {
                 prev_word_before,
                 mut buf,
             } => {
-                if Self::is_immediate_boundary(ch) || matches!(ch, '.' | ':' | ';') {
+                if Self::is_immediate_boundary(ch)
+                    || (!buf.is_empty() && matches!(ch, '.' | ':' | ';'))
+                {
                     if !buf.is_empty() {
                         let lex = engine.scorer.as_ref().map(|s| s.lexicon());
                         let ev = record_manual_edit(
@@ -984,9 +1033,9 @@ impl SmartKeySession {
         }
 
         // Starting from `Idle` (or transitioning out of `JustAutocorrected` / `AfterWord`):
-        if Self::is_immediate_boundary(ch)
-            || Self::is_opening_delimiter_when_idle(ch)
-            || matches!(ch, '.' | ':' | ';')
+        // Leading `;` and `:` are allowed to start `Composing` so `;addr` / `:sig` snippets work
+        // while non-snippets (`:wq`, `;)`) safely hit `TokenAnalysis::Bypass`.
+        if Self::is_immediate_boundary(ch) || Self::is_opening_delimiter_when_idle(ch) || ch == '.'
         {
             if Self::ends_sentence(ch) {
                 self.prev_word = None;
@@ -1073,6 +1122,9 @@ impl SmartKeySession {
             EvalOutcome::Autocorrect {
                 replacement, kind, ..
             } => {
+                engine
+                    .store
+                    .log_autocorrect_applied(&word, &replacement, kind);
                 let mut trailing_boundaries = String::with_capacity(2);
                 if let Some(p) = prior_punct {
                     trailing_boundaries.push(p);
@@ -1220,6 +1272,9 @@ impl SmartKeySession {
         engine.store.set_active_lang(self.lang.clone());
         self.mobile_pending_undo = None;
         self.prev_word = Some(raw_typed.to_string());
+        engine
+            .store
+            .log_backspace_undo(raw_typed, rejected, UndoResolution::KeptVerbatim);
         record_undo_keep_verbatim(&mut engine.store, &self.lang, raw_typed, rejected)
     }
 

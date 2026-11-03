@@ -859,10 +859,12 @@ impl EnglishScorer {
                     continue;
                 }
                 let mapped = self.lexicon.map_dialect(&entry.word, config.dialect);
-                // When >=88% of letters match in a long word (`hstiautoin -> situation`), cap effective scramble cost
-                // so multiple local transpositions don't drown out an unmistakable character-bag match.
+                // When >=88% of letters match in a long word (`hstiautoin -> situation`), or >=85%
+                // on 12+ char words (`implementintion -> implementation`), cap effective scramble cost
+                // so multiple local slips don't drown out an unmistakable character-bag match.
                 let raw_cost = weighted_keyboard_cost(&core_lower, mapped);
-                let damped_scramble_cost = if overlap >= 0.88 {
+                let high_overlap = overlap >= 0.88 || (char_len >= 12 && overlap >= 0.85);
+                let damped_scramble_cost = if high_overlap {
                     raw_cost.min(1.15)
                 } else {
                     raw_cost

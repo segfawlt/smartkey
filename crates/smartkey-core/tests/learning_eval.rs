@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use proptest::prelude::*;
 use serde::Deserialize;
 use smartkey_core::{
-    apply_key_to_buffer, Candidate, KeyInput, LangId, LearnEvent, MatchKind, Preset, RuleStore,
-    SessionAction, SkipReason, SmartKeyEngine, SmartKeySession, UserRuleView,
+    apply_key_to_buffer, Candidate, DiagnosticEvent, KeyInput, LangId, LearnEvent, MatchKind,
+    Preset, RuleStore, SessionAction, SkipReason, SmartKeyEngine, SmartKeySession, UndoResolution,
+    UserRuleView,
 };
 
 fn workspace_root() -> PathBuf {
@@ -359,6 +360,157 @@ fn heliboard_mobile_word_hooks_work_portably() {
     assert!(!engine.is_telex_passthrough("aur"));
     session.on_lotus_passthrough_repair(&mut engine, "aur");
     assert!(engine.is_telex_passthrough("aur"));
+}
+
+#[test]
+fn diagnostic_logger_tracks_autocorrects_and_1x_2x_3x_backspace_events() {
+    let custom_toml = r#"
+version = 1
+[settings]
+enabled = true
+
+[snippets]
+";addr" = "123 Le Loi"
+"#;
+    let store = RuleStore::from_toml_str(custom_toml).unwrap();
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    // 1. Normal untouched words must NEVER be logged
+    feed_keys(&mut session, &mut engine, &mut buf, "hello world ");
+    assert!(engine.store().state().recent_events.is_empty());
+
+    // 2. 1x and 2x AutocorrectApplied (`"ahve" -> "have"`)
+    feed_keys(&mut session, &mut engine, &mut buf, "ahve ahve ");
+    assert_eq!(
+        engine.store().state().applied_counts.get("ahve->have"),
+        Some(&2)
+    );
+    assert!(engine
+        .store()
+        .state()
+        .recent_events
+        .contains(&DiagnosticEvent::AutocorrectApplied {
+            typed: "ahve".to_string(),
+            applied: "have".to_string(),
+            kind: MatchKind::KnownTypoDict,
+            total_count: 2,
+        }));
+
+    // 3. Snippet undo 1x, 2x, 3x (`;addr -> 123 Le Loi` -> `<BS>` -> kept verbatim)
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        ";addr <BS> ;addr <BS> ;addr <BS> ",
+    );
+    assert_eq!(
+        engine.store().state().undo_counts.get(";addr->123 le loi"),
+        Some(&3)
+    );
+    assert!(engine
+        .store()
+        .state()
+        .recent_events
+        .contains(&DiagnosticEvent::BackspaceUndo {
+            typed: ";addr".to_string(),
+            rejected: "123 Le Loi".to_string(),
+            resolution: UndoResolution::KeptVerbatim,
+            undo_count: 3,
+        }));
+
+    // 4. Undo resolutions: SelfConfirmCancelled, ClauseErased, and EditedToThird
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "chagnes <BS><BS><BS><BS><BS>nges ",
+    );
+    assert!(engine
+        .store()
+        .state()
+        .recent_events
+        .contains(&DiagnosticEvent::BackspaceUndo {
+            typed: "chagnes".to_string(),
+            rejected: "changes".to_string(),
+            resolution: UndoResolution::SelfConfirmCancelled,
+            undo_count: 1,
+        }));
+
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "teh <BS><BS><BS><BS><BS>",
+    );
+    assert!(engine
+        .store()
+        .state()
+        .recent_events
+        .contains(&DiagnosticEvent::BackspaceUndo {
+            typed: "teh".to_string(),
+            rejected: "the".to_string(),
+            resolution: UndoResolution::ClauseErased,
+            undo_count: 1,
+        }));
+
+    // 5. 1x + 2x ManualBackspaceFix (`adpatr -> adapter`) + skipped DeltaSpanRewrite
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "adpatr <BS><BS><BS><BS><BS>apter adpatr <BS><BS><BS><BS><BS>apter ",
+    );
+    assert_eq!(
+        engine
+            .store()
+            .state()
+            .manual_fix_counts
+            .get("adpatr->adapter"),
+        Some(&2)
+    );
+    assert!(engine
+        .store()
+        .state()
+        .recent_events
+        .contains(&DiagnosticEvent::ManualBackspaceFix {
+            orig: "adpatr".to_string(),
+            fixed: "adapter".to_string(),
+            outcome: "graduated".to_string(),
+            attempt_count: 2,
+        }));
+
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "prodcut<BS><BS><BS>uction ",
+    );
+    assert!(engine
+        .store()
+        .state()
+        .recent_events
+        .contains(&DiagnosticEvent::ManualBackspaceFix {
+            orig: "prodcut".to_string(),
+            fixed: "production".to_string(),
+            outcome: "skipped:delta_span_rewrite".to_string(),
+            attempt_count: 1,
+        }));
+
+    // 6. Clearing diagnostic logs preserves graduated rules while wiping event feed
+    engine.store_mut().clear_diagnostic_logs().unwrap();
+    assert!(engine.store().state().recent_events.is_empty());
+    assert!(engine.store().state().undo_counts.is_empty());
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .corrections
+            .get("adpatr")
+            .map(String::as_str),
+        Some("adapter")
+    );
 }
 
 fn arb_key_input() -> impl Strategy<Value = KeyInput> {
