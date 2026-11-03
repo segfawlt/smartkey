@@ -20,11 +20,12 @@ Privacy-first, 100% on-device **PC-first autocorrect and deterministic backspace
 - [Architecture & Implementation Plan (v3.2)](./docs/architecture-and-plan.md)
 - [Competitor & Ecosystem Analysis](./docs/competitor-analysis.md)
 
-## Workspace Crates
+## Workspace Crates & Adapters
 
-- **`crates/smartkey-core`** — Pure-Rust Layer 1 scorer, `SmartKeySession` shadow-buffer learner, and comment-preserving `toml_edit` `RuleStore` (zero OS/C-sys/`$HOME` dependencies).
-- **`crates/smartkey-ffi`** — Panic-safe `extern "C"` ABI (`include/smartkey.h`) for `fcitx5-lotus` on Linux Wayland and portable word-level JNI hooks for Android `HeliBoard`.
-- **`crates/smartkey-cli`** — Developer CLI (`init`, `rules`, `eval`, `explain`, `repl`, `build-lexicon`).
+- **`crates/smartkey-core`** — Pure-Rust Layer 1 scorer, `SmartKeySession` shadow-buffer learner, diagnostic event logger, and comment-preserving `toml_edit` `RuleStore` (zero OS/C-sys/`$HOME` dependencies).
+- **`crates/smartkey-ffi`** — Panic-safe `extern "C"` ABI (`include/smartkey.h`) for desktop input method modules (`fcitx5`) and portable word-level JNI hooks for Android `HeliBoard`.
+- **`crates/smartkey-cli`** — Developer & inspection CLI (`init`, `rules`, `log`, `eval`, `explain`, `repl`, `build-lexicon`).
+- **`adapters/fcitx5-smartkey`** — Standalone C++20 `fcitx5` module addon (`Category=Module`, zero `sudo` user-local install to `~/.local`) that runs English autocorrect on `keyboard-*` layouts while stepping aside automatically when `Alt+Z` switches to `fcitx5-bamboo` or `fcitx5-lotus`.
 
 ## Quick Start
 
@@ -33,17 +34,26 @@ Privacy-first, 100% on-device **PC-first autocorrect and deterministic backspace
 cargo test --workspace
 cargo run --release -p smartkey-cli -- eval
 
-# Initialize ~/.config/smartkey/rules.toml (presets: balanced | chat_casual | developer_strict)
-cargo run --release -p smartkey-cli -- init --preset balanced
-cargo run --release -p smartkey-cli -- rules
+# Install the `smartkey` CLI and user-local `fcitx5-smartkey` addon (no sudo required)
+cargo install --path crates/smartkey-cli
+./adapters/fcitx5-smartkey/scripts/install-local.sh
+
+# Inspect live autocorrects, 1x/2x/3x+ backspace undos, and manual fixes
+smartkey log
+smartkey rules
 
 # Inspect how SmartKey scores and explains a token
-cargo run --release -p smartkey-cli -- explain "hstiautoin"
-cargo run --release -p smartkey-cli -- explain --prev "over" "ther"
+smartkey explain "implementintion"
+smartkey explain --prev "over" "ther"
 
 # Launch interactive terminal typing + live backspace-learning sandbox
-cargo run --release -p smartkey-cli -- repl
+smartkey repl
 ```
+
+### App Context Profiles (`fcitx5-smartkey`)
+
+- **Bypass (`100%` hands-off):** Password/PIN/URL/email/numeric fields (`CapabilityFlags`), terminals (`kitty`, `alacritty`, `foot`, `ghostty`, `wezterm`, `konsole`, `gnome-terminal`, `xterm`, etc.), and code editors/IDEs (`code`, `codium`, `zed`, `nvim`, `vim`, `emacs`, `helix`, `jetbrains-*`).
+- **Active (`keyboard-*` only):** Browsers (`firefox`, `zen`, `chromium`, `brave`), chat apps (`discord`, `vesktop`, `telegram`, `slack`, `signal`), and general prose/text editors (`gnome-text-editor`, `kate`, `kwrite`, `gedit`, `obsidian`, `libreoffice`). Switching to Vietnamese (`bamboo` / `lotus`) via `Alt+Z` steps SmartKey aside automatically.
 
 ## License
 

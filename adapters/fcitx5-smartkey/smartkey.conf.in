@@ -1,0 +1,12 @@
+[Addon]
+Name=SmartKey Autocorrect
+Comment=On-device PC English autocorrect and deterministic backspace learner
+Type=SharedLibrary
+Library=@SMARTKEY_LIBRARY_SPEC@
+Category=Module
+Version=@PROJECT_VERSION@
+OnDemand=False
+Configurable=False
+
+[Dependencies]
+0=core:5.0.0

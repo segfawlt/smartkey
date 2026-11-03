@@ -1,4 +1,5 @@
 /target
+/adapters/fcitx5-smartkey/build/
 /data/sources/
 **/*.rs.bk
 *.swp
