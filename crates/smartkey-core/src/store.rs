@@ -425,6 +425,20 @@ impl RuleStore {
         Ok(())
     }
 
+    /// Updates `[settings].enabled` in `rules.toml` while preserving all comments.
+    pub fn set_enabled(&mut self, enabled: bool) -> io::Result<()> {
+        self.sync_external_edits_before_write();
+        self.compiled.enabled = enabled;
+        let settings = self
+            .doc
+            .entry("settings")
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .unwrap();
+        settings["enabled"] = toml_edit::value(enabled);
+        self.flush_rules()
+    }
+
     pub fn flush_state(&mut self) -> io::Result<()> {
         if let Some(path) = self.state_path.as_ref().cloned() {
             if let Some(parent) = path.parent() {

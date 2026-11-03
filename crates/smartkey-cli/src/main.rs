@@ -2,22 +2,14 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
+use serde::Serialize;
 use smartkey_core::{
-    apply_key_to_buffer, compile_skdict_from_sources, DiagnosticEvent, Dialect, EmptyUserRules,
-    EnglishLexicon, EnglishScorer, EvalContext, EvalOutcome, KeyInput, LanguageScorer, MatchKind,
-    Preset, RuleStore, ScorerConfig, SessionAction, SmartKeyEngine, SmartKeySession,
-    UndoResolution,
+    apply_key_to_buffer, DiagnosticEvent, Dialect, EnglishScorer, EvalContext, KeyInput, MatchKind,
+    Preset, RuleStore, SessionAction, SmartKeyEngine, SmartKeySession, UndoResolution,
 };
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root")
-        .to_path_buf()
-}
 
 fn default_config_dir() -> PathBuf {
     if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
@@ -33,28 +25,238 @@ fn default_config_dir() -> PathBuf {
     PathBuf::from(".smartkey")
 }
 
+#[cfg(feature = "bundled-en")]
 fn load_scorer() -> Result<EnglishScorer, String> {
-    #[cfg(feature = "bundled-en")]
-    {
-        if let Ok(s) = EnglishScorer::new_bundled() {
-            return Ok(s);
-        }
-    }
-    let skdict_path = workspace_root().join("crates/smartkey-core/assets/en_lexicon.skdict");
-    let bytes = fs::read(&skdict_path).map_err(|e| {
-        format!(
-            "failed to read {}: {e} (run `smartkey build-lexicon` first)",
-            skdict_path.display()
-        )
-    })?;
-    let lex = EnglishLexicon::from_owned_bytes(bytes).map_err(|e| e.to_string())?;
-    Ok(EnglishScorer::new(lex))
+    EnglishScorer::new_bundled().map_err(|e| format!("failed to load bundled lexicon: {e}"))
+}
+
+#[cfg(not(feature = "bundled-en"))]
+fn load_scorer() -> Result<EnglishScorer, String> {
+    Err("smartkeyctl was compiled without `bundled-en` feature".to_string())
 }
 
 fn load_rule_store(dir: &Path, preset: Preset) -> Result<RuleStore, String> {
     let rules_path = dir.join("rules.toml");
     let state_path = dir.join("learner_state.json");
     RuleStore::load_or_init(rules_path, state_path, preset).map_err(|e| e.to_string())
+}
+
+fn notify_fcitx5_reload() -> bool {
+    if let Ok(status) = Command::new("busctl")
+        .args([
+            "--user",
+            "call",
+            "org.fcitx.Fcitx5",
+            "/controller",
+            "org.fcitx.Fcitx.Controller1",
+            "ReloadConfig",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        if status.success() {
+            return true;
+        }
+    }
+    if let Ok(status) = Command::new("fcitx5-remote")
+        .arg("-r")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        return status.success();
+    }
+    false
+}
+
+fn detect_fcitx5_running() -> bool {
+    Command::new("fcitx5-remote")
+        .arg("--check")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn detect_installed_addon() -> Option<PathBuf> {
+    if let Ok(home) = env::var("HOME") {
+        let user_so = PathBuf::from(home).join(".local/lib/fcitx5/libsmartkey.so");
+        if user_so.exists() {
+            return Some(user_so);
+        }
+    }
+    for sys in [
+        "/usr/lib/fcitx5/libsmartkey.so",
+        "/usr/lib64/fcitx5/libsmartkey.so",
+        "/usr/local/lib/fcitx5/libsmartkey.so",
+    ] {
+        let p = PathBuf::from(sys);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[derive(Serialize)]
+struct StatusJson {
+    enabled: bool,
+    fcitx5_running: bool,
+    addon_library: Option<String>,
+    rules_path: String,
+    dialect: Dialect,
+    personal_words: usize,
+    learned_corrections: usize,
+    autocorrects_applied: u32,
+    backspace_undos: u32,
+    text: &'static str,
+    tooltip: String,
+}
+
+fn cmd_status(args: &[String]) -> Result<(), String> {
+    let mut dir = default_config_dir();
+    let mut as_json = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                i += 1;
+                dir = PathBuf::from(args.get(i).ok_or("--dir requires a path")?);
+            }
+            "--json" => {
+                as_json = true;
+            }
+            other => {
+                return Err(format!(
+                    "unknown flag {other} (usage: smartkeyctl status [--json] [--dir <path>])"
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    let store = load_rule_store(&dir, Preset::Balanced)?;
+    let c = store.compiled();
+    let st = store.state();
+    let fcitx_up = detect_fcitx5_running();
+    let addon_so = detect_installed_addon();
+
+    let total_applied: u32 = st.applied_counts.values().copied().sum();
+    let total_undos: u32 = st.undo_counts.values().copied().sum();
+    let total_learned = c.corrections.len() + c.context_corrections.len();
+    let rules_str = store
+        .rules_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<in-memory>".to_string());
+
+    if as_json {
+        let text = if c.enabled { "SK" } else { "SK-OFF" };
+        let tooltip = format!(
+            "SmartKey: {} | learned={} | applied={} | undos={}",
+            if c.enabled { "enabled" } else { "disabled" },
+            total_learned,
+            total_applied,
+            total_undos
+        );
+        let payload = StatusJson {
+            enabled: c.enabled,
+            fcitx5_running: fcitx_up,
+            addon_library: addon_so.map(|p| p.display().to_string()),
+            rules_path: rules_str,
+            dialect: c.scorer_config.dialect,
+            personal_words: c.personal_dict.len(),
+            learned_corrections: total_learned,
+            autocorrects_applied: total_applied,
+            backspace_undos: total_undos,
+            text,
+            tooltip,
+        };
+        println!("{}", serde_json::to_string(&payload).unwrap());
+        return Ok(());
+    }
+
+    println!("=== SmartKey Status ===");
+    println!(
+        "Engine State         : {}",
+        if c.enabled { "ENABLED" } else { "DISABLED" }
+    );
+    println!(
+        "Fcitx5 Daemon        : {}",
+        if fcitx_up {
+            "running"
+        } else {
+            "not detected in current session"
+        }
+    );
+    println!(
+        "Fcitx5 Addon Library : {}",
+        addon_so
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not found".to_string())
+    );
+    println!("Rules File           : {rules_str}");
+    println!(
+        "Profile              : dialect={:?} | aggressiveness={:?} | undo_window={}ms",
+        c.scorer_config.dialect, c.scorer_config.aggressiveness, c.undo_window_ms
+    );
+    println!(
+        "Personal Brain       : {} dict words | {} learned rules | {} blocklisted pairs",
+        c.personal_dict.len(),
+        total_learned,
+        c.blocklist.len()
+    );
+    println!(
+        "Diagnostic Counters  : {} autocorrects | {} backspace undos",
+        total_applied, total_undos
+    );
+    Ok(())
+}
+
+fn cmd_set_enabled(args: &[String], mode: Option<bool>) -> Result<(), String> {
+    let mut dir = default_config_dir();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                i += 1;
+                dir = PathBuf::from(args.get(i).ok_or("--dir requires a path")?);
+            }
+            other => {
+                return Err(format!(
+                    "unknown flag {other} (usage: smartkeyctl enable|disable|toggle [--dir <path>])"
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    let mut store = load_rule_store(&dir, Preset::Balanced)?;
+    let target = mode.unwrap_or(!store.compiled().enabled);
+    store.set_enabled(target).map_err(|e| e.to_string())?;
+    let reloaded = notify_fcitx5_reload();
+    println!(
+        "SmartKey {} ({})",
+        if target { "enabled" } else { "disabled" },
+        if reloaded {
+            "Fcitx5 reloaded via DBus"
+        } else {
+            "saved to rules.toml; will apply on next focus change"
+        }
+    );
+    Ok(())
+}
+
+fn cmd_reload() -> Result<(), String> {
+    if notify_fcitx5_reload() {
+        println!("Reloaded Fcitx5 SmartKey configuration via DBus.");
+    } else {
+        println!(
+            "Could not reach Fcitx5 DBus in this shell; rules.toml still hot-reloads automatically on window focus change."
+        );
+    }
+    Ok(())
 }
 
 fn cmd_init(args: &[String]) -> Result<(), String> {
@@ -84,7 +286,7 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown flag {other} (usage: smartkey init [--preset balanced|chat_casual|developer_strict] [--dir <path>] [--force])"
+                    "unknown flag {other} (usage: smartkeyctl init [--preset balanced|chat_casual|developer_strict] [--dir <path>] [--force])"
                 ));
             }
         }
@@ -101,6 +303,7 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
     }
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     fs::write(&rules_path, preset.initial_toml()).map_err(|e| e.to_string())?;
+    let _ = notify_fcitx5_reload();
     println!(
         "Initialized SmartKey rules ({preset:?}) at {}",
         rules_path.display()
@@ -119,7 +322,7 @@ fn cmd_rules(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown flag {other} (usage: smartkey rules [--dir <path>])"
+                    "unknown flag {other} (usage: smartkeyctl rules [--dir <path>])"
                 ));
             }
         }
@@ -250,7 +453,7 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown flag {other} (usage: smartkey log [--limit <N>] [--clear] [--dir <path>])"
+                    "unknown flag {other} (usage: smartkeyctl log [--limit <N>] [--clear] [--dir <path>])"
                 ));
             }
         }
@@ -265,6 +468,7 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
 
     if clear {
         store.clear_diagnostic_logs().map_err(|e| e.to_string())?;
+        let _ = notify_fcitx5_reload();
         println!("Cleared SmartKey diagnostic logs at {state_label}");
         return Ok(());
     }
@@ -351,199 +555,6 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_build_lexicon() -> Result<(), String> {
-    let root = workspace_root();
-    let src_dir = root.join("data/sources");
-    let read_req = |p: &Path| -> Result<String, String> {
-        fs::read_to_string(p).map_err(|e| {
-            format!(
-                "missing {} ({e}); run `./scripts/fetch_sources.sh` first",
-                p.display()
-            )
-        })
-    };
-
-    let t0 = Instant::now();
-    println!("Loading raw dictionary & bigram sources...");
-    let en_us = read_req(&src_dir.join("en_US.combined"))?;
-    let en_gb = read_req(&src_dir.join("en_GB.combined"))?;
-    let dev_terms = read_req(&root.join("data/dev_terms.txt"))?;
-    let typos_csv = read_req(&src_dir.join("typos_words.csv"))?;
-    let uk_json = read_req(&src_dir.join("british_to_american.json"))?;
-    let count_2w = read_req(&src_dir.join("count_2w.txt"))?;
-
-    println!("Compiling FST lexicon, 96k known smashes, dialect map & bigrams...");
-    let image =
-        compile_skdict_from_sources(&en_us, &en_gb, &dev_terms, &typos_csv, &uk_json, &count_2w);
-
-    let out_path = root.join("crates/smartkey-core/assets/en_lexicon.skdict");
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    fs::write(&out_path, &image).map_err(|e| e.to_string())?;
-
-    let loaded = EnglishLexicon::from_owned_bytes(image.clone()).map_err(|e| e.to_string())?;
-    println!(
-        "Built {} ({:.2} MiB, {} smash-rescue words) in {:.2}s",
-        out_path.display(),
-        image.len() as f64 / (1024.0 * 1024.0),
-        loaded.smash_entries().len(),
-        t0.elapsed().as_secs_f64()
-    );
-    Ok(())
-}
-
-fn cmd_eval() -> Result<(), String> {
-    let root = workspace_root();
-    let scorer = load_scorer()?;
-    let config = ScorerConfig::default();
-
-    let must_fix_raw =
-        fs::read_to_string(root.join("tests/corpus/must_fix.tsv")).map_err(|e| e.to_string())?;
-    let must_not_raw = fs::read_to_string(root.join("tests/corpus/must_not_touch.txt"))
-        .map_err(|e| e.to_string())?;
-
-    let mut fix_total = 0usize;
-    let mut fix_passed = 0usize;
-    let mut fix_failures = Vec::new();
-    let mut latencies_ns = Vec::new();
-
-    for (line_no, line) in must_fix_raw.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let cols: Vec<&str> = trimmed.split('\t').collect();
-        if cols.len() < 4 {
-            return Err(format!(
-                "invalid TSV at must_fix.tsv:{}: {line}",
-                line_no + 1
-            ));
-        }
-        let prev_col = cols[0].trim();
-        let typed = cols[1].trim();
-        let punct_col = cols[2].trim();
-        let expected = cols[3].trim();
-
-        let at_sentence_start = prev_col == "^";
-        let prev_word = if prev_col == "-" || prev_col == "^" {
-            None
-        } else {
-            Some(prev_col)
-        };
-        let boundary_punct = if punct_col == "-" {
-            None
-        } else {
-            punct_col.chars().next()
-        };
-
-        let ctx = EvalContext {
-            prev_word,
-            boundary_punct,
-            at_sentence_start,
-            ..EvalContext::default()
-        };
-
-        let t0 = Instant::now();
-        let outcome = scorer.evaluate(typed, &ctx, &config, &EmptyUserRules);
-        latencies_ns.push(t0.elapsed().as_nanos() as u64);
-
-        fix_total += 1;
-        let actual = match &outcome {
-            EvalOutcome::Autocorrect { replacement, .. } => replacement.as_str(),
-            EvalOutcome::Unchanged { .. } => typed,
-        };
-        if actual == expected {
-            fix_passed += 1;
-        } else {
-            fix_failures.push(format!(
-                "  line {}: prev={:?} typed={:?} punct={:?} -> got {:?}, expected {:?}",
-                line_no + 1,
-                prev_col,
-                typed,
-                punct_col,
-                actual,
-                expected
-            ));
-        }
-    }
-
-    let mut keep_total = 0usize;
-    let mut keep_passed = 0usize;
-    let mut keep_failures = Vec::new();
-
-    for (line_no, line) in must_not_raw.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let ctx = EvalContext::default();
-        let t0 = Instant::now();
-        let outcome = scorer.evaluate(trimmed, &ctx, &config, &EmptyUserRules);
-        latencies_ns.push(t0.elapsed().as_nanos() as u64);
-
-        keep_total += 1;
-        match outcome {
-            EvalOutcome::Unchanged { .. } => keep_passed += 1,
-            EvalOutcome::Autocorrect {
-                replacement, kind, ..
-            } => {
-                keep_failures.push(format!(
-                    "  line {}: {:?} falsely changed to {:?} ({:?})",
-                    line_no + 1,
-                    trimmed,
-                    replacement,
-                    kind
-                ));
-            }
-        }
-    }
-
-    latencies_ns.sort_unstable();
-    let pct = |p: f64| -> f64 {
-        if latencies_ns.is_empty() {
-            return 0.0;
-        }
-        let idx = (((latencies_ns.len() - 1) as f64) * p).round() as usize;
-        latencies_ns[idx] as f64 / 1000.0
-    };
-
-    println!("=== SmartKey Golden Corpus Evaluation ===");
-    println!(
-        "Must-Fix Recall    : {fix_passed}/{fix_total} ({:.1}%)",
-        100.0 * fix_passed as f64 / fix_total.max(1) as f64
-    );
-    println!(
-        "Must-Not-Touch Gate: {keep_passed}/{keep_total} ({:.1}% unchanged, {} false positives)",
-        100.0 * keep_passed as f64 / keep_total.max(1) as f64,
-        keep_failures.len()
-    );
-    println!(
-        "Latency per Token  : p50 = {:.1} µs | p95 = {:.1} µs | p99 = {:.1} µs",
-        pct(0.50),
-        pct(0.95),
-        pct(0.99)
-    );
-
-    if !fix_failures.is_empty() {
-        println!("\nMust-Fix Misses ({}):", fix_failures.len());
-        for f in &fix_failures {
-            println!("{f}");
-        }
-    }
-    if !keep_failures.is_empty() {
-        println!("\nFalse-Positive Violations ({}):", keep_failures.len());
-        for f in &keep_failures {
-            println!("{f}");
-        }
-    }
-
-    if !fix_failures.is_empty() || !keep_failures.is_empty() {
-        return Err("corpus evaluation failed".to_string());
-    }
-    Ok(())
-}
-
 fn cmd_explain(args: &[String]) -> Result<(), String> {
     let mut prev: Option<String> = None;
     let mut punct: Option<char> = None;
@@ -587,7 +598,7 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
 
     let Some(tok) = token else {
         return Err(
-            "usage: smartkey explain [--prev <word>] [--punct <char>] [--dialect mixed|us|gb] [--dir <path>] [--sentence-start] <token>"
+            "usage: smartkeyctl explain [--prev <word>] [--punct <char>] [--dialect mixed|us|gb] [--dir <path>] [--sentence-start] <token>"
                 .to_string(),
         );
     };
@@ -664,7 +675,7 @@ fn cmd_repl(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown flag {other} (usage: smartkey repl [--dir <path>] [--in-memory])"
+                    "unknown flag {other} (usage: smartkeyctl repl [--dir <path>] [--in-memory])"
                 ));
             }
         }
@@ -786,20 +797,52 @@ fn cmd_repl(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn print_help() {
+    println!(
+        "\
+smartkeyctl {} — Control & inspection CLI for SmartKey
+
+USAGE:
+  smartkeyctl <COMMAND> [OPTIONS]
+
+COMMANDS:
+  status [--json] [--dir <path>]     Show daemon, addon, and personal brain status
+  enable [--dir <path>]              Enable SmartKey and reload Fcitx5
+  disable [--dir <path>]             Disable SmartKey and reload Fcitx5
+  toggle [--dir <path>]              Toggle SmartKey on/off (ideal for WM keybinds)
+  reload                             Reload rules.toml in running Fcitx5 daemon
+  log [--limit <N>] [--clear]        Show autocorrects and 1x/2x/3x+ backspace logs
+  rules [--dir <path>]               Show personal dictionary, blocklist & learned rules
+  explain [FLAGS] <word>             Explain scoring and candidate ranking for a token
+  init [--preset <name>] [--force]   Initialize ~/.config/smartkey/rules.toml
+  repl [--in-memory]                 Interactive terminal typing & learning sandbox",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let res = match args.first().map(String::as_str) {
+        Some("status") => cmd_status(&args[1..]),
+        Some("enable" | "on") => cmd_set_enabled(&args[1..], Some(true)),
+        Some("disable" | "off") => cmd_set_enabled(&args[1..], Some(false)),
+        Some("toggle") => cmd_set_enabled(&args[1..], None),
+        Some("reload") => cmd_reload(),
         Some("init") => cmd_init(&args[1..]),
         Some("rules") => cmd_rules(&args[1..]),
         Some("log") => cmd_log(&args[1..]),
-        Some("build-lexicon") => cmd_build_lexicon(),
-        Some("eval") => cmd_eval(),
         Some("explain") => cmd_explain(&args[1..]),
         Some("repl") => cmd_repl(&args[1..]),
+        Some("--version" | "-V") => {
+            println!("smartkeyctl {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("--help" | "-h" | "help") => {
+            print_help();
+            Ok(())
+        }
         _ => {
-            eprintln!(
-                "Usage: smartkey <init | rules | log | build-lexicon | eval | explain | repl>"
-            );
+            print_help();
             std::process::exit(2);
         }
     };
