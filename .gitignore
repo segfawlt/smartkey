@@ -5,3 +5,8 @@
 *.swp
 .DS_Store
 .worktrees/
+/dist/
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.tar.*
+

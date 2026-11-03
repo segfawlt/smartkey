@@ -24,30 +24,77 @@ Privacy-first, 100% on-device **PC-first autocorrect and deterministic backspace
 
 - **`crates/smartkey-core`** — Pure-Rust Layer 1 scorer, `SmartKeySession` shadow-buffer learner, diagnostic event logger, and comment-preserving `toml_edit` `RuleStore` (zero OS/C-sys/`$HOME` dependencies).
 - **`crates/smartkey-ffi`** — Panic-safe `extern "C"` ABI (`include/smartkey.h`) for desktop input method modules (`fcitx5`) and portable word-level JNI hooks for Android `HeliBoard`.
-- **`crates/smartkey-cli`** — Developer & inspection CLI (`init`, `rules`, `log`, `eval`, `explain`, `repl`, `build-lexicon`).
+- **`crates/smartkey-cli`** — Control CLI (`smartkeyctl`: `status`, `toggle`, `reload`, `log`, `rules`, `explain`, `init`, `repl`) and developer corpus tools (`smartkey-dev`: `eval`, `build-lexicon`).
 - **`adapters/fcitx5-smartkey`** — Standalone C++20 `fcitx5` module addon (`Category=Module`, zero `sudo` user-local install to `~/.local`) that runs English autocorrect on `keyboard-*` layouts while stepping aside automatically when `Alt+Z` switches to `fcitx5-bamboo` or `fcitx5-lotus`.
 
-## Quick Start
+## Installation & Packaging
+
+### 1. Arch Linux (`PKGBUILD` / `.pkg.tar.zst`)
+
+Build a native Arch Linux package from source:
 
 ```bash
-# Run full test suite (golden corpus, learning traces, proptest fuzzing, C++17 FFI link test)
-cargo test --workspace
-cargo run --release -p smartkey-cli -- eval
+./scripts/build-arch-pkg.sh
+sudo pacman -U dist/fcitx5-smartkey-*.pkg.tar.zst
+```
 
-# Install the `smartkey` CLI and user-local `fcitx5-smartkey` addon (no sudo required)
-cargo install --path crates/smartkey-cli
+This installs `/usr/bin/smartkeyctl`, `/usr/lib/fcitx5/libsmartkey.so`, and `/usr/share/fcitx5/addon/smartkey.conf`.
+
+### 2. Portable Linux Archive (`.tar.zst`)
+
+Build a standalone portable bundle for any Linux distribution (`x86_64`):
+
+```bash
+./scripts/package-portable.sh
+```
+
+To install on any system without requiring `sudo` or build dependencies:
+
+```bash
+tar --zstd -xf dist/fcitx5-smartkey-0.1.0-linux-x86_64.tar.zst
+cd fcitx5-smartkey-0.1.0-linux-x86_64
+./install.sh
+# To uninstall: ./uninstall.sh
+```
+
+### 3. From Source (User-Local Install)
+
+Build and install directly into `~/.local` without root privileges:
+
+```bash
 ./adapters/fcitx5-smartkey/scripts/install-local.sh
+# To uninstall: ./adapters/fcitx5-smartkey/scripts/uninstall-local.sh
+```
+
+## Quick Start & CLI Usage
+
+```bash
+# Run full test suite & corpus evaluation
+cargo test --workspace
+cargo run --release -p smartkey-cli --bin smartkey-dev -- eval
+
+# Query status and inspect running Fcitx5 addon
+smartkeyctl status
+
+# Toggle SmartKey autocorrect on/off (ideal for WM keybindings)
+smartkeyctl toggle
+
+# Reload rules.toml in running Fcitx5 daemon
+smartkeyctl reload
 
 # Inspect live autocorrects, 1x/2x/3x+ backspace undos, and manual fixes
-smartkey log
-smartkey rules
+smartkeyctl log
+smartkeyctl rules
 
-# Inspect how SmartKey scores and explains a token
-smartkey explain "implementintion"
-smartkey explain --prev "over" "ther"
+# Inspect how SmartKey scores and ranks candidates for a token
+smartkeyctl explain "implementintion"
+smartkeyctl explain --prev "over" "ther"
+
+# Initialize or reconfigure rules.toml with preset
+smartkeyctl init
 
 # Launch interactive terminal typing + live backspace-learning sandbox
-smartkey repl
+smartkeyctl repl
 ```
 
 ### App Context Profiles (`fcitx5-smartkey`)
