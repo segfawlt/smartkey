@@ -559,3 +559,57 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn test_proper_noun_capitalization_and_undo() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    // "english " -> "English "
+    feed_keys(&mut session, &mut engine, &mut buf, "english ");
+    assert_eq!(buf, "English ");
+
+    // 1x BackSpace undo -> snaps back to "english"
+    feed_keys(&mut session, &mut engine, &mut buf, "<BS>");
+    assert_eq!(buf, "english");
+
+    // Keep it verbatim
+    feed_keys(&mut session, &mut engine, &mut buf, " ");
+    assert_eq!(buf, "english ");
+
+    // "monday " -> "Monday "
+    feed_keys(&mut session, &mut engine, &mut buf, "monday ");
+    assert_eq!(buf, "english Monday ");
+}
+
+#[test]
+fn test_slang_shielding_ofc() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    // "ofc " must NOT become "of "
+    feed_keys(&mut session, &mut engine, &mut buf, "ofc ");
+    assert_eq!(buf, "ofc ");
+}
+
+#[test]
+fn test_unfixed_unknown_logging() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    feed_keys(&mut session, &mut engine, &mut buf, "xkzqw ");
+    assert_eq!(buf, "xkzqw ");
+
+    let st = engine.store().state();
+    assert!(st.untouched_unknowns.contains_key("xkzqw"));
+    assert!(st.recent_events.iter().any(|ev| matches!(
+        ev,
+        DiagnosticEvent::UnfixedUnknown { word, .. } if word == "xkzqw"
+    )));
+}

@@ -117,16 +117,23 @@ pub unsafe extern "C" fn smartkey_engine_new(
         let Ok(store) = build_store(rules_path_utf8, state_path_utf8, preset) else {
             return ptr::null_mut();
         };
-        #[cfg(feature = "bundled-en")]
-        let scorer = EnglishScorer::new_bundled().ok();
-        #[cfg(not(feature = "bundled-en"))]
-        let scorer: Option<EnglishScorer> = None;
 
         Box::into_raw(Box::new(SmartKeyEngineHandle {
-            inner: SmartKeyEngine::new(scorer, store),
+            inner: SmartKeyEngine::new_auto(store),
         }))
     })
     .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_reload_dicts(engine: *mut SmartKeyEngineHandle) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        (*engine).inner.reload_dicts()
+    }))
+    .unwrap_or(false)
 }
 
 #[no_mangle]

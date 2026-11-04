@@ -2,7 +2,7 @@
 pkgname=fcitx5-smartkey
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Privacy-first on-device PC English autocorrect and backspace learner for Fcitx5 (includes smartkeyctl)"
+pkgdesc="Privacy-first on-device PC English autocorrect and backspace learner for Fcitx5 (includes smartkey & smartkeyctl)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/segfawlt/smartkey"
 license=('GPL-3.0-or-later')
@@ -24,7 +24,7 @@ build() {
     export PATH="$HOME/.cargo/bin:$PATH"
     export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable}
     export CARGO_TARGET_DIR=target
-    cargo build --frozen --release -p smartkey-cli --bin smartkeyctl
+    cargo build --frozen --release -p smartkey-cli --bin smartkey
     cmake -B build -S adapters/fcitx5-smartkey \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr \
@@ -40,7 +40,9 @@ check() {
 package() {
     cd "$pkgname-$pkgver"
     DESTDIR="$pkgdir" cmake --install build
-    install -Dm755 target/release/smartkeyctl "$pkgdir/usr/bin/smartkeyctl"
+    install -Dm755 target/release/smartkey "$pkgdir/usr/bin/smartkey"
+    ln -s smartkey "$pkgdir/usr/bin/smartkeyctl"
+    install -Dm644 crates/smartkey-core/assets/en_lexicon.skdict "$pkgdir/usr/share/smartkey/dicts/en.skdict"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

@@ -7,8 +7,9 @@ use std::time::Instant;
 
 use serde::Serialize;
 use smartkey_core::{
-    apply_key_to_buffer, DiagnosticEvent, Dialect, EnglishScorer, EvalContext, KeyInput, MatchKind,
-    Preset, RuleStore, SessionAction, SmartKeyEngine, SmartKeySession, UndoResolution,
+    apply_key_to_buffer, DiagnosticEvent, Dialect, EnglishScorer, EvalContext, EvalOutcome,
+    KeyInput, MatchKind, Preset, RuleStore, SessionAction, SmartKeyEngine, SmartKeySession,
+    UndoResolution,
 };
 
 fn default_config_dir() -> PathBuf {
@@ -25,14 +26,22 @@ fn default_config_dir() -> PathBuf {
     PathBuf::from(".smartkey")
 }
 
-#[cfg(feature = "bundled-en")]
 fn load_scorer() -> Result<EnglishScorer, String> {
-    EnglishScorer::new_bundled().map_err(|e| format!("failed to load bundled lexicon: {e}"))
-}
-
-#[cfg(not(feature = "bundled-en"))]
-fn load_scorer() -> Result<EnglishScorer, String> {
-    Err("smartkeyctl was compiled without `bundled-en` feature".to_string())
+    if let Some(path) = smartkey_core::resolve_dict_path("en") {
+        if let Ok(bytes) = fs::read(&path) {
+            if let Ok(lex) = smartkey_core::EnglishLexicon::from_owned_bytes(bytes) {
+                return Ok(EnglishScorer::new(lex));
+            }
+        }
+    }
+    #[cfg(feature = "bundled-en")]
+    {
+        EnglishScorer::new_bundled().map_err(|e| format!("failed to load bundled lexicon: {e}"))
+    }
+    #[cfg(not(feature = "bundled-en"))]
+    {
+        Err("en.skdict not found in dictionary directories (~/.local/share/smartkey/dicts/ or /usr/share/smartkey/dicts/)".to_string())
+    }
 }
 
 fn load_rule_store(dir: &Path, preset: Preset) -> Result<RuleStore, String> {
@@ -388,6 +397,7 @@ fn match_kind_slug(kind: MatchKind) -> &'static str {
         MatchKind::UserContextRule => "user_context_rule",
         MatchKind::UserCorrectionRule => "user_correction_rule",
         MatchKind::ShiftSlip => "shift_slip",
+        MatchKind::ProperNoun => "proper_noun",
         MatchKind::DialectNormalization => "dialect_normalization",
         MatchKind::Contraction => "contraction",
         MatchKind::UnmergedCompound => "unmerged_compound",
@@ -429,10 +439,31 @@ fn print_top_pairs(title: &str, map: &std::collections::BTreeMap<String, u32>, m
     }
 }
 
+fn print_top_single(title: &str, map: &std::collections::BTreeMap<String, u32>, max_items: usize) {
+    if map.is_empty() {
+        return;
+    }
+    let mut pairs: Vec<(&String, &u32)> = map.iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    println!("\n{title}:");
+    for (word, count) in pairs.into_iter().take(max_items) {
+        println!("  [{count}x] {word:?}");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFilter {
+    All,
+    FixedOnly,
+    ManualOnly,
+    UnfixedOnly,
+}
+
 fn cmd_log(args: &[String]) -> Result<(), String> {
     let mut dir = default_config_dir();
     let mut limit: usize = 50;
     let mut clear = false;
+    let mut filter = LogFilter::All;
 
     let mut i = 0;
     while i < args.len() {
@@ -451,9 +482,18 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
             "--clear" => {
                 clear = true;
             }
+            "fixed" | "--fixed" | "--autocorrect" => {
+                filter = LogFilter::FixedOnly;
+            }
+            "manual" | "--manual" => {
+                filter = LogFilter::ManualOnly;
+            }
+            "unfixed" | "--unfixed" | "missed" => {
+                filter = LogFilter::UnfixedOnly;
+            }
             other => {
                 return Err(format!(
-                    "unknown flag {other} (usage: smartkeyctl log [--limit <N>] [--clear] [--dir <path>])"
+                    "unknown argument {other} (usage: smartkey log [fixed|manual|unfixed] [--limit <N>] [--clear] [--dir <path>])"
                 ));
             }
         }
@@ -477,8 +517,9 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
     let total_applied: u32 = st.applied_counts.values().copied().sum();
     let total_undos: u32 = st.undo_counts.values().copied().sum();
     let total_manual: u32 = st.manual_fix_counts.values().copied().sum();
+    let total_unfixed: u32 = st.untouched_unknowns.values().copied().sum();
 
-    println!("=== SmartKey Diagnostic Log ===");
+    println!("=== SmartKey Diagnostic Log ({:?}) ===", filter);
     println!("State File           : {state_label}");
     println!(
         "Autocorrects Applied : {} total ({} unique pairs)",
@@ -495,23 +536,54 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
         total_manual,
         st.manual_fix_counts.len()
     );
-
-    print_top_pairs("Backspace Undo Counts (1x / 2x / 3x+)", &st.undo_counts, 10);
-    print_top_pairs(
-        "Manual Backspace Fix Counts (1x / 2x / 3x+)",
-        &st.manual_fix_counts,
-        10,
+    println!(
+        "Unfixed Unknowns     : {} total ({} unique words)",
+        total_unfixed,
+        st.untouched_unknowns.len()
     );
-    print_top_pairs("Top Autocorrects Applied", &st.applied_counts, 10);
+
+    if filter == LogFilter::All || filter == LogFilter::ManualOnly {
+        print_top_pairs("Backspace Undo Counts (1x / 2x / 3x+)", &st.undo_counts, 10);
+        print_top_pairs(
+            "Manual Backspace Fix Counts (1x / 2x / 3x+)",
+            &st.manual_fix_counts,
+            10,
+        );
+    }
+    if filter == LogFilter::All || filter == LogFilter::FixedOnly {
+        print_top_pairs("Top Autocorrects Applied", &st.applied_counts, 10);
+    }
+    if filter == LogFilter::All || filter == LogFilter::UnfixedOnly {
+        print_top_single("Top Unfixed Unknown Words", &st.untouched_unknowns, 10);
+    }
 
     if st.recent_events.is_empty() {
         println!("\nRecent Events: (none yet)");
         return Ok(());
     }
 
-    let total_events = st.recent_events.len();
+    let matching_events: Vec<&DiagnosticEvent> = st
+        .recent_events
+        .iter()
+        .filter(|ev| match filter {
+            LogFilter::All => true,
+            LogFilter::FixedOnly => matches!(ev, DiagnosticEvent::AutocorrectApplied { .. }),
+            LogFilter::ManualOnly => matches!(
+                ev,
+                DiagnosticEvent::ManualBackspaceFix { .. } | DiagnosticEvent::BackspaceUndo { .. }
+            ),
+            LogFilter::UnfixedOnly => matches!(ev, DiagnosticEvent::UnfixedUnknown { .. }),
+        })
+        .collect();
+
+    if matching_events.is_empty() {
+        println!("\nRecent Events: (no events matching filter {:?})", filter);
+        return Ok(());
+    }
+
+    let total_events = matching_events.len();
     let start = total_events.saturating_sub(limit);
-    let shown = &st.recent_events[start..];
+    let shown = &matching_events[start..];
     println!(
         "\nRecent Events (showing {} of {}, oldest -> newest):",
         shown.len(),
@@ -549,6 +621,21 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
             } => {
                 println!("  [{attempt_count}x] MANUAL_FIX ({outcome}) {orig:?} -> {fixed:?}");
             }
+            DiagnosticEvent::UnfixedUnknown {
+                word,
+                best_candidate,
+                best_score,
+                threshold,
+                total_count,
+            } => {
+                if let Some(cand) = best_candidate {
+                    println!(
+                        "  [{total_count}x] UNFIXED {word:?} (closest: {cand:?} score={best_score:.2} < thresh={threshold:.2})"
+                    );
+                } else {
+                    println!("  [{total_count}x] UNFIXED {word:?} (no valid candidates)");
+                }
+            }
         }
     }
 
@@ -560,6 +647,7 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
     let mut punct: Option<char> = None;
     let mut dialect: Option<Dialect> = None;
     let mut sentence_start = false;
+    let mut as_json = false;
     let mut dir: Option<PathBuf> = None;
     let mut token: Option<String> = None;
 
@@ -582,6 +670,9 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
                     _ => Dialect::Mixed,
                 });
             }
+            "--json" => {
+                as_json = true;
+            }
             "--dir" => {
                 i += 1;
                 dir = args.get(i).map(PathBuf::from);
@@ -598,7 +689,7 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
 
     let Some(tok) = token else {
         return Err(
-            "usage: smartkeyctl explain [--prev <word>] [--punct <char>] [--dialect mixed|us|gb] [--dir <path>] [--sentence-start] <token>"
+            "usage: smartkey explain [--json] [--prev <word>] [--punct <char>] [--dialect mixed|us|gb] [--dir <path>] [--sentence-start] <token>"
                 .to_string(),
         );
     };
@@ -622,8 +713,211 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
         ..EvalContext::default()
     };
     let exp = engine.explain_token(&tok, &ctx);
-    println!("{}", serde_json::to_string_pretty(&exp).unwrap());
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&exp).unwrap());
+        return Ok(());
+    }
+
+    println!("=== SmartKey Explain: {:?} ===", exp.input);
+    println!("Input Token     : {:?}", exp.input);
+    if let Some(prev) = &exp.prev_word {
+        println!("Previous Word   : {:?}", prev);
+    }
+    if let Some(punct) = exp.boundary_punct {
+        println!("Boundary Punct  : {:?}", punct);
+    }
+    match &exp.outcome {
+        EvalOutcome::Autocorrect {
+            replacement,
+            kind,
+            score,
+            margin,
+        } => {
+            println!(
+                "Verdict         : AUTOCORRECT -> {:?} ({}, score={:.2}, margin={:.2})",
+                replacement,
+                match_kind_slug(*kind),
+                score,
+                margin
+            );
+        }
+        EvalOutcome::Unchanged { reason, do_not_learn } => {
+            println!(
+                "Verdict         : UNCHANGED ({}, do_not_learn={})",
+                match_kind_slug(*reason),
+                do_not_learn
+            );
+        }
+    }
+    let aggr = engine.store().scorer_config().aggressiveness;
+    let (thresh_score, thresh_margin) = match aggr {
+        smartkey_core::Aggressiveness::Conservative => (0.24, 0.09),
+        smartkey_core::Aggressiveness::Balanced => (0.14, 0.05),
+        smartkey_core::Aggressiveness::Aggressive => (0.06, 0.03),
+    };
+    println!(
+        "Configuration   : dialect={:?} | aggressiveness={:?} (min_score >= {:.2}, margin >= {:.2})",
+        engine.store().scorer_config().dialect,
+        aggr,
+        thresh_score,
+        thresh_margin
+    );
+    if !exp.top_candidates.is_empty() {
+        println!("\nTop Ranked Candidates ({}):", exp.top_candidates.len());
+        for (idx, c) in exp.top_candidates.iter().take(5).enumerate() {
+            println!(
+                "  #{:<2} {:<16} score={:<6.2} edit={:<5.2} freq={:<4} [{}]",
+                idx + 1,
+                format!("{:?}", c.replacement),
+                c.score,
+                c.edit_cost,
+                c.freq,
+                match_kind_slug(c.kind)
+            );
+        }
+    } else {
+        println!("\nTop Ranked Candidates : (none)");
+    }
     Ok(())
+}
+
+fn cmd_dict(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("list" | "ls") | None => {
+            println!("=== SmartKey Language Packs ===");
+            let user_dir = smartkey_core::default_user_dict_dir();
+            println!("User Dict Directory   : {}", user_dir.display());
+            println!("System Dict Directory : /usr/share/smartkey/dicts\n");
+
+            let mut found = false;
+            if user_dir.exists() {
+                if let Ok(entries) = fs::read_dir(&user_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|s| s.to_str()) == Some("skdict") {
+                            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+                            let meta = entry.metadata().ok();
+                            let sz = meta.map(|m| m.len() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0);
+                            println!("  [user]   {:<6} ({:.2} MiB) -> {}", stem, sz, path.display());
+                            found = true;
+                        }
+                    }
+                }
+            }
+            for sys in ["/usr/share/smartkey/dicts", "/usr/local/share/smartkey/dicts"] {
+                let sys_dir = Path::new(sys);
+                if sys_dir.exists() {
+                    if let Ok(entries) = fs::read_dir(sys_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().and_then(|s| s.to_str()) == Some("skdict") {
+                                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+                                let meta = entry.metadata().ok();
+                                let sz = meta.map(|m| m.len() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0);
+                                println!("  [system] {:<6} ({:.2} MiB) -> {}", stem, sz, path.display());
+                                found = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !found {
+                #[cfg(feature = "bundled-en")]
+                println!("  [bundled] en (built into binary fallback)");
+                #[cfg(not(feature = "bundled-en"))]
+                println!("  (no language packs installed yet; install with `smartkey dict install en <path>`)");
+            }
+            Ok(())
+        }
+        Some("dir" | "path") => {
+            println!("{}", smartkey_core::default_user_dict_dir().display());
+            Ok(())
+        }
+        Some("install") => {
+            let lang = args.get(1).ok_or("usage: smartkey dict install <lang> <path_or_url>")?;
+            let source = args.get(2).ok_or("usage: smartkey dict install <lang> <path_or_url>")?;
+            let user_dir = smartkey_core::default_user_dict_dir();
+            fs::create_dir_all(&user_dir).map_err(|e| e.to_string())?;
+            let target_path = user_dir.join(format!("{lang}.skdict"));
+
+            if source.starts_with("http://") || source.starts_with("https://") {
+                println!("Downloading {source}...");
+                let status = Command::new("curl")
+                    .args(["-fsSL", source, "-o", target_path.to_str().unwrap()])
+                    .status()
+                    .map_err(|e| format!("failed to run curl: {e}"))?;
+                if !status.success() {
+                    return Err(format!("curl failed with status {status}"));
+                }
+            } else {
+                let src_path = PathBuf::from(source);
+                if !src_path.exists() {
+                    return Err(format!("source file does not exist: {}", src_path.display()));
+                }
+                fs::copy(&src_path, &target_path).map_err(|e| e.to_string())?;
+            }
+
+            let bytes = fs::read(&target_path).map_err(|e| e.to_string())?;
+            smartkey_core::EnglishLexicon::from_owned_bytes(bytes)
+                .map_err(|e| format!("invalid dictionary format: {e}"))?;
+
+            let reloaded = notify_fcitx5_reload();
+            println!(
+                "Successfully installed {lang}.skdict to {} ({})",
+                target_path.display(),
+                if reloaded { "Fcitx5 reloaded via DBus" } else { "will apply on next focus change" }
+            );
+            Ok(())
+        }
+        Some("remove" | "rm" | "uninstall") => {
+            let lang = args.get(1).ok_or("usage: smartkey dict remove <lang>")?;
+            let user_dir = smartkey_core::default_user_dict_dir();
+            let target_path = user_dir.join(format!("{lang}.skdict"));
+            if target_path.exists() {
+                fs::remove_file(&target_path).map_err(|e| e.to_string())?;
+                let reloaded = notify_fcitx5_reload();
+                println!(
+                    "Removed {} ({})",
+                    target_path.display(),
+                    if reloaded { "Fcitx5 reloaded via DBus" } else { "will apply on next focus change" }
+                );
+            } else {
+                println!("No user pack found at {}", target_path.display());
+            }
+            Ok(())
+        }
+        Some("update") => {
+            let lang = args.get(1).map(String::as_str).unwrap_or("en");
+            println!("Checking GitHub releases from segfawlt/smartkey-dicts for '{lang}'...");
+            let url = format!("https://github.com/segfawlt/smartkey-dicts/releases/latest/download/{lang}.skdict");
+            let user_dir = smartkey_core::default_user_dict_dir();
+            fs::create_dir_all(&user_dir).map_err(|e| e.to_string())?;
+            let target_path = user_dir.join(format!("{lang}.skdict"));
+
+            let status = Command::new("curl")
+                .args(["-fsSL", &url, "-o", target_path.to_str().unwrap()])
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    let reloaded = notify_fcitx5_reload();
+                    println!(
+                        "Updated {lang}.skdict at {} ({})",
+                        target_path.display(),
+                        if reloaded { "Fcitx5 reloaded via DBus" } else { "will apply on next focus change" }
+                    );
+                    Ok(())
+                }
+                _ => {
+                    println!("Could not download from {url}. You can manually place {lang}.skdict in {}.", user_dir.display());
+                    Ok(())
+                }
+            }
+        }
+        Some(other) => {
+            Err(format!("unknown dict subcommand {other:?} (usage: smartkey dict [list|dir|install|remove|update])"))
+        }
+    }
 }
 
 struct RawTermGuard {
@@ -800,22 +1094,23 @@ fn cmd_repl(args: &[String]) -> Result<(), String> {
 fn print_help() {
     println!(
         "\
-smartkeyctl {} — Control & inspection CLI for SmartKey
+smartkey {} — Control & inspection CLI for SmartKey
 
 USAGE:
-  smartkeyctl <COMMAND> [OPTIONS]
+  smartkey <COMMAND> [OPTIONS]
 
 COMMANDS:
-  status [--json] [--dir <path>]     Show daemon, addon, and personal brain status
-  enable [--dir <path>]              Enable SmartKey and reload Fcitx5
-  disable [--dir <path>]             Disable SmartKey and reload Fcitx5
-  toggle [--dir <path>]              Toggle SmartKey on/off (ideal for WM keybinds)
-  reload                             Reload rules.toml in running Fcitx5 daemon
-  log [--limit <N>] [--clear]        Show autocorrects and 1x/2x/3x+ backspace logs
-  rules [--dir <path>]               Show personal dictionary, blocklist & learned rules
-  explain [FLAGS] <word>             Explain scoring and candidate ranking for a token
-  init [--preset <name>] [--force]   Initialize ~/.config/smartkey/rules.toml
-  repl [--in-memory]                 Interactive terminal typing & learning sandbox",
+  status [--json] [--dir <path>]                  Show daemon, addon, and personal brain status
+  enable [--dir <path>]                           Enable SmartKey and reload Fcitx5
+  disable [--dir <path>]                          Disable SmartKey and reload Fcitx5
+  toggle [--dir <path>]                           Toggle SmartKey on/off (ideal for WM keybinds)
+  reload                                          Reload configuration & dictionary packs in Fcitx5
+  log [fixed|manual|unfixed] [-n <N>] [--clear]   Show autocorrects, undos, and missed unknown words
+  rules [--dir <path>]                            Show personal dictionary, blocklist & learned rules
+  explain [--json] [FLAGS] <word>                 Explain scoring, proper nouns, and candidate ranking
+  dict [list|dir|install|remove|update]           Inspect and manage modular language dictionary packs
+  init [--preset <name>] [--force]                Initialize ~/.config/smartkey/rules.toml
+  repl [--in-memory]                              Interactive terminal typing & learning sandbox",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -832,9 +1127,10 @@ fn main() {
         Some("rules") => cmd_rules(&args[1..]),
         Some("log") => cmd_log(&args[1..]),
         Some("explain") => cmd_explain(&args[1..]),
+        Some("dict" | "dicts") => cmd_dict(&args[1..]),
         Some("repl") => cmd_repl(&args[1..]),
         Some("--version" | "-V") => {
-            println!("smartkeyctl {}", env!("CARGO_PKG_VERSION"));
+            println!("smartkey {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("--help" | "-h" | "help") => {

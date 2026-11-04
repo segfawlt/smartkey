@@ -30,10 +30,10 @@ impl Preset {
     }
 
     pub fn initial_toml(self) -> String {
-        let (aggr, auto_cap_sent, split_spaces) = match self {
-            Self::Balanced => ("balanced", false, true),
-            Self::ChatCasual => ("balanced", false, true),
-            Self::DeveloperStrict => ("conservative", false, false),
+        let (aggr, auto_cap_sent, split_spaces, fix_proper) = match self {
+            Self::Balanced => ("balanced", false, true, true),
+            Self::ChatCasual => ("balanced", false, true, true),
+            Self::DeveloperStrict => ("conservative", false, false, false),
         };
         format!(
             r#"# SmartKey Configuration & Personal Rule Brain (v1)
@@ -48,6 +48,7 @@ undo_window_ms = 5000
 auto_capitalize_i = true
 auto_capitalize_sentence = {auto_cap_sent}
 fix_shift_slips = true          # THat's -> That's, situatioN: -> situation:, tHIS -> This
+fix_proper_nouns = {fix_proper}         # english -> English, monday -> Monday
 enable_contractions = true
 enable_missed_space_split = {split_spaces}
 
@@ -104,7 +105,7 @@ pub enum UndoResolution {
     ClauseErased,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum DiagnosticEvent {
     AutocorrectApplied {
@@ -124,6 +125,13 @@ pub enum DiagnosticEvent {
         fixed: String,
         outcome: String,
         attempt_count: u32,
+    },
+    UnfixedUnknown {
+        word: String,
+        best_candidate: Option<String>,
+        best_score: f32,
+        threshold: f32,
+        total_count: u32,
     },
 }
 
@@ -541,6 +549,33 @@ impl RuleStore {
         let _ = self.flush_state();
     }
 
+    pub fn log_unfixed_unknown(
+        &mut self,
+        word: &str,
+        best_candidate: Option<&str>,
+        best_score: f32,
+        threshold: f32,
+    ) {
+        self.sync_external_state_before_write();
+        let word_l = word.trim().to_lowercase();
+        if word_l.is_empty() {
+            return;
+        }
+        let total_count = {
+            let e = self.state.untouched_unknowns.entry(word_l.clone()).or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        };
+        self.state.push_event(DiagnosticEvent::UnfixedUnknown {
+            word: word.trim().to_string(),
+            best_candidate: best_candidate.map(str::to_string),
+            best_score,
+            threshold,
+            total_count,
+        });
+        let _ = self.flush_state();
+    }
+
     pub fn clear_diagnostic_logs(&mut self) -> io::Result<()> {
         self.sync_external_state_before_write();
         self.state.applied_counts.clear();
@@ -737,6 +772,9 @@ impl RuleStore {
                 .and_then(Item::as_bool)
             {
                 out.scorer_config.fix_shift_slips = b;
+            }
+            if let Some(b) = settings.get("fix_proper_nouns").and_then(Item::as_bool) {
+                out.scorer_config.fix_proper_nouns = b;
             }
             if let Some(b) = settings.get("enable_contractions").and_then(Item::as_bool) {
                 out.scorer_config.enable_contractions = b;

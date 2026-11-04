@@ -51,13 +51,23 @@ fn cmd_build_lexicon() -> Result<(), String> {
     let en_us = read_req(&src_dir.join("en_US.combined"))?;
     let en_gb = read_req(&src_dir.join("en_GB.combined"))?;
     let dev_terms = read_req(&root.join("data/dev_terms.txt"))?;
+    let slang_terms = fs::read_to_string(root.join("data/slang.txt")).unwrap_or_default();
+    let proper_nouns = fs::read_to_string(root.join("data/proper_nouns.tsv")).unwrap_or_default();
     let typos_csv = read_req(&src_dir.join("typos_words.csv"))?;
     let uk_json = read_req(&src_dir.join("british_to_american.json"))?;
     let count_2w = read_req(&src_dir.join("count_2w.txt"))?;
 
-    println!("Compiling FST lexicon, 96k known smashes, dialect map & bigrams...");
-    let image =
-        compile_skdict_from_sources(&en_us, &en_gb, &dev_terms, &typos_csv, &uk_json, &count_2w);
+    println!("Compiling FST lexicon, 96k known smashes, proper nouns, dialect map & bigrams...");
+    let image = compile_skdict_from_sources(
+        &en_us,
+        &en_gb,
+        &dev_terms,
+        &slang_terms,
+        &proper_nouns,
+        &typos_csv,
+        &uk_json,
+        &count_2w,
+    );
 
     let out_path = root.join("crates/smartkey-core/assets/en_lexicon.skdict");
     if let Some(parent) = out_path.parent() {

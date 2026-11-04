@@ -3,15 +3,15 @@ name = "smartkey-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-default-run = "smartkeyctl"
-description = "Control CLI (`smartkeyctl`) and maintainer corpus tools (`smartkey-dev`) for SmartKey"
+default-run = "smartkey"
+description = "Control CLI (`smartkey` / `smartkeyctl`) and maintainer corpus tools (`smartkey-dev`) for SmartKey"
 
 [features]
 default = ["bundled-en"]
 bundled-en = ["smartkey-core/bundled-en"]
 
 [[bin]]
-name = "smartkeyctl"
+name = "smartkey"
 path = "src/main.rs"
 
 [[bin]]

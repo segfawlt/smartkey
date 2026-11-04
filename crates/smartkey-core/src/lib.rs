@@ -8,7 +8,10 @@ pub mod store;
 pub mod types;
 
 pub use learner::{LearnEvent, SkipReason};
-pub use lexicon::{compile_skdict_from_sources, EnglishLexicon, LexiconError, WordMeta};
+pub use lexicon::{
+    compile_skdict_from_sources, default_user_dict_dir, resolve_dict_path, EnglishLexicon,
+    LexiconError, WordMeta,
+};
 pub use scorer::{EmptyUserRules, EnglishScorer, EvalContext, LanguageScorer, UserRuleView};
 pub use session::{
     apply_key_to_buffer, KeyInput, SessionAction, SessionOutput, SmartKeyEngine, SmartKeySession,

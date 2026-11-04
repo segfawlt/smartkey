@@ -133,6 +133,7 @@ void SmartKeyAddon::reloadConfig() {
     if (engine_ == nullptr || instance_ == nullptr) {
         return;
     }
+    smartkey_engine_reload_dicts(engine_);
     bool reloadedViaContext = false;
     instance_->inputContextManager().foreach([this, &reloadedViaContext](InputContext *ic) {
         resetContext(ic);

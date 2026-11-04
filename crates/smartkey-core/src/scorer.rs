@@ -570,6 +570,33 @@ impl EnglishScorer {
                     );
                 }
             }
+
+            // Proper Noun auto-capitalization (english -> English, monday -> Monday)
+            if config.fix_proper_nouns && !shift_slip_fixed {
+                if let Some(proper) = self.lexicon.lookup_proper_noun(&core_lower) {
+                    if core != proper && !rules.is_pair_blocked(&core_lower, &proper.to_lowercase()) {
+                        let rep = wrap(proper);
+                        if rep != token {
+                            return (
+                                EvalOutcome::Autocorrect {
+                                    replacement: rep.clone(),
+                                    kind: MatchKind::ProperNoun,
+                                    score: 4.5,
+                                    margin: 4.5,
+                                },
+                                vec![Candidate {
+                                    replacement: rep,
+                                    score: 4.5,
+                                    edit_cost: 0.2,
+                                    freq: 200,
+                                    bigram_boost: 0.0,
+                                    kind: MatchKind::ProperNoun,
+                                }],
+                            );
+                        }
+                    }
+                }
+            }
             if sentence_cap && !user_title_case {
                 let rep = wrap(&project_case(&core, true));
                 if rep != token {

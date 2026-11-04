@@ -73,6 +73,7 @@ SmartKeyEngineHandle* smartkey_engine_new_with_lexicon_bytes(
 );
 
 void smartkey_engine_free(SmartKeyEngineHandle* engine);
+bool smartkey_engine_reload_dicts(SmartKeyEngineHandle* engine);
 
 /* Session lifecycle & context */
 SmartKeySessionHandle* smartkey_session_new(void);

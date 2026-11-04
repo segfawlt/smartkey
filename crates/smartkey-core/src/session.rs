@@ -9,7 +9,7 @@ use crate::lexicon::EnglishLexicon;
 use crate::scorer::{EnglishScorer, EvalContext, LanguageScorer, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::{
-    AppProfile, Candidate, EvalOutcome, Explanation, InputOrigin, LangId, MatchKind,
+    Aggressiveness, AppProfile, Candidate, EvalOutcome, Explanation, InputOrigin, LangId, MatchKind,
 };
 
 /// Shared process-wide engine owning the zero-copy Layer 1 scorer and comment-preserving `RuleStore`.
@@ -35,6 +35,35 @@ impl SmartKeyEngine {
     #[cfg(feature = "bundled-en")]
     pub fn in_memory_default() -> Result<Self, crate::lexicon::LexiconError> {
         Self::new_bundled(RuleStore::in_memory(crate::store::Preset::Balanced))
+    }
+
+    pub fn new_auto(store: RuleStore) -> Self {
+        if let Some(path) = crate::lexicon::resolve_dict_path("en") {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(lex) = EnglishLexicon::from_owned_bytes(bytes) {
+                    return Self::new(Some(EnglishScorer::new(lex)), store);
+                }
+            }
+        }
+        #[cfg(feature = "bundled-en")]
+        {
+            if let Ok(scorer) = EnglishScorer::new_bundled() {
+                return Self::new(Some(scorer), store);
+            }
+        }
+        Self::new(None, store)
+    }
+
+    pub fn reload_dicts(&mut self) -> bool {
+        if let Some(path) = crate::lexicon::resolve_dict_path("en") {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(lex) = EnglishLexicon::from_owned_bytes(bytes) {
+                    self.scorer = Some(EnglishScorer::new(lex));
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn scorer(&self) -> Option<&EnglishScorer> {
@@ -1163,6 +1192,22 @@ impl SmartKeySession {
             EvalOutcome::Unchanged { do_not_learn, .. } => {
                 if !do_not_learn {
                     self.pending_unknown = Some((self.lang.clone(), word.clone()));
+                    let (best_candidate, best_score, threshold) = if let Some(scorer) = engine.scorer() {
+                        let explanation = scorer.explain(&word, &ctx, engine.store.scorer_config(), &engine.store);
+                        let thresh = match engine.store.scorer_config().aggressiveness {
+                            Aggressiveness::Conservative => 0.24,
+                            Aggressiveness::Balanced => 0.14,
+                            Aggressiveness::Aggressive => 0.06,
+                        };
+                        let (cand, score) = match explanation.top_candidates.first() {
+                            Some(c) => (Some(c.replacement.clone()), c.score),
+                            None => (None, 0.0),
+                        };
+                        (cand, score, thresh)
+                    } else {
+                        (None, 0.0, 0.14)
+                    };
+                    engine.store.log_unfixed_unknown(&word, best_candidate.as_deref(), best_score, threshold);
                 }
                 self.update_context_after_commit(
                     &word,

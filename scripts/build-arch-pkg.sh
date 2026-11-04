@@ -15,7 +15,7 @@ TARBALL="${PKG_DIR}/${PKGNAME}-${PKGVER}.tar.gz"
 mkdir -p "${DIST_DIR}" "${PKG_DIR}"
 
 echo "Packing clean source archive from git files..."
-git -C "${ROOT}" ls-files -co --exclude-standard | tar -C "${ROOT}" --transform "s,^,${PKGNAME}-${PKGVER}/," -czf "${TARBALL}" -T -
+git -C "${ROOT}" ls-files | tar -C "${ROOT}" --transform "s,^,${PKGNAME}-${PKGVER}/," -czf "${TARBALL}" -T -
 
 # Check if makepkg requires -d (nodeps) because cargo/rust is installed via rustup rather than pacman
 MAKEPKG_ARGS=(-f -c)

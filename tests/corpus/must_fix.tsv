@@ -54,6 +54,13 @@ too	mcu	-	much
 -	does'nt	-	doesn't
 -	ca'nt	-	can't
 
+# --- Unambiguous Proper Nouns ---
+-	english	-	English
+-	vietnamese	-	Vietnamese
+-	monday	-	Monday
+-	tuesday	-	Tuesday
+-	january	-	January
+
 # --- Physical Shift & CapsLock timing slips ---
 -	THat's	-	That's
 -	THis	-	This

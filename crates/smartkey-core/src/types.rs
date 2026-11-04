@@ -80,6 +80,7 @@ pub struct ScorerConfig {
     pub auto_capitalize_i: bool,
     pub auto_capitalize_sentence: bool,
     pub fix_shift_slips: bool,
+    pub fix_proper_nouns: bool,
     pub enable_contractions: bool,
     pub enable_missed_space_split: bool,
 }
@@ -92,6 +93,7 @@ impl Default for ScorerConfig {
             auto_capitalize_i: true,
             auto_capitalize_sentence: false,
             fix_shift_slips: true,
+            fix_proper_nouns: true,
             enable_contractions: true,
             enable_missed_space_split: true,
         }
@@ -109,6 +111,7 @@ pub enum MatchKind {
     UserContextRule,
     UserCorrectionRule,
     ShiftSlip,
+    ProperNoun,
     DialectNormalization,
     Contraction,
     UnmergedCompound,

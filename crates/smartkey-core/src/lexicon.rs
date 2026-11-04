@@ -8,7 +8,8 @@ use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA, SINK_STAT
 use crate::keyboard::ascii_letter_mask;
 use crate::types::Dialect;
 
-const MAGIC: &[u8; 8] = b"SKDICT01";
+pub const MAGIC_V1: &[u8; 8] = b"SKDICT01";
+pub const MAGIC_V2: &[u8; 8] = b"SKDICT02";
 
 pub const FLAG_IN_US: u8 = 0x01;
 pub const FLAG_IN_GB: u8 = 0x02;
@@ -158,6 +159,7 @@ pub struct EnglishLexicon {
     typo_pool: Cow<'static, [u8]>,
     uk_to_us: Vec<(Box<str>, Box<str>)>,
     us_to_uk: Vec<(Box<str>, Box<str>)>,
+    proper_nouns: Vec<(Box<str>, Box<str>)>,
     bigram_keys: Vec<u32>,
     bigram_scores: Vec<u8>,
     smash_entries: Vec<SmashEntry>,
@@ -185,9 +187,14 @@ impl EnglishLexicon {
 
     fn parse_image(bytes: &[u8], is_static: bool) -> Result<Self, LexiconError> {
         let mut cursor = 0usize;
-        if bytes.len() < 8 || &bytes[..8] != MAGIC {
-            return Err(LexiconError::InvalidMagic);
+        if bytes.len() < 8 {
+            return Err(LexiconError::TruncatedData);
         }
+        let version = match &bytes[..8] {
+            b"SKDICT01" => 1,
+            b"SKDICT02" => 2,
+            _ => return Err(LexiconError::InvalidMagic),
+        };
         cursor += 8;
 
         let read_u32 = |buf: &[u8], pos: &mut usize| -> Result<u32, LexiconError> {
@@ -274,6 +281,26 @@ impl EnglishLexicon {
             });
         }
 
+        let mut proper_nouns = Vec::new();
+        if version >= 2 && cursor < bytes.len() {
+            let pn_count = read_u32(bytes, &mut cursor)? as usize;
+            for _ in 0..pn_count {
+                let (ks, ke) = read_slice(bytes, &mut cursor)?;
+                let (vs, ve) = read_slice(bytes, &mut cursor)?;
+                let lower = std::str::from_utf8(&bytes[ks..ke])
+                    .map_err(LexiconError::Utf8)?
+                    .to_string()
+                    .into_boxed_str();
+                let proper = std::str::from_utf8(&bytes[vs..ve])
+                    .map_err(LexiconError::Utf8)?
+                    .to_string()
+                    .into_boxed_str();
+                proper_nouns.push((lower, proper));
+            }
+            proper_nouns.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            proper_nouns.dedup_by(|a, b| a.0 == b.0);
+        }
+
         let (words_cow, typos_cow, pool_cow) = if is_static {
             // Safe static subslice reconstruction via pointer math unneeded if called from `from_static_bytes`;
             // instead, pass Owned for `from_owned_bytes` and Borrowed via helper in `from_static_bytes_inner`.
@@ -297,6 +324,7 @@ impl EnglishLexicon {
             typo_pool: pool_cow,
             uk_to_us,
             us_to_uk,
+            proper_nouns,
             bigram_keys,
             bigram_scores,
             smash_entries,
@@ -426,23 +454,103 @@ impl EnglishLexicon {
         &self.smash_entries
     }
 
+    #[inline]
+    pub fn lookup_proper_noun(&self, lower_word: &str) -> Option<&str> {
+        self.proper_nouns
+            .binary_search_by(|(lower, _)| lower.as_ref().cmp(lower_word))
+            .ok()
+            .map(|idx| self.proper_nouns[idx].1.as_ref())
+    }
+
+    #[inline]
+    pub fn proper_nouns(&self) -> &[(Box<str>, Box<str>)] {
+        &self.proper_nouns
+    }
+
     /// Builds an in-memory minimal test lexicon from word lists (used when `.skdict` is not bundled).
     pub fn from_word_list(
         words: &[(&str, u8)],
         typos: &[(&str, &str)],
         bigrams: &[(&str, &str, u8)],
     ) -> Result<Self, LexiconError> {
-        let bytes = compile_skdict_in_memory(words, typos, &[], bigrams);
+        Self::from_word_list_with_proper(words, typos, &[], bigrams, &[])
+    }
+
+    pub fn from_word_list_with_proper(
+        words: &[(&str, u8)],
+        typos: &[(&str, &str)],
+        uk_pairs: &[(&str, &str)],
+        bigrams: &[(&str, &str, u8)],
+        proper_nouns: &[(&str, &str)],
+    ) -> Result<Self, LexiconError> {
+        let bytes = compile_skdict_in_memory(words, typos, uk_pairs, bigrams, proper_nouns);
         Self::from_owned_bytes(bytes)
     }
 }
 
-/// Compiles raw AOSP `en_US.combined`, `en_GB.combined`, `dev_terms.txt`, `typos_words.csv`,
-/// `british_to_american.json`, and `count_2w.txt` into a compact `.skdict` binary image.
+pub fn resolve_dict_path(lang: &str) -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("SMARTKEY_DICT_DIR") {
+        if !dir.trim().is_empty() {
+            let p = std::path::PathBuf::from(dir).join(format!("{lang}.skdict"));
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.trim().is_empty() {
+            let p = std::path::PathBuf::from(xdg)
+                .join("smartkey/dicts")
+                .join(format!("{lang}.skdict"));
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    } else if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            let p = std::path::PathBuf::from(home)
+                .join(".local/share/smartkey/dicts")
+                .join(format!("{lang}.skdict"));
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    for sys in [
+        "/usr/local/share/smartkey/dicts",
+        "/usr/share/smartkey/dicts",
+    ] {
+        let p = std::path::PathBuf::from(sys).join(format!("{lang}.skdict"));
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub fn default_user_dict_dir() -> std::path::PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.trim().is_empty() {
+            return std::path::PathBuf::from(xdg).join("smartkey/dicts");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            return std::path::PathBuf::from(home).join(".local/share/smartkey/dicts");
+        }
+    }
+    std::path::PathBuf::from(".smartkey/dicts")
+}
+
+/// Compiles raw AOSP `en_US.combined`, `en_GB.combined`, `dev_terms.txt`, `slang.txt`,
+/// `proper_nouns.tsv`, `typos_words.csv`, `british_to_american.json`, and `count_2w.txt` into a compact `.skdict` binary image.
+#[allow(clippy::too_many_arguments)]
 pub fn compile_skdict_from_sources(
     en_us_combined: &str,
     en_gb_combined: &str,
     dev_terms: &str,
+    slang_terms: &str,
+    proper_nouns_tsv: &str,
     typos_csv: &str,
     british_to_american_json: &str,
     count_2w_tsv: &str,
@@ -567,6 +675,44 @@ pub fn compile_skdict_from_sources(
         entry.us_freq = entry.us_freq.max(172);
         entry.gb_freq = entry.gb_freq.max(172);
     }
+
+    // Merge curated internet abbreviations & slang shield (`slang.txt`)
+    for line in slang_terms.lines() {
+        let w = line.trim();
+        if w.is_empty() || w.starts_with('#') {
+            continue;
+        }
+        let lower = w.to_lowercase();
+        let entry = words.entry(lower).or_default();
+        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_TECH | FLAG_IN_US | FLAG_IN_GB;
+        entry.us_freq = entry.us_freq.max(185);
+        entry.gb_freq = entry.gb_freq.max(185);
+    }
+
+    // Parse curated unambiguous proper nouns (`proper_nouns.tsv`)
+    let mut proper_nouns: Vec<(String, String)> = Vec::new();
+    for line in proper_nouns_tsv.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (lower, proper) = if let Some((l, p)) = line.split_once('\t') {
+            (l.trim().to_lowercase(), p.trim().to_string())
+        } else {
+            (line.to_lowercase(), line.to_string())
+        };
+        if lower.is_empty() || proper.is_empty() || lower == proper {
+            continue;
+        }
+        let entry = words.entry(lower.clone()).or_default();
+        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_IN_US | FLAG_IN_GB;
+        entry.us_freq = entry.us_freq.max(160);
+        entry.gb_freq = entry.gb_freq.max(160);
+
+        proper_nouns.push((lower, proper));
+    }
+    proper_nouns.sort_unstable();
+    proper_nouns.dedup_by(|a, b| a.0 == b.0);
 
     // Parse UK -> US spelling map (`british_to_american.json`)
     let raw_uk_map: BTreeMap<String, String> =
@@ -764,6 +910,7 @@ pub fn compile_skdict_from_sources(
         &uk_pairs,
         &bigram_map,
         &smash_entries,
+        &proper_nouns,
     )
 }
 
@@ -772,6 +919,7 @@ fn compile_skdict_in_memory(
     typos: &[(&str, &str)],
     uk_pairs: &[(&str, &str)],
     bigrams: &[(&str, &str, u8)],
+    proper_nouns: &[(&str, &str)],
 ) -> Vec<u8> {
     let mut sorted_words: BTreeMap<String, u8> = BTreeMap::new();
     for &(w, f) in words {
@@ -826,6 +974,11 @@ fn compile_skdict_in_memory(
         }
     }
 
+    let pn_vec: Vec<(String, String)> = proper_nouns
+        .iter()
+        .map(|&(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
     serialize_skdict(
         &wb.into_inner().unwrap(),
         &tb.into_inner().unwrap(),
@@ -833,6 +986,7 @@ fn compile_skdict_in_memory(
         &uk_vec,
         &bg_map,
         &smash_entries,
+        &pn_vec,
     )
 }
 
@@ -843,11 +997,12 @@ fn serialize_skdict(
     uk_pairs: &[(String, String)],
     bigrams: &BTreeMap<u32, u8>,
     smash_entries: &[(u32, u8, u8, String)],
+    proper_nouns: &[(String, String)],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(
         words_fst.len() + typos_fst.len() + typo_pool.len() + bigrams.len() * 5 + 65536,
     );
-    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(MAGIC_V2);
 
     let write_slice = |buf: &mut Vec<u8>, data: &[u8]| {
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -876,6 +1031,12 @@ fn serialize_skdict(
         out.push(*len);
         out.push(*freq);
         write_slice(&mut out, word.as_bytes());
+    }
+
+    out.extend_from_slice(&(proper_nouns.len() as u32).to_le_bytes());
+    for (lower, proper) in proper_nouns {
+        write_slice(&mut out, lower.as_bytes());
+        write_slice(&mut out, proper.as_bytes());
     }
 
     out

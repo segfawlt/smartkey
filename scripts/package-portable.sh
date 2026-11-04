@@ -13,8 +13,8 @@ STAGE_NAME="${PKGNAME}-${PKGVER}-${ARCH}"
 
 mkdir -p "${DIST_DIR}"
 
-echo "Building smartkeyctl binary..."
-cargo build --release --manifest-path "${ROOT}/Cargo.toml" -p smartkey-cli --bin smartkeyctl
+echo "Building smartkey binary..."
+cargo build --release --manifest-path "${ROOT}/Cargo.toml" -p smartkey-cli --bin smartkey
 
 echo "Building fcitx5-smartkey addon..."
 ADAPTER_DIR="${ROOT}/adapters/fcitx5-smartkey"
@@ -29,12 +29,16 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
 STAGE_DIR="${TMP_DIR}/${STAGE_NAME}"
-mkdir -p "${STAGE_DIR}/bin" "${STAGE_DIR}/lib/fcitx5"
+mkdir -p "${STAGE_DIR}/bin" "${STAGE_DIR}/lib/fcitx5" "${STAGE_DIR}/share/smartkey/dicts"
 
-# Copy binary & strip/copy shared library
-install -m 755 "${ROOT}/target/release/smartkeyctl" "${STAGE_DIR}/bin/smartkeyctl"
+# Copy binary & symlink smartkeyctl
+install -m 755 "${ROOT}/target/release/smartkey" "${STAGE_DIR}/bin/smartkey"
+ln -s smartkey "${STAGE_DIR}/bin/smartkeyctl"
 install -m 755 "${BUILD_DIR}/libsmartkey.so" "${STAGE_DIR}/lib/fcitx5/libsmartkey.so"
 strip --strip-unneeded "${STAGE_DIR}/lib/fcitx5/libsmartkey.so"
+
+# Copy default English dictionary pack
+install -m 644 "${ROOT}/crates/smartkey-core/assets/en_lexicon.skdict" "${STAGE_DIR}/share/smartkey/dicts/en.skdict"
 
 # Copy docs and license
 install -m 644 "${ROOT}/LICENSE" "${STAGE_DIR}/LICENSE"
@@ -50,11 +54,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 LIB_DIR="${HOME}/.local/lib/fcitx5"
 CONF_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/addon"
+DICT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/smartkey/dicts"
 
-mkdir -p "${BIN_DIR}" "${LIB_DIR}" "${CONF_DIR}"
+mkdir -p "${BIN_DIR}" "${LIB_DIR}" "${CONF_DIR}" "${DICT_DIR}"
 
-# Install smartkeyctl
-install -m 755 "${SCRIPT_DIR}/bin/smartkeyctl" "${BIN_DIR}/smartkeyctl"
+# Install smartkey & symlink smartkeyctl
+install -m 755 "${SCRIPT_DIR}/bin/smartkey" "${BIN_DIR}/smartkey"
+ln -sf smartkey "${BIN_DIR}/smartkeyctl"
+
+# Install default English dictionary
+install -m 644 "${SCRIPT_DIR}/share/smartkey/dicts/en.skdict" "${DICT_DIR}/en.skdict"
 
 # Install libsmartkey.so
 install -m 755 "${SCRIPT_DIR}/lib/fcitx5/libsmartkey.so" "${LIB_DIR}/libsmartkey.so"
@@ -81,8 +90,9 @@ Configurable=False
 CONF_EOF
 
 echo "Installed fcitx5-smartkey (portable):"
-echo "  Binary: ${BIN_DIR}/smartkeyctl"
+echo "  Binary: ${BIN_DIR}/smartkey (aliased as smartkeyctl)"
 echo "  Addon:  ${LIB_DIR}/libsmartkey.so"
+echo "  Dict:   ${DICT_DIR}/en.skdict"
 echo "  Config: ${CONF_DIR}/smartkey.conf"
 
 if command -v busctl >/dev/null 2>&1 && command -v fcitx5-remote >/dev/null 2>&1 && fcitx5-remote --check >/dev/null 2>&1; then
@@ -102,10 +112,12 @@ set -euo pipefail
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 LIB_DIR="${HOME}/.local/lib/fcitx5"
 CONF_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5/addon"
+DICT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/smartkey/dicts"
 
-rm -f "${BIN_DIR}/smartkeyctl"
+rm -f "${BIN_DIR}/smartkey" "${BIN_DIR}/smartkeyctl"
 rm -f "${LIB_DIR}/libsmartkey.so"
 rm -f "${CONF_DIR}/smartkey.conf"
+rm -f "${DICT_DIR}/en.skdict"
 
 echo "Removed fcitx5-smartkey from ~/.local."
 
