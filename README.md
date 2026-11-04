@@ -1,6 +1,29 @@
 # SmartKey
 
-Privacy-first, 100% on-device **PC-first autocorrect and deterministic backspace-learning engine**, written in pure Rust (`GPL-3.0-or-later`).
+> [!WARNING]
+> **Experimental Testing / Beta Proof of Concept**
+> 
+> SmartKey is currently in an early **testing beta / proof-of-concept (PoC)** phase. It has **not yet been widely tested across varied desktop environments, distros, or edge-case workflows**. Expect rough edges, unexpected interactions in certain applications, or changes to internal configuration formats as feedback comes in.
+>
+> If you are trying this out, please treat it as an experimental preview. Feedback, bug reports, and typo edge cases are very welcome via [GitHub Issues](https://github.com/segfawlt/smartkey/issues)!
+
+---
+
+## What is SmartKey?
+
+SmartKey brings **phone-grade, privacy-first, 100% on-device autocorrect to physical PC keyboards** on Linux (via Fcitx5).
+
+Unlike touchscreens, physical desktop keyboards suffer from distinct typing errors: physical key chatter, 10-finger rolling transpositions (`teh`, `chagnes`), pinky slips on punctuation (`don;t`, `situatioN:`), and thumb-spacebar collisions (`inbthe`). Most existing desktop spellcheckers either show slow red squiggly popups or blindly overwrite code, URLs, and variable names.
+
+SmartKey is designed from the ground up for desktop environments:
+1. **Sub-20 µs Latency & 0% False Positives on Code:** Powered by pure Rust with an embedded compressed finite-state transducer (FST), 96,000+ real-world keyboard smashes, and character-multiset rescue. It automatically steps aside in code editors, terminals, passwords, and URLs.
+2. **Deterministic Learning Through Your Backspace:** It learns from what you actually do without machine learning or cloud telemetry:
+   - **1x Backspace:** Immediately reverts an unwanted suggestion back to what you literally typed.
+   - **2x Fix:** Fixing the same typo twice promotes your fix permanently to your personal dictionary and learned rules.
+   - **Plain-text Brain:** All learned preferences live in a human-readable, comment-preserving `~/.config/smartkey/rules.toml` that you can inspect, edit, or sync with Git.
+3. **Seamless Bilingual Coexistence:** Runs as a lightweight Fcitx5 module addon on top of standard English layouts (`keyboard-us`), but instantly steps aside whenever you switch to Vietnamese input engines like `fcitx5-bamboo` or `fcitx5-lotus`.
+
+---
 
 ## Highlights
 
