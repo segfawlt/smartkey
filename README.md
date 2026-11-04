@@ -27,43 +27,65 @@ Privacy-first, 100% on-device **PC-first autocorrect and deterministic backspace
 - **`crates/smartkey-cli`** — Control CLI (`smartkeyctl`: `status`, `toggle`, `reload`, `log`, `rules`, `explain`, `init`, `repl`) and developer corpus tools (`smartkey-dev`: `eval`, `build-lexicon`).
 - **`adapters/fcitx5-smartkey`** — Standalone C++20 `fcitx5` module addon (`Category=Module`, zero `sudo` user-local install to `~/.local`) that runs English autocorrect on `keyboard-*` layouts while stepping aside automatically when `Alt+Z` switches to `fcitx5-bamboo` or `fcitx5-lotus`.
 
-## Installation & Packaging
+## Installation
 
-### 1. Arch Linux (`PKGBUILD` / `.pkg.tar.zst`)
+### 1. Download Prebuilt Binaries (No Build Required)
 
-Build a native Arch Linux package from source:
+#### Arch Linux (`.pkg.tar.zst`)
+```bash
+# Download latest release package
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.0-1-x86_64.pkg.tar.zst
 
+# Install via pacman
+sudo pacman -U fcitx5-smartkey-0.1.0-1-x86_64.pkg.tar.zst
+
+# Restart Fcitx5 and check status
+fcitx5 -r -d
+smartkeyctl status
+```
+
+#### Generic Linux (Ubuntu / Fedora / Debian / SUSE)
+```bash
+# Download and unpack portable bundle
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.0-linux-x86_64.tar.zst
+tar --zstd -xf fcitx5-smartkey-0.1.0-linux-x86_64.tar.zst
+cd fcitx5-smartkey-0.1.0-linux-x86_64
+
+# Install to ~/.local (no sudo required)
+./install.sh
+smartkeyctl status
+```
+
+---
+
+### 2. Build From Source
+
+Clone the repository and its dependencies:
+
+```bash
+git clone https://github.com/segfawlt/smartkey.git
+cd smartkey
+```
+
+#### Option A: User-Local Install (`~/.local`, no root)
+```bash
+./adapters/fcitx5-smartkey/scripts/install-local.sh
+smartkeyctl status
+
+# To uninstall:
+# ./adapters/fcitx5-smartkey/scripts/uninstall-local.sh
+```
+
+#### Option B: Build Arch Linux Package (`PKGBUILD`)
 ```bash
 ./scripts/build-arch-pkg.sh
 sudo pacman -U dist/fcitx5-smartkey-*.pkg.tar.zst
 ```
 
-This installs `/usr/bin/smartkeyctl`, `/usr/lib/fcitx5/libsmartkey.so`, and `/usr/share/fcitx5/addon/smartkey.conf`.
-
-### 2. Portable Linux Archive (`.tar.zst`)
-
-Build a standalone portable bundle for any Linux distribution (`x86_64`):
-
+#### Option C: Build Portable Release Bundle
 ```bash
 ./scripts/package-portable.sh
-```
-
-To install on any system without requiring `sudo` or build dependencies:
-
-```bash
-tar --zstd -xf dist/fcitx5-smartkey-0.1.0-linux-x86_64.tar.zst
-cd fcitx5-smartkey-0.1.0-linux-x86_64
-./install.sh
-# To uninstall: ./uninstall.sh
-```
-
-### 3. From Source (User-Local Install)
-
-Build and install directly into `~/.local` without root privileges:
-
-```bash
-./adapters/fcitx5-smartkey/scripts/install-local.sh
-# To uninstall: ./adapters/fcitx5-smartkey/scripts/uninstall-local.sh
+# Outputs dist/fcitx5-smartkey-0.1.0-linux-x86_64.tar.zst
 ```
 
 ## Quick Start & CLI Usage
