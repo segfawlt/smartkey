@@ -87,6 +87,10 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/smartkey.conf" DESTINATION "${FCITX_I
 
 enable_testing()
 add_executable(addon_load_smoke tests/addon_load_smoke.cpp)
+target_include_directories(addon_load_smoke PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${SMARTKEY_ROOT}/crates/smartkey-ffi/include"
+)
 target_link_libraries(addon_load_smoke PRIVATE Fcitx5::Core Fcitx5::Utils)
 add_dependencies(addon_load_smoke smartkey)
 add_test(

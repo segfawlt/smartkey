@@ -8,12 +8,15 @@ ADAPTER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${ADAPTER_DIR}/../.." && pwd)"
 BUILD_DIR="${ADAPTER_DIR}/build"
 BIN_DIR="${HOME}/.local/bin"
+DICT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/smartkey/dicts"
 
-mkdir -p "${BIN_DIR}"
+mkdir -p "${BIN_DIR}" "${DICT_DIR}"
 
-echo "Building smartkeyctl CLI..."
-cargo build --release --manifest-path "${ROOT_DIR}/Cargo.toml" -p smartkey-cli --bin smartkeyctl
-install -m 755 "${ROOT_DIR}/target/release/smartkeyctl" "${BIN_DIR}/smartkeyctl"
+echo "Building smartkey CLI..."
+cargo build --release --manifest-path "${ROOT_DIR}/Cargo.toml" -p smartkey-cli --bin smartkey
+install -m 755 "${ROOT_DIR}/target/release/smartkey" "${BIN_DIR}/smartkey"
+ln -sf smartkey "${BIN_DIR}/smartkeyctl"
+install -m 644 "${ROOT_DIR}/crates/smartkey-core/assets/en_lexicon.skdict" "${DICT_DIR}/en.skdict"
 
 if [ -f "${HOME}/.cargo/bin/smartkey" ]; then
     rm -f "${HOME}/.cargo/bin/smartkey"
@@ -34,9 +37,10 @@ cmake --install "${BUILD_DIR}"
 
 echo ""
 echo "Installed fcitx5-smartkey to:"
-echo "  ${BIN_DIR}/smartkeyctl"
+echo "  ${BIN_DIR}/smartkey (aliased as smartkeyctl)"
 echo "  ${HOME}/.local/lib/fcitx5/libsmartkey.so"
 echo "  ${HOME}/.local/share/fcitx5/addon/smartkey.conf"
+echo "  ${DICT_DIR}/en.skdict"
 
 if command -v busctl >/dev/null 2>&1 && command -v fcitx5-remote >/dev/null 2>&1 && fcitx5-remote --check >/dev/null 2>&1; then
     busctl --user call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1 Restart >/dev/null 2>&1 || true

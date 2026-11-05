@@ -40,36 +40,6 @@ std::filesystem::path resolveConfigDir() {
     return std::filesystem::path(".smartkey");
 }
 
-std::string normalizeProgramBasename(std::string_view raw) {
-    if (const auto slash = raw.rfind('/'); slash != std::string_view::npos) {
-        raw.remove_prefix(slash + 1);
-    }
-    std::string lower(raw);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return lower;
-}
-
-bool matchesAnyExact(std::string_view prog,
-                     std::initializer_list<std::string_view> names) {
-    for (const auto name : names) {
-        if (prog == name) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool matchesAnySubstring(std::string_view prog,
-                         std::initializer_list<std::string_view> needles) {
-    for (const auto needle : needles) {
-        if (prog.find(needle) != std::string_view::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
 } // namespace
 
 SmartKeyAddon::SmartKeyAddon(Instance *instance)
@@ -184,48 +154,21 @@ uint8_t SmartKeyAddon::classifyProfile(InputContext *ic) {
         return SMARTKEY_PROFILE_BYPASS;
     }
 
-    const std::string prog = normalizeProgramBasename(ic->program());
-    if (prog.empty()) {
+    const std::string_view rawProg = ic->program();
+    if (rawProg.empty()) {
+        // GTK4's `libim-fcitx5.so` (`frontend:dbus` when `GTK_IM_MODULE=fcitx` is exported)
+        // reports an empty program name and implements DBus `ForwardKey` as a hard no-op (`ret`).
+        // If `SurroundingText` is also invalid (e.g. a GTK4 terminal or raw surface), replacement
+        // cannot delete the original word and would duplicate text (`orig + replacement`).
+        if (ic->frontendName() == std::string_view("dbus") &&
+            (!flags.test(CapabilityFlag::SurroundingText) ||
+             !ic->surroundingText().isValid())) {
+            return SMARTKEY_PROFILE_BYPASS;
+        }
         return SMARTKEY_PROFILE_PROSE;
     }
 
-    // Terminals and code-centric editors/IDEs: 100% hands-off
-    if (matchesAnyExact(prog, {
-            "alacritty", "kitty", "foot", "footclient", "ghostty",
-            "wezterm", "wezterm-gui", "konsole", "gnome-terminal",
-            "gnome-terminal-server", "kgx", "ptyxis", "xterm", "urxvt",
-            "st", "tilix", "terminator", "xfce4-terminal", "yakuake",
-            "warp", "tabby", "rio",
-            "code", "code-oss", "codium", "vscodium", "cursor", "windsurf",
-            "zed", "zed-editor", "nvim", "nvim-qt", "neovide", "vim",
-            "gvim", "emacs", "helix", "sublime_text", "subl",
-            "idea", "clion", "pycharm", "rustrover", "goland", "webstorm"
-        }) ||
-        matchesAnySubstring(prog, {"terminal", "jetbrains-"})) {
-        return SMARTKEY_PROFILE_BYPASS;
-    }
-
-    if (matchesAnyExact(prog, {
-            "firefox", "firefox-developer-edition", "librewolf", "waterfox",
-            "zen", "zen-bin", "chromium", "chrome", "google-chrome",
-            "google-chrome-stable", "brave", "brave-browser", "vivaldi",
-            "vivaldi-stable", "epiphany"
-        }) ||
-        matchesAnySubstring(prog, {"firefox", "chromium", "chrome"})) {
-        return SMARTKEY_PROFILE_BROWSER;
-    }
-
-    if (matchesAnyExact(prog, {
-            "discord", "vesktop", "legcord", "webcord", "telegram",
-            "telegram-desktop", "org.telegram.desktop", "slack", "signal",
-            "signal-desktop", "element", "element-desktop", "fractal",
-            "caprine"
-        }) ||
-        matchesAnySubstring(prog, {"discord", "telegram", "slack", "signal"})) {
-        return SMARTKEY_PROFILE_CHAT;
-    }
-
-    return SMARTKEY_PROFILE_PROSE;
+    return classifyProgramName(rawProg);
 }
 
 void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {

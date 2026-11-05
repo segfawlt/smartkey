@@ -40,6 +40,15 @@ impl Preset {
 # Editing this file directly edits SmartKey's behavior; comments are preserved automatically.
 version = 1
 
+# Vocabulary kept immune from statistical autocorrect (graduated at 2x undo+keep or 3x untouched use).
+personal_dict = []
+
+# ASCII tokens kept immune from Vietnamese Telex composition in fcitx5-lotus (Phase 2).
+telex_passthrough = []
+
+# Pair-level rejections ({{ typed = "...", rejected = "..." }}).
+blocklist = []
+
 [settings]
 enabled = true
 dialect = "mixed"               # "mixed" | "en_US" | "en_GB"
@@ -51,15 +60,6 @@ fix_shift_slips = true          # THat's -> That's, situatioN: -> situation:, tH
 fix_proper_nouns = {fix_proper}         # english -> English, monday -> Monday
 enable_contractions = true
 enable_missed_space_split = {split_spaces}
-
-# Vocabulary kept immune from statistical autocorrect (graduated at 2x undo+keep or 3x untouched use).
-personal_dict = []
-
-# ASCII tokens kept immune from Vietnamese Telex composition in fcitx5-lotus (Phase 2).
-telex_passthrough = []
-
-# Pair-level rejections ({{ typed = "...", rejected = "..." }}).
-blocklist = []
 
 # Learned unigram typo repairs (graduated after 2x manual fixes).
 [corrections]
@@ -581,6 +581,7 @@ impl RuleStore {
         self.state.applied_counts.clear();
         self.state.undo_counts.clear();
         self.state.manual_fix_counts.clear();
+        self.state.untouched_unknowns.clear();
         self.state.recent_events.clear();
         self.state.skipped_edits.clear();
         self.flush_state()

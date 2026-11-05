@@ -1,9 +1,9 @@
 # Terminal Word Duplication & Wayland App ID Classification Analysis
 
 > **Date:** 2026-11-05  
-> **Status:** Investigation Complete & Solution Designed  
+> **Status:** Implemented & Verified  
 > **Affected Component:** `fcitx5-smartkey` (`adapters/fcitx5-smartkey`), Wayland environment (`niri`), Ghostty terminal  
-> **Target Fix:** Enhanced Wayland `app_id` normalization + terminal bypass matching in `smartkey-addon.cpp`
+> **Target Fix:** Reverse-DNS dot-segment `app_id` matching + `frontend:dbus` no-`SurroundingText` guard in `smartkey-addon.h` / `smartkey-addon.cpp`
 
 ---
 
@@ -113,33 +113,21 @@ When SmartKey incorrectly activates inside a terminal and backspaces are dropped
 
 ---
 
-## 4. Proposed Solution Architecture
+## 4. Implemented Solution Architecture
 
-### Step 1: Robust `app_id` Normalization in `smartkey-addon.cpp`
+### Step 1: Reverse-DNS Segment Matching & DBus Guard in `smartkey-addon.h` / `smartkey-addon.cpp`
 
-Update the program normalization logic in `adapters/fcitx5-smartkey/src/smartkey-addon.cpp` to handle reverse-DNS desktop identifiers and flatpak-style application IDs:
+Rather than stripping everything before the final `.` (`raw.rfind('.')`, which would turn `"org.telegram.desktop"` into `"desktop"` or `"org.gnome.terminal.server"` into `"server"`), `matchesExactOrAppSegment` checks both the full normalized ID and every non-TLD `.`-delimited segment (`seg.size() >= 3`):
 
-```cpp
-std::string normalizeProgramBasename(std::string_view raw) {
-    if (const auto slash = raw.rfind('/'); slash != std::string_view::npos) {
-        raw.remove_prefix(slash + 1);
-    }
-    // If the ID is a reverse-DNS desktop app_id (e.g. "com.mitchellh.ghostty",
-    // "org.wezfurlong.wezterm", "io.github.alacritty", "org.gnome.Terminal"),
-    // strip everything up to the final dot to extract the base name.
-    if (const auto dot = raw.rfind('.'); dot != std::string_view::npos) {
-        raw.remove_prefix(dot + 1);
-    }
-    std::string lower(raw);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return lower;
-}
-```
+- `"com.mitchellh.ghostty"` $\to$ matches segment `"ghostty"` (`SMARTKEY_PROFILE_BYPASS`)
+- `"dev.zed.Zed"` $\to$ matches segment `"zed"` (`SMARTKEY_PROFILE_BYPASS`)
+- `"org.wezfurlong.wezterm"` / `"io.github.alacritty"` $\to$ matches `"wezterm"` / `"alacritty"` (`SMARTKEY_PROFILE_BYPASS`)
+- `"org.gnome.Terminal.Server"` $\to$ matches `"terminal"` (`SMARTKEY_PROFILE_BYPASS`)
+- `"com.sublimetext.three"` $\to$ matches `"sublimetext"` (`SMARTKEY_PROFILE_BYPASS`)
+- `"org.telegram.desktop"` $\to$ matches `"telegram"` (`SMARTKEY_PROFILE_CHAT`)
+- `"app.zen_browser.zen"` $\to$ matches `"zen"` (`SMARTKEY_PROFILE_BROWSER`)
 
-In addition, add explicit reverse-DNS entries and common prefixes to `classifyProfile` as defense-in-depth:
-- Explicit bypass for `"com.mitchellh.ghostty"`, `"org.wezfurlong.wezterm"`, `"io.github.alacritty"`, `"org.gnome.terminal"`, `"org.gnome.terminal.server"`.
-- Preserve full app_id matching if a future app profile requires distinguishing between package namespaces.
+In addition, when `ic->program()` is empty and `ic->frontendName() == "dbus"` without valid `SurroundingText` (the exact signature of GTK4 `libim-fcitx5.so` when `GTK_IM_MODULE=fcitx` is exported, where `ForwardKey` is a no-op stub), `classifyProfile` returns `SMARTKEY_PROFILE_BYPASS` so words are never duplicated even on machines with legacy `GTK_IM_MODULE=fcitx` environment variables.
 
 ### Step 2: Session Environment & Ghostty Daemon Restart
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-rm -f "${HOME}/.local/bin/smartkeyctl"
+rm -f "${HOME}/.local/bin/smartkey" "${HOME}/.local/bin/smartkeyctl"
 rm -f "${HOME}/.local/lib/fcitx5/libsmartkey.so"
 rm -f "${HOME}/.local/share/fcitx5/addon/smartkey.conf"
 
-echo "Removed fcitx5-smartkey and smartkeyctl from ~/.local."
+echo "Removed fcitx5-smartkey and smartkey from ~/.local."
 
 if command -v busctl >/dev/null 2>&1 && command -v fcitx5-remote >/dev/null 2>&1 && fcitx5-remote --check >/dev/null 2>&1; then
     busctl --user call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1 Restart >/dev/null 2>&1 || true

@@ -15,7 +15,66 @@
 
 #include <fcitx/addonmanager.h>
 
+#include "../src/smartkey-addon.h"
+
+namespace {
+
+void verifyProfileClassification() {
+    using fcitx::smartkey::classifyProgramName;
+
+    // Wayland reverse-DNS & Flatpak terminals -> BYPASS
+    assert(classifyProgramName("com.mitchellh.ghostty") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("org.wezfurlong.wezterm") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("io.github.alacritty") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("org.alacritty.Alacritty") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("org.gnome.Terminal") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("org.gnome.Terminal.Server") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("org.gnome.Console") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("org.gnome.Ptyxis") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("org.kde.konsole") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("org.kde.yakuake") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("com.raggesilver.BlackBox") == SMARTKEY_PROFILE_BYPASS);
+
+    // Classic binary / path terminals -> BYPASS
+    assert(classifyProgramName("ghostty") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("/usr/bin/ghostty") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("kitty") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("foot") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("st") == SMARTKEY_PROFILE_BYPASS);
+
+    // Wayland reverse-DNS & Flatpak code editors / IDEs -> BYPASS
+    assert(classifyProgramName("dev.zed.Zed") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("com.visualstudio.code") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("com.vscodium.codium") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("com.sublimetext.three") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("com.jetbrains.rustrover") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("jetbrains-idea") == SMARTKEY_PROFILE_BYPASS);
+
+    // Browsers (classic & reverse-DNS) -> BROWSER
+    assert(classifyProgramName("zen") == SMARTKEY_PROFILE_BROWSER);
+    assert(classifyProgramName("app.zen_browser.zen") == SMARTKEY_PROFILE_BROWSER);
+    assert(classifyProgramName("io.github.zen_browser.zen") == SMARTKEY_PROFILE_BROWSER);
+    assert(classifyProgramName("org.mozilla.firefox") == SMARTKEY_PROFILE_BROWSER);
+    assert(classifyProgramName("com.brave.Browser") == SMARTKEY_PROFILE_BROWSER);
+
+    // Chat apps (classic & reverse-DNS) -> CHAT
+    assert(classifyProgramName("org.telegram.desktop") == SMARTKEY_PROFILE_CHAT);
+    assert(classifyProgramName("com.discordapp.Discord") == SMARTKEY_PROFILE_CHAT);
+    assert(classifyProgramName("dev.vencord.Vesktop") == SMARTKEY_PROFILE_CHAT);
+    assert(classifyProgramName("org.signal.Signal") == SMARTKEY_PROFILE_CHAT);
+    assert(classifyProgramName("im.riot.Riot") == SMARTKEY_PROFILE_CHAT);
+    assert(classifyProgramName("org.gnome.Fractal") == SMARTKEY_PROFILE_CHAT);
+
+    // General prose apps -> PROSE
+    assert(classifyProgramName("org.gnome.TextEditor") == SMARTKEY_PROFILE_PROSE);
+    assert(classifyProgramName("md.obsidian.Obsidian") == SMARTKEY_PROFILE_PROSE);
+    assert(classifyProgramName("libreoffice") == SMARTKEY_PROFILE_PROSE);
+}
+
+} // namespace
+
 int main(int argc, char *argv[]) {
+    verifyProfileClassification();
     if (argc < 2) {
         std::cerr << "usage: addon_load_smoke <libsmartkey.so>\n";
         return 2;
