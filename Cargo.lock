@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "smartkey-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "smartkey-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fst",
  "levenshtein_automata",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "smartkey-ffi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "smartkey-core",
 ]

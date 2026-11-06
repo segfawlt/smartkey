@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DIST_DIR="${ROOT}/dist"
 PKGNAME="fcitx5-smartkey"
-PKGVER="0.1.0"
+PKGVER="0.1.1"
 ARCH="linux-x86_64"
 STAGE_NAME="${PKGNAME}-${PKGVER}-${ARCH}"
 
@@ -81,7 +81,7 @@ Comment=On-device PC English autocorrect and deterministic backspace learner
 Type=SharedLibrary
 Library=${LIB_DIR}/libsmartkey
 Category=Module
-Version=0.1.0
+Version=0.1.1
 OnDemand=False
 Configurable=False
 

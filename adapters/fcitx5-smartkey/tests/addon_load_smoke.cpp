@@ -106,7 +106,7 @@ int main(int argc, char *argv[]) {
              << "Type=SharedLibrary\n"
              << "Library=" << (addonLibDir / "libsmartkey").string() << "\n"
              << "Category=Module\n"
-             << "Version=0.1.0\n"
+             << "Version=0.1.1\n"
              << "OnDemand=False\n"
              << "Configurable=False\n";
     }

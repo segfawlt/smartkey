@@ -47,7 +47,7 @@ SmartKey is designed from the ground up for desktop environments:
 
 - **`crates/smartkey-core`** — Pure-Rust Layer 1 scorer, `SmartKeySession` shadow-buffer learner, diagnostic event logger, and comment-preserving `toml_edit` `RuleStore` (zero OS/C-sys/`$HOME` dependencies).
 - **`crates/smartkey-ffi`** — Panic-safe `extern "C"` ABI (`include/smartkey.h`) for desktop input method modules (`fcitx5`) and portable word-level JNI hooks for Android `HeliBoard`.
-- **`crates/smartkey-cli`** — Control CLI (`smartkeyctl`: `status`, `toggle`, `reload`, `log`, `rules`, `explain`, `init`, `repl`) and developer corpus tools (`smartkey-dev`: `eval`, `build-lexicon`).
+- **`crates/smartkey-cli`** — Control CLI (`smartkey`: `status`, `toggle`, `reload`, `log`, `dict`, `rules`, `explain`, `init`, `repl`; aliased as `smartkeyctl`) and developer corpus tools (`smartkey-dev`: `eval`, `build-lexicon`).
 - **`adapters/fcitx5-smartkey`** — Standalone C++20 `fcitx5` module addon (`Category=Module`, zero `sudo` user-local install to `~/.local`) that runs English autocorrect on `keyboard-*` layouts while stepping aside automatically when `Alt+Z` switches to `fcitx5-bamboo` or `fcitx5-lotus`.
 
 ## Installation
@@ -57,26 +57,26 @@ SmartKey is designed from the ground up for desktop environments:
 #### Arch Linux (`.pkg.tar.zst`)
 ```bash
 # Download latest release package
-curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.0-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst
 
 # Install via pacman
-sudo pacman -U fcitx5-smartkey-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst
 
 # Restart Fcitx5 and check status
 fcitx5 -r -d
-smartkeyctl status
+smartkey status
 ```
 
 #### Generic Linux (Ubuntu / Fedora / Debian / SUSE)
 ```bash
 # Download and unpack portable bundle
-curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.0-linux-x86_64.tar.zst
-tar --zstd -xf fcitx5-smartkey-0.1.0-linux-x86_64.tar.zst
-cd fcitx5-smartkey-0.1.0-linux-x86_64
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst
+tar --zstd -xf fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst
+cd fcitx5-smartkey-0.1.1-linux-x86_64
 
 # Install to ~/.local (no sudo required)
 ./install.sh
-smartkeyctl status
+smartkey status
 ```
 
 ---
@@ -93,7 +93,7 @@ cd smartkey
 #### Option A: User-Local Install (`~/.local`, no root)
 ```bash
 ./adapters/fcitx5-smartkey/scripts/install-local.sh
-smartkeyctl status
+smartkey status
 
 # To uninstall:
 # ./adapters/fcitx5-smartkey/scripts/uninstall-local.sh
@@ -108,7 +108,7 @@ sudo pacman -U dist/fcitx5-smartkey-*.pkg.tar.zst
 #### Option C: Build Portable Release Bundle
 ```bash
 ./scripts/package-portable.sh
-# Outputs dist/fcitx5-smartkey-0.1.0-linux-x86_64.tar.zst
+# Outputs dist/fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst
 ```
 
 ## Quick Start & CLI Usage

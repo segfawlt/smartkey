@@ -9,7 +9,7 @@ ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PKG_DIR="${ROOT}/packaging/arch"
 DIST_DIR="${ROOT}/dist"
 PKGNAME="fcitx5-smartkey"
-PKGVER="0.1.0"
+PKGVER="0.1.1"
 TARBALL="${PKG_DIR}/${PKGNAME}-${PKGVER}.tar.gz"
 
 mkdir -p "${DIST_DIR}" "${PKG_DIR}"
