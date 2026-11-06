@@ -56,13 +56,13 @@ SmartKey is designed from the ground up for desktop environments:
 
 #### Arch Linux (`.pkg.tar.zst`)
 ```bash
-# Download latest release package
+# 1. Download latest release package locally (avoids pacman remote .sig check)
 curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst
 
-# Install via pacman
-sudo pacman -U fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst
+# 2. Install local package
+sudo pacman -U ./fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst
 
-# Restart Fcitx5 and check status
+# 3. Restart Fcitx5 and check status
 fcitx5 -r -d
 smartkey status
 ```
