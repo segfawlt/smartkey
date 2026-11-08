@@ -8,8 +8,8 @@ use std::time::Instant;
 use serde::Serialize;
 use smartkey_core::{
     apply_key_to_buffer, DiagnosticEvent, Dialect, EnglishScorer, EvalContext, EvalOutcome,
-    KeyInput, MatchKind, Preset, RuleStore, SessionAction, SmartKeyEngine, SmartKeySession,
-    UndoResolution,
+    KeyInput, LangId, MatchKind, Preset, RuleStore, SessionAction, SmartKeyEngine,
+    SmartKeySession, UndoResolution,
 };
 
 fn default_config_dir() -> PathBuf {
@@ -111,6 +111,7 @@ fn detect_installed_addon() -> Option<PathBuf> {
 #[derive(Serialize)]
 struct StatusJson {
     enabled: bool,
+    vi_lotus_enabled: bool,
     fcitx5_running: bool,
     addon_library: Option<String>,
     rules_path: String,
@@ -171,6 +172,7 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         );
         let payload = StatusJson {
             enabled: c.enabled,
+            vi_lotus_enabled: c.vi_lotus_enabled,
             fcitx5_running: fcitx_up,
             addon_library: addon_so.map(|p| p.display().to_string()),
             rules_path: rules_str,
@@ -190,6 +192,14 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     println!(
         "Engine State         : {}",
         if c.enabled { "ENABLED" } else { "DISABLED" }
+    );
+    println!(
+        "Lotus Bridge Plugin  : {}",
+        if c.vi_lotus_enabled {
+            "ENABLED (vi-lotus)"
+        } else {
+            "DISABLED (vi-lotus)"
+        }
     );
     println!(
         "Fcitx5 Daemon        : {}",
@@ -408,6 +418,7 @@ fn match_kind_slug(kind: MatchKind) -> &'static str {
         MatchKind::MissedSpaceSplit => "missed_space_split",
         MatchKind::FuzzyLexicon => "fuzzy_lexicon",
         MatchKind::SmashRescue => "smash_rescue",
+        MatchKind::VietnameseTelexRescue => "vietnamese_telex_rescue",
     }
 }
 
@@ -646,6 +657,7 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
     let mut prev: Option<String> = None;
     let mut punct: Option<char> = None;
     let mut dialect: Option<Dialect> = None;
+    let mut lang: LangId = LangId::en();
     let mut sentence_start = false;
     let mut as_json = false;
     let mut dir: Option<PathBuf> = None;
@@ -670,6 +682,14 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
                     _ => Dialect::Mixed,
                 });
             }
+            "--lang" | "-l" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--lang requires an id (en|vi)")?;
+                lang = match raw.as_str() {
+                    "vi" | "vi-lotus" | "vi_lotus" | "lotus" => LangId::vi(),
+                    other => LangId(other.to_string()),
+                };
+            }
             "--json" => {
                 as_json = true;
             }
@@ -689,7 +709,7 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
 
     let Some(tok) = token else {
         return Err(
-            "usage: smartkey explain [--json] [--prev <word>] [--punct <char>] [--dialect mixed|us|gb] [--dir <path>] [--sentence-start] <token>"
+            "usage: smartkey explain [--json] [--lang en|vi] [--prev <word>] [--punct <char>] [--dialect mixed|us|gb] [--dir <path>] [--sentence-start] <token>"
                 .to_string(),
         );
     };
@@ -704,6 +724,7 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
     if let Some(d) = dialect {
         store.scorer_config_mut().dialect = d;
     }
+    store.set_active_lang(lang);
 
     let engine = SmartKeyEngine::new(Some(scorer), store);
     let ctx = EvalContext {
@@ -953,9 +974,85 @@ impl Drop for RawTermGuard {
     }
 }
 
+fn cmd_plugin(args: &[String]) -> Result<(), String> {
+    let mut dir = default_config_dir();
+    let mut pos: Vec<&str> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                i += 1;
+                dir = PathBuf::from(args.get(i).ok_or("--dir requires a path")?);
+            }
+            other => pos.push(other),
+        }
+        i += 1;
+    }
+
+    let action = pos.first().copied().unwrap_or("list");
+    match action {
+        "list" | "ls" => {
+            let store = load_rule_store(&dir, Preset::Balanced)?;
+            let c = store.compiled();
+            let lotus_so = Path::new("/usr/lib/fcitx5/liblotus.so").exists()
+                || Path::new("/usr/local/lib/fcitx5/liblotus.so").exists();
+            println!("=== SmartKey Modular Plugins ===");
+            println!(
+                "  {:<10} : {:<8} | host={} | Zero-fork Vietnamese Telex typo rescue & bilingual bridge for fcitx5-lotus (7,886 syllables)",
+                "vi-lotus",
+                if c.vi_lotus_enabled {
+                    "ENABLED"
+                } else {
+                    "DISABLED"
+                },
+                if lotus_so {
+                    "liblotus.so detected"
+                } else {
+                    "fcitx5-lotus not detected"
+                }
+            );
+            Ok(())
+        }
+        "enable" | "on" | "install" | "disable" | "off" | "remove" | "toggle" => {
+            let name = pos
+                .get(1)
+                .copied()
+                .unwrap_or("vi-lotus");
+            let mut store = load_rule_store(&dir, Preset::Balanced)?;
+            let cur = store.is_plugin_enabled(name).ok_or_else(|| {
+                format!("unknown plugin {name:?} (available plugins: vi-lotus)")
+            })?;
+            let target = match action {
+                "enable" | "on" | "install" => true,
+                "disable" | "off" | "remove" => false,
+                _ => !cur,
+            };
+            store
+                .set_plugin_enabled(name, target)
+                .map_err(|e| e.to_string())?;
+            let reloaded = notify_fcitx5_reload();
+            println!(
+                "Plugin 'vi-lotus' {} ({})",
+                if target { "enabled" } else { "disabled" },
+                if reloaded {
+                    "Fcitx5 reloaded via DBus"
+                } else {
+                    "saved to rules.toml; will apply on next focus change"
+                }
+            );
+            Ok(())
+        }
+        other => Err(format!(
+            "unknown plugin subcommand {other:?} (usage: smartkey plugin [list|enable|disable|toggle] [vi-lotus] [--dir <path>])"
+        )),
+    }
+}
+
 fn cmd_repl(args: &[String]) -> Result<(), String> {
     let mut dir = default_config_dir();
     let mut in_memory = false;
+    let mut lang = LangId::en();
 
     let mut i = 0;
     while i < args.len() {
@@ -967,9 +1064,17 @@ fn cmd_repl(args: &[String]) -> Result<(), String> {
             "--in-memory" => {
                 in_memory = true;
             }
+            "--lang" | "-l" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--lang requires an id (en|vi)")?;
+                lang = match raw.as_str() {
+                    "vi" | "vi-lotus" | "vi_lotus" | "lotus" => LangId::vi(),
+                    other => LangId(other.to_string()),
+                };
+            }
             other => {
                 return Err(format!(
-                    "unknown flag {other} (usage: smartkeyctl repl [--dir <path>] [--in-memory])"
+                    "unknown flag {other} (usage: smartkeyctl repl [--lang en|vi] [--dir <path>] [--in-memory])"
                 ));
             }
         }
@@ -990,6 +1095,7 @@ fn cmd_repl(args: &[String]) -> Result<(), String> {
 
     let mut engine = SmartKeyEngine::new(Some(scorer), store);
     let mut session = SmartKeySession::new();
+    session.set_lang(lang);
     let t0 = Instant::now();
 
     println!("SmartKey Interactive REPL — Layer 1 + Layer 2 Learning Active");
@@ -1107,10 +1213,11 @@ COMMANDS:
   reload                                          Reload configuration & dictionary packs in Fcitx5
   log [fixed|manual|unfixed] [-n <N>] [--clear]   Show autocorrects, undos, and missed unknown words
   rules [--dir <path>]                            Show personal dictionary, blocklist & learned rules
-  explain [--json] [FLAGS] <word>                 Explain scoring, proper nouns, and candidate ranking
+  explain [--json] [--lang en|vi] [FLAGS] <word>  Explain scoring, proper nouns, and candidate ranking
+  plugin [list|enable|disable|toggle] [vi-lotus]  Manage modular input-method & language bridge plugins
   dict [list|dir|install|remove|update]           Inspect and manage modular language dictionary packs
   init [--preset <name>] [--force]                Initialize ~/.config/smartkey/rules.toml
-  repl [--in-memory]                              Interactive terminal typing & learning sandbox",
+  repl [--lang en|vi] [--in-memory]               Interactive terminal typing & learning sandbox",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1127,6 +1234,7 @@ fn main() {
         Some("rules") => cmd_rules(&args[1..]),
         Some("log") => cmd_log(&args[1..]),
         Some("explain") => cmd_explain(&args[1..]),
+        Some("plugin" | "plugins") => cmd_plugin(&args[1..]),
         Some("dict" | "dicts") => cmd_dict(&args[1..]),
         Some("repl") => cmd_repl(&args[1..]),
         Some("--version" | "-V") => {

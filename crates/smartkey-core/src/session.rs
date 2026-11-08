@@ -100,12 +100,18 @@ impl SmartKeyEngine {
             };
         }
 
+        if self.store.active_lang().as_str() == "vi" && self.store.compiled().vi_lotus_enabled {
+            return self.evaluate_vi_lotus_token(token, ctx);
+        }
+
         if let Some(scorer) = &self.scorer {
             return scorer.evaluate(token, ctx, self.store.scorer_config(), &self.store);
         }
 
-        // Lean fallback when compiled without bundled English lexicon (e.g., HeliBoard lean mode):
-        // still honors user `[snippets]`, `[context_corrections]`, `[corrections]`, and `blocklist`.
+        self.evaluate_user_rules_only(token, ctx)
+    }
+
+    fn evaluate_user_rules_only(&self, token: &str, ctx: &EvalContext<'_>) -> EvalOutcome {
         if let Some(snip) = self.store.lookup_snippet(token) {
             return EvalOutcome::Autocorrect {
                 replacement: snip.to_string(),
@@ -149,7 +155,150 @@ impl SmartKeyEngine {
         }
     }
 
+    fn evaluate_vi_lotus_token(&self, token: &str, ctx: &EvalContext<'_>) -> EvalOutcome {
+        // 1. User explicit rules (`[snippets]`, `[context_corrections]`, `[corrections]`, `[lang.vi.corrections]`)
+        if let EvalOutcome::Autocorrect {
+            replacement,
+            kind,
+            score,
+            margin,
+        } = self.evaluate_user_rules_only(token, ctx)
+        {
+            return EvalOutcome::Autocorrect {
+                replacement,
+                kind,
+                score,
+                margin,
+            };
+        }
+
+        let lower = token.to_lowercase();
+        let sim = crate::vi_telex::simulate_lotus_word(token);
+
+        // 2. If Lotus composed this into Vietnamese, or if it is a valid Vietnamese syllable
+        //    (including toneless Vietnamese words like `anh`, `em`, `nha`, `con`, `cho`):
+        if sim.is_valid_vietnamese || crate::vi_telex::is_vietnamese_dict_word(&lower) {
+            if sim.is_composed_vietnamese && self.is_telex_passthrough(token) {
+                return EvalOutcome::Autocorrect {
+                    replacement: token.to_string(),
+                    kind: MatchKind::UserCorrectionRule,
+                    score: 9.5,
+                    margin: 9.5,
+                };
+            }
+            return EvalOutcome::Unchanged {
+                reason: MatchKind::ValidWord,
+                do_not_learn: sim.is_composed_vietnamese || self.store.is_personal_word(&lower),
+            };
+        }
+
+        // 3. Valid English word shield (`personal_dict` + `EnglishLexicon` on both raw keys and
+        //    Lotus's on-screen preedit after 3-key Telex escape like `seee -> see`, `tooo -> too`):
+        let dialect = self.store.scorer_config().dialect;
+        let screen_lower = sim.preedit_before_break.to_lowercase();
+        let is_known_english_raw = self.store.is_personal_word(&lower)
+            || self
+                .lexicon()
+                .and_then(|lex| lex.lookup_word(&lower))
+                .is_some_and(|meta| meta.is_valid_for_dialect(dialect));
+        let is_known_english_screen = self.store.is_personal_word(&screen_lower)
+            || self
+                .lexicon()
+                .and_then(|lex| lex.lookup_word(&screen_lower))
+                .is_some_and(|meta| meta.is_valid_for_dialect(dialect));
+        let is_known_english = is_known_english_raw || is_known_english_screen;
+
+        // If the user typed a valid English word containing doubled Telex keys (`issue`, `off`,
+        // `boss`, `less`, `process`, `success`) where Lotus's tone-undo ate one `s`/`f` leaving
+        // a truncated non-Vietnamese string (`isue`, `of`, `bos`, `les`, `proces`) on screen,
+        // automatically restore the full English word!
+        if is_known_english_raw && sim.preedit_before_break != token {
+            return EvalOutcome::Autocorrect {
+                replacement: token.to_string(),
+                kind: MatchKind::ValidWord,
+                score: 9.5,
+                margin: 9.5,
+            };
+        }
+
+        // 4. Vietnamese Telex Typo Rescue (prioritized over fuzzy English matching):
+        if !is_known_english {
+            if let Some(rescue) = crate::vi_telex::rescue_telex_typo(token) {
+                if !self
+                    .store
+                    .is_pair_blocked(&lower, &rescue.replacement.to_lowercase())
+                {
+                    return EvalOutcome::Autocorrect {
+                        replacement: rescue.replacement,
+                        kind: MatchKind::VietnameseTelexRescue,
+                        score: 9.2,
+                        margin: 9.2,
+                    };
+                }
+            }
+        }
+
+        // If Lotus's 3x mark undo changed the on-screen character count (`tieeeng` or `feeel -> feel`),
+        // do not run fuzzy English guesses on the raw keystrokes.
+        if sim.screen_chars != token.chars().count() {
+            return EvalOutcome::Unchanged {
+                reason: if is_known_english {
+                    MatchKind::ValidWord
+                } else {
+                    MatchKind::Bypass
+                },
+                do_not_learn: true,
+            };
+        }
+
+        // 5. Fallback to Layer 1 English scorer (`dont -> don't`, `teh -> the`, `chagnes -> changes`):
+        if let Some(scorer) = &self.scorer {
+            return scorer.evaluate(token, ctx, self.store.scorer_config(), &self.store);
+        }
+
+        EvalOutcome::Unchanged {
+            reason: if is_known_english {
+                MatchKind::ValidWord
+            } else {
+                MatchKind::Bypass
+            },
+            do_not_learn: is_known_english,
+        }
+    }
+
     pub fn explain_token(&self, token: &str, ctx: &EvalContext<'_>) -> Explanation {
+        if self.store.active_lang().as_str() == "vi" && self.store.compiled().vi_lotus_enabled {
+            let outcome = self.evaluate_token(token, ctx);
+            let mut top_candidates = Vec::new();
+            if let EvalOutcome::Autocorrect {
+                ref replacement,
+                kind: MatchKind::VietnameseTelexRescue,
+                score,
+                ..
+            } = outcome
+            {
+                top_candidates.push(Candidate {
+                    replacement: replacement.clone(),
+                    score,
+                    edit_cost: 1.0,
+                    freq: 250,
+                    bigram_boost: 0.0,
+                    kind: MatchKind::VietnameseTelexRescue,
+                });
+            }
+            if let Some(scorer) = &self.scorer {
+                let en_exp = scorer.explain(token, ctx, self.store.scorer_config(), &self.store);
+                top_candidates.extend(en_exp.top_candidates);
+            }
+            return Explanation {
+                input: token.to_string(),
+                prev_word: ctx.prev_word.map(str::to_string),
+                boundary_punct: ctx.boundary_punct,
+                outcome,
+                top_candidates,
+            };
+        }
+
         if let Some(scorer) = &self.scorer {
             return scorer.explain(token, ctx, self.store.scorer_config(), &self.store);
         }
@@ -699,7 +848,7 @@ impl SmartKeySession {
                     self.prev_word = None;
                 } else {
                     let cur_chars = buf.chars().count();
-                    if cur_chars >= 3 {
+                    if cur_chars >= 3 || self.lang.as_str() == "vi" {
                         let replace_peak = match &peak_before_bs {
                             None => true,
                             Some(prev_peak) => cur_chars > prev_peak.chars().count(),
@@ -1110,17 +1259,19 @@ impl SmartKeySession {
         // The user ALREADY manually edited this word mid-flight; learn from `(peak -> word)` and
         // do not overwrite their fresh manual edit with statistical guesses!
         if let Some(peak) = peak_before_bs {
-            let lex = engine.scorer.as_ref().map(|s| s.lexicon());
-            let ev = record_manual_edit(
-                &mut engine.store,
-                lex,
-                &self.lang,
-                prev_before.as_deref(),
-                &peak,
-                &word,
-            );
-            if !matches!(ev, LearnEvent::None) {
-                learn_events.push(ev);
+            if self.lang.as_str() != "vi" {
+                let lex = engine.scorer.as_ref().map(|s| s.lexicon());
+                let ev = record_manual_edit(
+                    &mut engine.store,
+                    lex,
+                    &self.lang,
+                    prev_before.as_deref(),
+                    &peak,
+                    &word,
+                );
+                if !matches!(ev, LearnEvent::None) {
+                    learn_events.push(ev);
+                }
             }
             self.update_context_after_commit(
                 &word,
@@ -1136,6 +1287,42 @@ impl SmartKeySession {
             }
             return SessionOutput::with_events(learn_events);
         }
+
+        let is_vi_lotus =
+            self.lang.as_str() == "vi" && engine.store.compiled().vi_lotus_enabled;
+        let vi_sim = if is_vi_lotus {
+            let sim = crate::vi_telex::simulate_lotus_word(&word);
+            // If Lotus itself is performing a uinput fallback burst on this word-break keystroke,
+            // step aside completely so we never collide with Lotus's uinput burst.
+            if sim.needs_uinput_restore_on_break {
+                self.update_context_after_commit(
+                    &sim.committed_at_break,
+                    effective_punct,
+                    is_trigger_space && prior_punct.is_none(),
+                );
+                return SessionOutput::with_events(learn_events);
+            }
+            // If Lotus already composed a valid Vietnamese word with Vietnamese runes (e.g. `"tiếng"`),
+            // leave it untouched unless the raw ASCII token is in `telex_passthrough`.
+            if sim.is_composed_vietnamese && !engine.is_telex_passthrough(&word) {
+                self.update_context_after_commit(
+                    &sim.committed_at_break,
+                    effective_punct,
+                    is_trigger_space && prior_punct.is_none(),
+                );
+                if is_trigger_space && prior_punct.is_none() {
+                    self.mode = Mode::AfterWord {
+                        word: sim.committed_at_break,
+                        prev_word_before: prev_before,
+                        trailing_spaces: 1,
+                    };
+                }
+                return SessionOutput::with_events(learn_events);
+            }
+            Some(sim)
+        } else {
+            None
+        };
 
         let ctx = EvalContext {
             prev_word: prev_before.as_deref(),
@@ -1160,7 +1347,11 @@ impl SmartKeySession {
                 }
                 trailing_boundaries.push(trigger_ch);
 
-                let delete_chars = word.chars().count() + extra_buffered_chars;
+                let base_chars = vi_sim
+                    .as_ref()
+                    .map(|s| s.screen_chars)
+                    .unwrap_or_else(|| word.chars().count());
+                let delete_chars = base_chars + extra_buffered_chars;
                 let mut insert =
                     String::with_capacity(replacement.len() + trailing_boundaries.len());
                 insert.push_str(&replacement);

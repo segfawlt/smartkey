@@ -127,6 +127,13 @@ inline uint8_t classifyProgramName(std::string_view rawProgram) {
     return SMARTKEY_PROFILE_PROSE;
 }
 
+inline bool isSmartKeyBoundaryChar(uint32_t cp) {
+    return cp == ' ' || cp == '\t' || cp == ',' || cp == '.' || cp == '!' ||
+           cp == '?' || cp == ';' || cp == ':' || cp == ')' || cp == ']' ||
+           cp == '}' || cp == '"' || cp == '(' || cp == '[' || cp == '{' ||
+           cp == '`' || cp == 0x201C || cp == 0x201D;
+}
+
 class SmartKeyState final : public InputContextProperty {
 public:
     SmartKeyState() : session_(smartkey_session_new()) {}
@@ -142,8 +149,28 @@ public:
 
     SmartKeySessionHandle *session() const { return session_; }
 
+    void armLotusBurst(uint64_t nowMs) { lotusBurstDeadlineMs_ = nowMs + 150; }
+    void clearLotusBurst() { lotusBurstDeadlineMs_ = 0; }
+    bool isInLotusBurst(uint64_t nowMs) const {
+        return lotusBurstDeadlineMs_ != 0 && nowMs <= lotusBurstDeadlineMs_;
+    }
+
+    void setLotusFilteredBoundary(bool v) { lotusFilteredBoundary_ = v; }
+    bool takeLotusFilteredBoundary() {
+        const bool v = lotusFilteredBoundary_;
+        lotusFilteredBoundary_ = false;
+        return v;
+    }
+
+    void resetLotusTracking() {
+        lotusBurstDeadlineMs_ = 0;
+        lotusFilteredBoundary_ = false;
+    }
+
 private:
     SmartKeySessionHandle *session_ = nullptr;
+    uint64_t lotusBurstDeadlineMs_ = 0;
+    bool lotusFilteredBoundary_ = false;
 };
 
 class SmartKeyAddon final : public AddonInstance {
@@ -156,9 +183,13 @@ public:
 
 private:
     void onKeyEvent(KeyEvent &keyEvent);
+    void onPostKeyEvent(KeyEvent &keyEvent);
     void resetContext(InputContext *ic);
     bool isEnglishKeyboardActive(InputContext *ic) const;
+    bool isLotusActive(InputContext *ic) const;
     static uint8_t classifyProfile(InputContext *ic);
+    static void applyReplaceAction(InputContext *ic, KeyEvent &keyEvent,
+                                   const SmartKeyAction &act);
 
     Instance *instance_ = nullptr;
     SmartKeyEngineHandle *engine_ = nullptr;

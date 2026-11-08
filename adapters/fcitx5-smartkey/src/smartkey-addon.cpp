@@ -72,6 +72,12 @@ SmartKeyAddon::SmartKeyAddon(Instance *instance)
             onKeyEvent(static_cast<KeyEvent &>(event));
         }));
 
+    eventWatchers_.emplace_back(instance_->watchEvent(
+        EventType::InputContextKeyEvent, EventWatcherPhase::PostInputMethod,
+        [this](Event &event) {
+            onPostKeyEvent(static_cast<KeyEvent &>(event));
+        }));
+
     auto resetWatcher = [this](Event &event) {
         auto &icEvent = static_cast<InputContextEvent &>(event);
         resetContext(icEvent.inputContext());
@@ -125,8 +131,11 @@ void SmartKeyAddon::resetContext(InputContext *ic) {
         return;
     }
     auto *state = ic->propertyFor(&factory_);
-    if (state != nullptr && state->session() != nullptr) {
-        smartkey_session_reset(state->session(), engine_);
+    if (state != nullptr) {
+        state->resetLotusTracking();
+        if (state->session() != nullptr) {
+            smartkey_session_reset(state->session(), engine_);
+        }
     }
 }
 
@@ -135,9 +144,17 @@ bool SmartKeyAddon::isEnglishKeyboardActive(InputContext *ic) const {
         return false;
     }
     const std::string im = instance_->inputMethod(ic);
-    // Active ONLY on raw keyboard layouts (e.g. `keyboard-us`); steps aside completely
-    // whenever `bamboo`, `lotus`, `unikey`, `mozc`, `rime`, etc. is active via `Alt+Z`.
     return im.starts_with("keyboard-");
+}
+
+bool SmartKeyAddon::isLotusActive(InputContext *ic) const {
+    if (instance_ == nullptr || ic == nullptr || engine_ == nullptr) {
+        return false;
+    }
+    if (!smartkey_engine_is_vi_lotus_enabled(engine_)) {
+        return false;
+    }
+    return instance_->inputMethod(ic) == "lotus";
 }
 
 uint8_t SmartKeyAddon::classifyProfile(InputContext *ic) {
@@ -171,35 +188,18 @@ uint8_t SmartKeyAddon::classifyProfile(InputContext *ic) {
     return classifyProgramName(rawProg);
 }
 
-void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
-    if (engine_ == nullptr || keyEvent.isRelease()) {
-        return;
-    }
+namespace {
 
-    auto *ic = keyEvent.inputContext();
-    if (ic == nullptr || !isEnglishKeyboardActive(ic)) {
-        return;
-    }
-
-    if (instance_->isComposing(ic)) {
-        return;
-    }
-
-    auto *state = ic->propertyFor(&factory_);
-    if (state == nullptr || state->session() == nullptr) {
-        return;
-    }
-
-    const uint8_t profile = classifyProfile(ic);
-    smartkey_session_set_profile(state->session(), profile);
-    if (profile == SMARTKEY_PROFILE_BYPASS) {
-        return;
-    }
+bool decodeKeyEvent(const KeyEvent &keyEvent, bool &isShortcutReset,
+                    uint8_t &keyKind, uint32_t &codepoint) {
+    isShortcutReset = false;
+    keyKind = SMARTKEY_KEY_CHAR;
+    codepoint = 0;
 
     const Key rawKey = keyEvent.rawKey();
     const Key normKey = keyEvent.key();
     if (rawKey.isModifier() || normKey.isModifier()) {
-        return;
+        return false;
     }
 
     const auto mods = rawKey.states();
@@ -208,54 +208,49 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         KeyState::Alt, KeyState::Super, KeyState::Super2,
         KeyState::Hyper, KeyState::Hyper2, KeyState::Meta});
 
-    const uint64_t nowMs = monotonicNowMs();
-    uint8_t keyKind = SMARTKEY_KEY_CHAR;
-    uint32_t codepoint = 0;
-
     if (rawKey.sym() == FcitxKey_BackSpace && hasCtrl && !hasAltOrSuper) {
         keyKind = SMARTKEY_KEY_CTRL_BACKSPACE;
-    } else if (hasCtrl || hasAltOrSuper) {
-        // Any shortcut chord (`Ctrl+V`, `Ctrl+A`, `Ctrl+Z`, `Ctrl+Left`, `Alt+...`) resets
-        // our shadow buffer cleanly and passes straight through to the application.
-        SmartKeyAction unused{};
-        smartkey_session_process_key(state->session(), engine_,
-                                     SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
-                                     &unused);
-        return;
-    } else if (rawKey.sym() == FcitxKey_BackSpace) {
+        return true;
+    }
+    if (hasCtrl || hasAltOrSuper) {
+        isShortcutReset = true;
+        return true;
+    }
+    if (rawKey.sym() == FcitxKey_BackSpace) {
         keyKind = SMARTKEY_KEY_BACKSPACE;
-    } else if (rawKey.sym() == FcitxKey_Return ||
-               rawKey.sym() == FcitxKey_KP_Enter) {
+        return true;
+    }
+    if (rawKey.sym() == FcitxKey_Return || rawKey.sym() == FcitxKey_KP_Enter) {
         keyKind = SMARTKEY_KEY_ENTER;
-    } else if (rawKey.sym() == FcitxKey_Tab ||
-               rawKey.sym() == FcitxKey_ISO_Left_Tab ||
-               rawKey.sym() == FcitxKey_KP_Tab) {
+        return true;
+    }
+    if (rawKey.sym() == FcitxKey_Tab ||
+        rawKey.sym() == FcitxKey_ISO_Left_Tab ||
+        rawKey.sym() == FcitxKey_KP_Tab) {
         keyKind = SMARTKEY_KEY_TAB;
-    } else if (rawKey.isCursorMove() ||
-               rawKey.sym() == FcitxKey_Delete ||
-               rawKey.sym() == FcitxKey_KP_Delete ||
-               rawKey.sym() == FcitxKey_Insert ||
-               rawKey.sym() == FcitxKey_Escape) {
+        return true;
+    }
+    if (rawKey.isCursorMove() || rawKey.sym() == FcitxKey_Delete ||
+        rawKey.sym() == FcitxKey_KP_Delete ||
+        rawKey.sym() == FcitxKey_Insert ||
+        rawKey.sym() == FcitxKey_Escape) {
         keyKind = SMARTKEY_KEY_NAV_OR_CLICK;
-    } else {
-        const uint32_t cp = Key::keySymToUnicode(rawKey.sym());
-        if (cp < 0x20 || cp == 0x7F) {
-            return;
-        }
-        keyKind = SMARTKEY_KEY_CHAR;
-        codepoint = cp;
+        return true;
     }
 
-    SmartKeyAction act{};
-    if (!smartkey_session_process_key(state->session(), engine_, keyKind,
-                                      codepoint, nowMs, &act)) {
-        return;
+    const uint32_t cp = Key::keySymToUnicode(rawKey.sym());
+    if (cp < 0x20 || cp == 0x7F) {
+        return false;
     }
+    keyKind = SMARTKEY_KEY_CHAR;
+    codepoint = cp;
+    return true;
+}
 
-    if (act.kind != SMARTKEY_ACTION_REPLACE) {
-        return;
-    }
+} // namespace
 
+void SmartKeyAddon::applyReplaceAction(InputContext *ic, KeyEvent &keyEvent,
+                                       const SmartKeyAction &act) {
     keyEvent.filterAndAccept();
 
     if (act.delete_chars > 0) {
@@ -275,6 +270,186 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
 
     if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
         ic->commitString(std::string(act.insert_utf8, act.insert_byte_len));
+    }
+}
+
+void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
+    if (engine_ == nullptr || keyEvent.isRelease()) {
+        return;
+    }
+
+    auto *ic = keyEvent.inputContext();
+    if (ic == nullptr) {
+        return;
+    }
+
+    const bool englishActive = isEnglishKeyboardActive(ic);
+    const bool lotusActive = !englishActive && isLotusActive(ic);
+    if (!englishActive && !lotusActive) {
+        return;
+    }
+
+    auto *state = ic->propertyFor(&factory_);
+    if (state == nullptr || state->session() == nullptr) {
+        return;
+    }
+
+    const uint8_t profile = classifyProfile(ic);
+    smartkey_session_set_profile(state->session(), profile);
+    if (profile == SMARTKEY_PROFILE_BYPASS) {
+        state->resetLotusTracking();
+        return;
+    }
+
+    const uint64_t nowMs = monotonicNowMs();
+
+    if (lotusActive) {
+        smartkey_session_set_lang(state->session(), "vi");
+        const Key rawKey = keyEvent.rawKey();
+
+        // `fcitx5-lotus-server` terminates every uinput replacement burst with `FcitxKey_Pause`.
+        if (rawKey.sym() == FcitxKey_Pause) {
+            state->clearLotusBurst();
+            return;
+        }
+
+        // Ignore synthetic `BackSpace` / `Left` / `Delete` keys injected by `fcitx5-lotus-server`
+        // during a mid-word or break-time uinput replacement burst.
+        if (state->isInLotusBurst(nowMs) &&
+            (rawKey.sym() == FcitxKey_BackSpace ||
+             rawKey.sym() == FcitxKey_Left ||
+             rawKey.sym() == FcitxKey_Delete)) {
+            state->armLotusBurst(nowMs);
+            return;
+        }
+
+        // If Lotus filtered the previous word-break key (`Space`/punct) in `InputMethod` phase
+        // (so `onPostKeyEvent` was skipped), reset our composing state to stay in sync.
+        if (state->takeLotusFilteredBoundary()) {
+            SmartKeyAction unused{};
+            smartkey_session_process_key(state->session(), engine_,
+                                         SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
+                                         &unused);
+        }
+
+        bool isShortcutReset = false;
+        uint8_t keyKind = SMARTKEY_KEY_CHAR;
+        uint32_t codepoint = 0;
+        if (!decodeKeyEvent(keyEvent, isShortcutReset, keyKind, codepoint)) {
+            return;
+        }
+
+        if (isShortcutReset) {
+            state->resetLotusTracking();
+            SmartKeyAction unused{};
+            smartkey_session_process_key(state->session(), engine_,
+                                         SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
+                                         &unused);
+            return;
+        }
+
+        // Record non-boundary letters (`a..z`, etc.) passively in `PreInputMethod` so SmartKey
+        // sees every raw keystroke even when `LotusState::keyEvent` filters the key to run a
+        // uinput burst. Never call `keyEvent.filterAndAccept()` here so Lotus is never starved.
+        if (keyKind == SMARTKEY_KEY_CHAR && !isSmartKeyBoundaryChar(codepoint)) {
+            state->armLotusBurst(nowMs);
+            SmartKeyAction unused{};
+            smartkey_session_process_key(state->session(), engine_,
+                                         SMARTKEY_KEY_CHAR, codepoint, nowMs,
+                                         &unused);
+            return;
+        }
+
+        // For word-break/lookahead chars (`Space`, `,`, `.`, `!`, `?`, etc.), `BackSpace`,
+        // `Enter`, `Tab`, and cursor nav: defer to `onPostKeyEvent` (`PostInputMethod`) so
+        // `LotusState::keyEvent` runs first and clears `oldPreBuffer_`.
+        state->armLotusBurst(nowMs);
+        state->setLotusFilteredBoundary(true);
+        return;
+    }
+
+    // `englishActive` (`keyboard-*`):
+    if (instance_->isComposing(ic)) {
+        return;
+    }
+    state->resetLotusTracking();
+    smartkey_session_set_lang(state->session(), "en");
+
+    bool isShortcutReset = false;
+    uint8_t keyKind = SMARTKEY_KEY_CHAR;
+    uint32_t codepoint = 0;
+    if (!decodeKeyEvent(keyEvent, isShortcutReset, keyKind, codepoint)) {
+        return;
+    }
+
+    if (isShortcutReset) {
+        SmartKeyAction unused{};
+        smartkey_session_process_key(state->session(), engine_,
+                                     SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
+                                     &unused);
+        return;
+    }
+
+    SmartKeyAction act{};
+    if (!smartkey_session_process_key(state->session(), engine_, keyKind,
+                                      codepoint, nowMs, &act)) {
+        return;
+    }
+
+    if (act.kind == SMARTKEY_ACTION_REPLACE) {
+        applyReplaceAction(ic, keyEvent, act);
+    }
+}
+
+void SmartKeyAddon::onPostKeyEvent(KeyEvent &keyEvent) {
+    if (engine_ == nullptr || keyEvent.isRelease()) {
+        return;
+    }
+
+    auto *ic = keyEvent.inputContext();
+    if (ic == nullptr || !isLotusActive(ic)) {
+        return;
+    }
+
+    auto *state = ic->propertyFor(&factory_);
+    if (state == nullptr || state->session() == nullptr) {
+        return;
+    }
+
+    // Reaching `PostInputMethod` proves `LotusState::keyEvent` did NOT filter this key event!
+    state->clearLotusBurst();
+    state->setLotusFilteredBoundary(false);
+
+    const uint8_t profile = classifyProfile(ic);
+    smartkey_session_set_profile(state->session(), profile);
+    if (profile == SMARTKEY_PROFILE_BYPASS) {
+        return;
+    }
+
+    smartkey_session_set_lang(state->session(), "vi");
+
+    bool isShortcutReset = false;
+    uint8_t keyKind = SMARTKEY_KEY_CHAR;
+    uint32_t codepoint = 0;
+    if (!decodeKeyEvent(keyEvent, isShortcutReset, keyKind, codepoint)) {
+        return;
+    }
+
+    // Shortcut resets and non-boundary letters were already recorded in `onKeyEvent` (`PreInputMethod`).
+    if (isShortcutReset ||
+        (keyKind == SMARTKEY_KEY_CHAR && !isSmartKeyBoundaryChar(codepoint))) {
+        return;
+    }
+
+    const uint64_t nowMs = monotonicNowMs();
+    SmartKeyAction act{};
+    if (!smartkey_session_process_key(state->session(), engine_, keyKind,
+                                      codepoint, nowMs, &act)) {
+        return;
+    }
+
+    if (act.kind == SMARTKEY_ACTION_REPLACE) {
+        applyReplaceAction(ic, keyEvent, act);
     }
 }
 

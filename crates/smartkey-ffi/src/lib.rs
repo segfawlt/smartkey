@@ -297,6 +297,19 @@ pub unsafe extern "C" fn smartkey_session_process_key(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_is_vi_lotus_enabled(
+    engine: *const SmartKeyEngineHandle,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        (*engine).inner.store().compiled().vi_lotus_enabled
+    }))
+    .unwrap_or(false)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn smartkey_engine_is_english_word(
     engine: *const SmartKeyEngineHandle,
     word_utf8: *const c_char,

@@ -69,6 +69,17 @@ void verifyProfileClassification() {
     assert(classifyProgramName("org.gnome.TextEditor") == SMARTKEY_PROFILE_PROSE);
     assert(classifyProgramName("md.obsidian.Obsidian") == SMARTKEY_PROFILE_PROSE);
     assert(classifyProgramName("libreoffice") == SMARTKEY_PROFILE_PROSE);
+
+    // Boundary vs non-boundary key classification for Lotus 2-phase bridge
+    using fcitx::smartkey::isSmartKeyBoundaryChar;
+    assert(isSmartKeyBoundaryChar(' '));
+    assert(isSmartKeyBoundaryChar('.'));
+    assert(isSmartKeyBoundaryChar(','));
+    assert(isSmartKeyBoundaryChar('!'));
+    assert(isSmartKeyBoundaryChar('?'));
+    assert(!isSmartKeyBoundaryChar('a'));
+    assert(!isSmartKeyBoundaryChar('t'));
+    assert(!isSmartKeyBoundaryChar('s'));
 }
 
 } // namespace

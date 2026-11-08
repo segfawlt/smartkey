@@ -93,6 +93,10 @@ bool smartkey_session_process_key(
 );
 
 /* Bilingual `fcitx5-lotus` queries & `telex_passthrough` learning */
+bool smartkey_engine_is_vi_lotus_enabled(
+    const SmartKeyEngineHandle* engine
+);
+
 bool smartkey_engine_is_english_word(
     const SmartKeyEngineHandle* engine,
     const char* word_utf8,

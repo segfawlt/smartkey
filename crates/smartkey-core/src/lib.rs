@@ -6,6 +6,7 @@ pub mod scorer;
 pub mod session;
 pub mod store;
 pub mod types;
+pub mod vi_telex;
 
 pub use learner::{LearnEvent, SkipReason};
 pub use lexicon::{
@@ -23,4 +24,8 @@ pub use store::{
 pub use types::{
     Aggressiveness, AppProfile, Candidate, Dialect, EvalOutcome, Explanation, InputOrigin, LangId,
     MatchKind, ScorerConfig,
+};
+pub use vi_telex::{
+    has_any_vietnamese_rune, is_vietnamese_dict_word, rescue_telex_typo, simulate_lotus_word,
+    LotusSimulation, TelexRescue,
 };

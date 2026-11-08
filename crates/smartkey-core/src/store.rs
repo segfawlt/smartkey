@@ -61,6 +61,10 @@ fix_proper_nouns = {fix_proper}         # english -> English, monday -> Monday
 enable_contractions = true
 enable_missed_space_split = {split_spaces}
 
+# Modular language & input-method bridge plugins (`smartkey plugin list|enable|disable|toggle`).
+[plugins]
+vi_lotus = true                 # Zero-fork Vietnamese Telex typo rescue & bilingual bridge for fcitx5-lotus
+
 # Learned unigram typo repairs (graduated after 2x manual fixes).
 [corrections]
 
@@ -201,6 +205,7 @@ impl LearnerState {
 #[derive(Debug, Clone, Default)]
 pub struct CompiledRules {
     pub enabled: bool,
+    pub vi_lotus_enabled: bool,
     pub undo_window_ms: u64,
     pub scorer_config: ScorerConfig,
     pub personal_dict: BTreeSet<String>,
@@ -445,6 +450,41 @@ impl RuleStore {
             .unwrap();
         settings["enabled"] = toml_edit::value(enabled);
         self.flush_rules()
+    }
+
+    /// Normalizes a plugin name (`"vi-lotus"`, `"vi_lotus"`, `"lotus"`, `"vi"`) to its canonical key.
+    pub fn normalize_plugin_key(name: &str) -> Option<&'static str> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "vi-lotus" | "vi_lotus" | "lotus" | "fcitx5-lotus" | "vi" => Some("vi_lotus"),
+            _ => None,
+        }
+    }
+
+    pub fn is_plugin_enabled(&self, name: &str) -> Option<bool> {
+        match Self::normalize_plugin_key(name)? {
+            "vi_lotus" => Some(self.compiled.vi_lotus_enabled),
+            _ => None,
+        }
+    }
+
+    /// Updates `[plugins].<key>` in `rules.toml` while preserving all comments.
+    pub fn set_plugin_enabled(&mut self, name: &str, enabled: bool) -> io::Result<bool> {
+        let Some(key) = Self::normalize_plugin_key(name) else {
+            return Ok(false);
+        };
+        self.sync_external_edits_before_write();
+        if key == "vi_lotus" {
+            self.compiled.vi_lotus_enabled = enabled;
+        }
+        let plugins = self
+            .doc
+            .entry("plugins")
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .unwrap();
+        plugins[key] = toml_edit::value(enabled);
+        self.flush_rules()?;
+        Ok(true)
     }
 
     pub fn flush_state(&mut self) -> io::Result<()> {
@@ -730,10 +770,21 @@ impl RuleStore {
     fn extract_compiled(doc: &DocumentMut) -> CompiledRules {
         let mut out = CompiledRules {
             enabled: true,
+            vi_lotus_enabled: true,
             undo_window_ms: 5000,
             scorer_config: ScorerConfig::default(),
             ..CompiledRules::default()
         };
+
+        if let Some(plugins) = doc.get("plugins").and_then(Item::as_table) {
+            if let Some(b) = plugins
+                .get("vi_lotus")
+                .or_else(|| plugins.get("vi-lotus"))
+                .and_then(Item::as_bool)
+            {
+                out.vi_lotus_enabled = b;
+            }
+        }
 
         if let Some(settings) = doc.get("settings").and_then(Item::as_table) {
             if let Some(b) = settings.get("enabled").and_then(Item::as_bool) {

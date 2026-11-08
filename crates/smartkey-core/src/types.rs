@@ -67,6 +67,10 @@ impl LangId {
         Self("en".to_string())
     }
 
+    pub fn vi() -> Self {
+        Self("vi".to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -122,6 +126,7 @@ pub enum MatchKind {
     MissedSpaceSplit,
     FuzzyLexicon,
     SmashRescue,
+    VietnameseTelexRescue,
 }
 
 /// Ranked candidate produced by a `LanguageScorer`.
