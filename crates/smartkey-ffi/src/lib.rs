@@ -235,6 +235,53 @@ pub unsafe extern "C" fn smartkey_session_set_lang(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn smartkey_session_set_app(
+    session: *mut SmartKeySessionHandle,
+    app_utf8: *const c_char,
+) {
+    if session.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        (*session).inner.set_app(opt_cstr(app_utf8));
+    }));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_set_log_dir(
+    engine: *mut SmartKeyEngineHandle,
+    log_dir_utf8: *const c_char,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let dir = opt_cstr(log_dir_utf8).map(PathBuf::from);
+        (*engine).inner.store_mut().set_log_dir(dir);
+        true
+    }))
+    .unwrap_or(false)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_log_app_event(
+    engine: *mut SmartKeyEngineHandle,
+    app_utf8: *const c_char,
+    profile: u8,
+    reason_utf8: *const c_char,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let app = opt_cstr(app_utf8).unwrap_or("");
+        let reason = opt_cstr(reason_utf8).unwrap_or("unknown");
+        let prof = decode_profile(profile);
+        (*engine).inner.store_mut().log_app_bypass(app, prof, reason);
+    }));
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn smartkey_session_process_key(
     session: *mut SmartKeySessionHandle,
     engine: *mut SmartKeyEngineHandle,

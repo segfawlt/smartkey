@@ -167,10 +167,21 @@ public:
         lotusFilteredBoundary_ = false;
     }
 
+    bool shouldLogProfileTransition(uint8_t profile, std::string_view reason) {
+        if (lastLoggedProfile_ == profile && lastLoggedReason_ == reason) {
+            return false;
+        }
+        lastLoggedProfile_ = profile;
+        lastLoggedReason_ = std::string(reason);
+        return true;
+    }
+
 private:
     SmartKeySessionHandle *session_ = nullptr;
     uint64_t lotusBurstDeadlineMs_ = 0;
     bool lotusFilteredBoundary_ = false;
+    uint8_t lastLoggedProfile_ = 0xFF;
+    std::string lastLoggedReason_;
 };
 
 class SmartKeyAddon final : public AddonInstance {
@@ -187,7 +198,7 @@ private:
     void resetContext(InputContext *ic);
     bool isEnglishKeyboardActive(InputContext *ic) const;
     bool isLotusActive(InputContext *ic) const;
-    static uint8_t classifyProfile(InputContext *ic);
+    static uint8_t classifyProfile(InputContext *ic, const char **outReason = nullptr);
     static void applyReplaceAction(InputContext *ic, KeyEvent &keyEvent,
                                    const SmartKeyAction &act);
 

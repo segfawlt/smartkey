@@ -40,6 +40,18 @@ std::filesystem::path resolveConfigDir() {
     return std::filesystem::path(".smartkey");
 }
 
+std::filesystem::path resolveStateLogDir() {
+    if (const char *xdg = std::getenv("XDG_STATE_HOME");
+        xdg != nullptr && xdg[0] != '\0') {
+        return std::filesystem::path(xdg) / "smartkey" / "logs";
+    }
+    if (const char *home = std::getenv("HOME");
+        home != nullptr && home[0] != '\0') {
+        return std::filesystem::path(home) / ".local" / "state" / "smartkey" / "logs";
+    }
+    return std::filesystem::path(".smartkey") / "logs";
+}
+
 } // namespace
 
 SmartKeyAddon::SmartKeyAddon(Instance *instance)
@@ -48,6 +60,7 @@ SmartKeyAddon::SmartKeyAddon(Instance *instance)
     const auto cfgDir = resolveConfigDir();
     const auto rulesPath = (cfgDir / "rules.toml").string();
     const auto statePath = (cfgDir / "learner_state.json").string();
+    const auto logDir = resolveStateLogDir().string();
 
     engine_ = smartkey_engine_new(rulesPath.c_str(), statePath.c_str(),
                                   SMARTKEY_PRESET_BALANCED);
@@ -55,6 +68,7 @@ SmartKeyAddon::SmartKeyAddon(Instance *instance)
         FCITX_ERROR() << "SmartKey failed to initialize engine at " << rulesPath;
         return;
     }
+    smartkey_engine_set_log_dir(engine_, logDir.c_str());
 
     FCITX_INFO() << "SmartKey loaded (rules: " << rulesPath
                  << ", state: " << statePath << ")";
@@ -157,17 +171,33 @@ bool SmartKeyAddon::isLotusActive(InputContext *ic) const {
     return instance_->inputMethod(ic) == "lotus";
 }
 
-uint8_t SmartKeyAddon::classifyProfile(InputContext *ic) {
+uint8_t SmartKeyAddon::classifyProfile(InputContext *ic, const char **outReason) {
+    auto setReason = [&](const char *r) {
+        if (outReason != nullptr) {
+            *outReason = r;
+        }
+    };
     const auto flags = ic->capabilityFlags();
+    if (flags.test(CapabilityFlag::PasswordOrSensitive)) {
+        setReason("capability:password");
+        return SMARTKEY_PROFILE_BYPASS;
+    }
+    if (flags.test(CapabilityFlag::Terminal)) {
+        setReason("capability:terminal");
+        return SMARTKEY_PROFILE_BYPASS;
+    }
+    if (flags.test(CapabilityFlag::Url)) {
+        setReason("capability:url");
+        return SMARTKEY_PROFILE_BYPASS;
+    }
+    if (flags.test(CapabilityFlag::Email)) {
+        setReason("capability:email");
+        return SMARTKEY_PROFILE_BYPASS;
+    }
     if (flags.testAny(CapabilityFlags{
-            CapabilityFlag::PasswordOrSensitive,
-            CapabilityFlag::Terminal,
-            CapabilityFlag::Url,
-            CapabilityFlag::Email,
-            CapabilityFlag::Digit,
-            CapabilityFlag::Number,
-            CapabilityFlag::Dialable,
-            CapabilityFlag::Disable})) {
+            CapabilityFlag::Digit, CapabilityFlag::Number,
+            CapabilityFlag::Dialable, CapabilityFlag::Disable})) {
+        setReason("capability:numeric_or_disabled");
         return SMARTKEY_PROFILE_BYPASS;
     }
 
@@ -180,12 +210,29 @@ uint8_t SmartKeyAddon::classifyProfile(InputContext *ic) {
         if (ic->frontendName() == std::string_view("dbus") &&
             (!flags.test(CapabilityFlag::SurroundingText) ||
              !ic->surroundingText().isValid())) {
+            setReason("dbus-no-surrounding-text");
             return SMARTKEY_PROFILE_BYPASS;
         }
+        setReason("prose");
         return SMARTKEY_PROFILE_PROSE;
     }
 
-    return classifyProgramName(rawProg);
+    const uint8_t prof = classifyProgramName(rawProg);
+    switch (prof) {
+    case SMARTKEY_PROFILE_BYPASS:
+        setReason("program-list");
+        break;
+    case SMARTKEY_PROFILE_BROWSER:
+        setReason("browser");
+        break;
+    case SMARTKEY_PROFILE_CHAT:
+        setReason("chat");
+        break;
+    default:
+        setReason("prose");
+        break;
+    }
+    return prof;
 }
 
 namespace {
@@ -294,8 +341,16 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         return;
     }
 
-    const uint8_t profile = classifyProfile(ic);
+    const std::string appName = normalizeProgramId(ic->program());
+    smartkey_session_set_app(state->session(), appName.c_str());
+
+    const char *reason = "prose";
+    const uint8_t profile = classifyProfile(ic, &reason);
     smartkey_session_set_profile(state->session(), profile);
+    if (state->shouldLogProfileTransition(profile, reason) &&
+        profile == SMARTKEY_PROFILE_BYPASS) {
+        smartkey_engine_log_app_event(engine_, appName.c_str(), profile, reason);
+    }
     if (profile == SMARTKEY_PROFILE_BYPASS) {
         state->resetLotusTracking();
         return;
@@ -420,8 +475,16 @@ void SmartKeyAddon::onPostKeyEvent(KeyEvent &keyEvent) {
     state->clearLotusBurst();
     state->setLotusFilteredBoundary(false);
 
-    const uint8_t profile = classifyProfile(ic);
+    const std::string appName = normalizeProgramId(ic->program());
+    smartkey_session_set_app(state->session(), appName.c_str());
+
+    const char *reason = "prose";
+    const uint8_t profile = classifyProfile(ic, &reason);
     smartkey_session_set_profile(state->session(), profile);
+    if (state->shouldLogProfileTransition(profile, reason) &&
+        profile == SMARTKEY_PROFILE_BYPASS) {
+        smartkey_engine_log_app_event(engine_, appName.c_str(), profile, reason);
+    }
     if (profile == SMARTKEY_PROFILE_BYPASS) {
         return;
     }

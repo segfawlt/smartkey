@@ -81,6 +81,16 @@ void smartkey_session_free(SmartKeySessionHandle* session);
 void smartkey_session_reset(SmartKeySessionHandle* session, SmartKeyEngineHandle* engine);
 void smartkey_session_set_profile(SmartKeySessionHandle* session, uint8_t profile);
 void smartkey_session_set_lang(SmartKeySessionHandle* session, const char* lang_utf8);
+void smartkey_session_set_app(SmartKeySessionHandle* session, const char* app_utf8);
+
+/* Durable diagnostics event log (`~/.local/state/smartkey/logs/`) */
+bool smartkey_engine_set_log_dir(SmartKeyEngineHandle* engine, const char* log_dir_utf8);
+void smartkey_engine_log_app_event(
+    SmartKeyEngineHandle* engine,
+    const char* app_utf8,
+    uint8_t profile,
+    const char* reason_utf8
+);
 
 /* Desktop keystroke stream (`fcitx5-lotus` / X11 / Wayland) */
 bool smartkey_session_process_key(

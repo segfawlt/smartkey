@@ -7,8 +7,9 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
+use crate::event_log::{current_epoch_ms, date_string, DiagnosticsConfig, EventLog, EventLogLevel};
 use crate::scorer::UserRuleView;
-use crate::types::{Aggressiveness, Dialect, LangId, MatchKind, ScorerConfig};
+use crate::types::{Aggressiveness, AppProfile, Dialect, LangId, MatchKind, ScorerConfig};
 
 /// Built-in onboarding presets (`smartkey init --preset ...`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -64,6 +65,14 @@ enable_missed_space_split = {split_spaces}
 # Modular language & input-method bridge plugins (`smartkey plugin list|enable|disable|toggle`).
 [plugins]
 vi_lotus = true                 # Zero-fork Vietnamese Telex typo rescue & bilingual bridge for fcitx5-lotus
+
+# Durable decision & learning provenance log (`~/.local/state/smartkey/logs/events-YYYY-MM-DD.jsonl`).
+[diagnostics]
+event_log = true                # Durable decision log on/off
+log_level = "interesting"       # "interesting" | "all" ("all" = every committed word)
+keep_days = 14                  # Prune logs older than N days (0 = keep forever)
+near_miss_band = 0.5            # Log declined unknowns scoring >= band * threshold
+annotate_rules = true           # Provenance comments on machine-learned rules.toml entries
 
 # Learned unigram typo repairs (graduated after 2x manual fixes).
 [corrections]
@@ -137,6 +146,28 @@ pub enum DiagnosticEvent {
         threshold: f32,
         total_count: u32,
     },
+    RealWordDeclined {
+        word: String,
+        prev: String,
+        candidate: String,
+        candidate_score: f32,
+        typed_score: f32,
+    },
+    AppBypass {
+        app: String,
+        profile: AppProfile,
+        reason: String,
+    },
+    RuleLearned {
+        rule: String,
+        stage: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous: Option<String>,
+    },
+    WordUnchanged {
+        word: String,
+        reason: MatchKind,
+    },
 }
 
 /// High-churn staging counters and diagnostic log stored in `learner_state.json`.
@@ -208,6 +239,7 @@ pub struct CompiledRules {
     pub vi_lotus_enabled: bool,
     pub undo_window_ms: u64,
     pub scorer_config: ScorerConfig,
+    pub diagnostics: DiagnosticsConfig,
     pub personal_dict: BTreeSet<String>,
     pub lang_personal_dict: BTreeMap<String, BTreeSet<String>>,
     pub telex_passthrough: BTreeSet<String>,
@@ -230,6 +262,7 @@ pub struct RuleStore {
     compiled: CompiledRules,
     state: LearnerState,
     active_lang: LangId,
+    event_log: EventLog,
     /// Session-scoped instant shields (e.g. `1x` Undo + Keep Verbatim before `2x` permanent graduation).
     session_shielded_words: BTreeSet<String>,
     session_blocked_pairs: BTreeSet<(String, String)>,
@@ -250,6 +283,7 @@ impl RuleStore {
             compiled,
             state: LearnerState::default(),
             active_lang: LangId::en(),
+            event_log: EventLog::new(),
             session_shielded_words: BTreeSet::new(),
             session_blocked_pairs: BTreeSet::new(),
         }
@@ -270,6 +304,7 @@ impl RuleStore {
             compiled,
             state: LearnerState::default(),
             active_lang: LangId::en(),
+            event_log: EventLog::new(),
             session_shielded_words: BTreeSet::new(),
             session_blocked_pairs: BTreeSet::new(),
         })
@@ -322,9 +357,40 @@ impl RuleStore {
             compiled,
             state,
             active_lang: LangId::en(),
+            event_log: EventLog::new(),
             session_shielded_words: BTreeSet::new(),
             session_blocked_pairs: BTreeSet::new(),
         })
+    }
+
+    pub fn set_log_dir(&mut self, dir: Option<PathBuf>) {
+        self.event_log.set_dir(dir);
+    }
+
+    pub fn log_dir(&self) -> Option<&Path> {
+        self.event_log.dir()
+    }
+
+    pub fn set_current_app(&mut self, app: Option<&str>) {
+        self.event_log.set_app(app);
+    }
+
+    pub fn current_app(&self) -> Option<&str> {
+        self.event_log.app()
+    }
+
+    pub fn diagnostics(&self) -> &DiagnosticsConfig {
+        &self.compiled.diagnostics
+    }
+
+    pub fn record_event_only(&mut self, ev: &DiagnosticEvent) {
+        if self.compiled.diagnostics.event_log {
+            self.event_log.record(
+                &self.compiled.diagnostics,
+                self.active_lang.as_str(),
+                ev,
+            );
+        }
     }
 
     pub fn set_active_lang(&mut self, lang: LangId) {
@@ -509,12 +575,14 @@ impl RuleStore {
             *e = e.saturating_add(1);
             *e
         };
-        self.state.push_event(DiagnosticEvent::AutocorrectApplied {
+        let ev = DiagnosticEvent::AutocorrectApplied {
             typed: typed.to_string(),
             applied: applied.to_string(),
             kind,
             total_count,
-        });
+        };
+        self.record_event_only(&ev);
+        self.state.push_event(ev);
         let _ = self.flush_state();
     }
 
@@ -526,12 +594,17 @@ impl RuleStore {
             *e = e.saturating_add(1);
             *e
         };
-        self.state.push_event(DiagnosticEvent::BackspaceUndo {
+        let is_triggered = matches!(resolution, UndoResolution::Triggered);
+        let ev = DiagnosticEvent::BackspaceUndo {
             typed: typed.to_string(),
             rejected: rejected.to_string(),
             resolution,
             undo_count,
-        });
+        };
+        if !is_triggered {
+            self.record_event_only(&ev);
+        }
+        self.state.push_event(ev);
         let _ = self.flush_state();
     }
 
@@ -544,11 +617,12 @@ impl RuleStore {
         resolution: UndoResolution,
     ) {
         self.sync_external_state_before_write();
+        let mut resolved_count = None;
         if let Some(DiagnosticEvent::BackspaceUndo {
             typed: t,
             rejected: r,
             resolution: res_slot,
-            ..
+            undo_count,
         }) = self.state.recent_events.iter_mut().rev().find(|ev| {
             matches!(
                 ev,
@@ -559,10 +633,20 @@ impl RuleStore {
             )
         }) {
             if t == typed && r == rejected {
-                *res_slot = resolution;
-                let _ = self.flush_state();
-                return;
+                *res_slot = resolution.clone();
+                resolved_count = Some(*undo_count);
             }
+        }
+        if let Some(undo_count) = resolved_count {
+            let _ = self.flush_state();
+            let ev = DiagnosticEvent::BackspaceUndo {
+                typed: typed.to_string(),
+                rejected: rejected.to_string(),
+                resolution,
+                undo_count,
+            };
+            self.record_event_only(&ev);
+            return;
         }
         self.log_backspace_undo(typed, rejected, resolution);
     }
@@ -580,12 +664,14 @@ impl RuleStore {
             *e = e.saturating_add(1);
             *e
         };
-        self.state.push_event(DiagnosticEvent::ManualBackspaceFix {
+        let ev = DiagnosticEvent::ManualBackspaceFix {
             orig: orig.trim().to_string(),
             fixed: fixed.trim().to_string(),
             outcome: outcome.to_string(),
             attempt_count,
-        });
+        };
+        self.record_event_only(&ev);
+        self.state.push_event(ev);
         let _ = self.flush_state();
     }
 
@@ -606,14 +692,74 @@ impl RuleStore {
             *e = e.saturating_add(1);
             *e
         };
-        self.state.push_event(DiagnosticEvent::UnfixedUnknown {
+        let ev = DiagnosticEvent::UnfixedUnknown {
             word: word.trim().to_string(),
             best_candidate: best_candidate.map(str::to_string),
             best_score,
             threshold,
             total_count,
-        });
+        };
+        self.record_event_only(&ev);
+        self.state.push_event(ev);
         let _ = self.flush_state();
+    }
+
+    pub fn log_real_word_declined(
+        &mut self,
+        word: &str,
+        prev: &str,
+        candidate: &str,
+        candidate_score: f32,
+        typed_score: f32,
+    ) {
+        let ev = DiagnosticEvent::RealWordDeclined {
+            word: word.to_string(),
+            prev: prev.to_string(),
+            candidate: candidate.to_string(),
+            candidate_score,
+            typed_score,
+        };
+        self.record_event_only(&ev);
+    }
+
+    pub fn log_app_bypass(&mut self, app: &str, profile: AppProfile, reason: &str) {
+        let ev = DiagnosticEvent::AppBypass {
+            app: app.to_string(),
+            profile,
+            reason: reason.to_string(),
+        };
+        self.record_event_only(&ev);
+    }
+
+    pub fn log_word_unchanged(&mut self, word: &str, reason: MatchKind) {
+        let ev = DiagnosticEvent::WordUnchanged {
+            word: word.to_string(),
+            reason,
+        };
+        self.record_event_only(&ev);
+    }
+
+    pub fn log_rule_learned(&mut self, rule: &str, stage: &str, previous: Option<String>) {
+        let ev = DiagnosticEvent::RuleLearned {
+            rule: rule.to_string(),
+            stage: stage.to_string(),
+            previous,
+        };
+        self.record_event_only(&ev);
+    }
+
+    fn format_provenance_comment(&self, label: &str, previous: Option<&str>) -> String {
+        let d = date_string(current_epoch_ms());
+        let app_part = self
+            .event_log
+            .app()
+            .filter(|a| !a.is_empty())
+            .map(|a| format!(" ({a})"))
+            .unwrap_or_default();
+        let was_part = previous
+            .map(|old| format!(" — was: {old:?}"))
+            .unwrap_or_default();
+        format!(" # {label} {d}{app_part}{was_part}")
     }
 
     pub fn clear_diagnostic_logs(&mut self) -> io::Result<()> {
@@ -646,8 +792,26 @@ impl RuleStore {
         let _ = self.flush_rules();
     }
 
+    /// Returns true if `lower_word` is explicitly stored in `personal_dict` (excluding session shields).
+    pub fn is_explicit_personal_word(&self, lang: &LangId, lower_word: &str) -> bool {
+        if lang.as_str() != "en"
+            && self
+                .compiled
+                .lang_personal_dict
+                .get(lang.as_str())
+                .is_some_and(|s| s.contains(lower_word))
+        {
+            return true;
+        }
+        self.compiled.personal_dict.contains(lower_word)
+    }
+
     /// Permanently adds `word_lower` to `personal_dict` (or `[lang.<id>].personal_dict` for non-English).
     pub fn add_personal_word(&mut self, lang: &LangId, word_lower: &str) {
+        self.add_personal_word_with_stage(lang, word_lower, "personal_graduated");
+    }
+
+    pub fn add_personal_word_with_stage(&mut self, lang: &LangId, word_lower: &str, stage: &str) {
         self.sync_external_edits_before_write();
         if lang.as_str() == "en" {
             if !self.compiled.personal_dict.insert(word_lower.to_string()) {
@@ -687,28 +851,85 @@ impl RuleStore {
             }
         }
         let _ = self.flush_rules();
+        self.log_rule_learned(&format!("personal_dict:{word_lower}"), stage, None);
+    }
+
+    /// Removes `word_lower` from `personal_dict` (used when a user repeatedly corrects or rejects
+    /// a mistaken `personal_dict` entry — automatic "un-dictionary").
+    pub fn remove_personal_word(&mut self, lang: &LangId, word_lower: &str) -> bool {
+        self.sync_external_edits_before_write();
+        self.session_shielded_words.remove(word_lower);
+        let removed = if lang.as_str() == "en" {
+            let did_remove = self.compiled.personal_dict.remove(word_lower);
+            if did_remove {
+                if let Some(arr) = self.doc.get_mut("personal_dict").and_then(Item::as_array_mut) {
+                    arr.retain(|v| !v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(word_lower)));
+                }
+            }
+            did_remove
+        } else {
+            let did_remove = self
+                .compiled
+                .lang_personal_dict
+                .get_mut(lang.as_str())
+                .is_some_and(|s| s.remove(word_lower));
+            if did_remove {
+                if let Some(arr) = self
+                    .doc
+                    .get_mut("lang")
+                    .and_then(Item::as_table_mut)
+                    .and_then(|t| t.get_mut(lang.as_str()))
+                    .and_then(Item::as_table_mut)
+                    .and_then(|t| t.get_mut("personal_dict"))
+                    .and_then(Item::as_array_mut)
+                {
+                    arr.retain(|v| !v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(word_lower)));
+                }
+            }
+            did_remove
+        };
+        if removed {
+            let _ = self.flush_rules();
+            self.log_rule_learned(
+                &format!("personal_dict:{word_lower}"),
+                "personal_demoted_2x",
+                Some(word_lower.to_string()),
+            );
+        }
+        removed
     }
 
     /// Permanently adds `typed_lower = fixed` to `[corrections]` (or `[lang.<id>.corrections]`).
     pub fn add_correction(&mut self, lang: &LangId, typed_lower: &str, fixed: &str) {
         self.sync_external_edits_before_write();
-        if lang.as_str() == "en" {
+        let prev_target = if lang.as_str() == "en" {
             self.compiled
                 .corrections
-                .insert(typed_lower.to_string(), fixed.to_string());
+                .insert(typed_lower.to_string(), fixed.to_string())
+        } else {
+            self.compiled
+                .lang_corrections
+                .entry(lang.as_str().to_string())
+                .or_default()
+                .insert(typed_lower.to_string(), fixed.to_string())
+        };
+        let superseded = prev_target.as_deref().filter(|old| *old != fixed);
+
+        let mut item_val = Value::from(fixed);
+        if self.compiled.diagnostics.annotate_rules {
+            let comment = self.format_provenance_comment("learned 2x", superseded);
+            item_val.decor_mut().set_suffix(comment);
+        }
+
+        if lang.as_str() == "en" {
             let tbl = self
                 .doc
                 .entry("corrections")
                 .or_insert(Item::Table(Table::new()))
                 .as_table_mut()
                 .unwrap();
-            tbl[typed_lower] = toml_edit::value(fixed);
+            tbl[typed_lower] = Item::Value(item_val);
         } else {
-            self.compiled
-                .lang_corrections
-                .entry(lang.as_str().to_string())
-                .or_default()
-                .insert(typed_lower.to_string(), fixed.to_string());
             let lang_root = self
                 .doc
                 .entry("lang")
@@ -725,18 +946,33 @@ impl RuleStore {
                 .or_insert(Item::Table(Table::new()))
                 .as_table_mut()
                 .unwrap();
-            corr[typed_lower] = toml_edit::value(fixed);
+            corr[typed_lower] = Item::Value(item_val);
         }
         let _ = self.flush_rules();
+
+        let rule_str = format!("{typed_lower}->{fixed}");
+        if let Some(old) = superseded {
+            self.log_rule_learned(&rule_str, "superseded", Some(old.to_string()));
+        } else if prev_target.is_none() {
+            self.log_rule_learned(&rule_str, "graduated_2x", None);
+        }
     }
 
     /// Permanently adds `"prev typed" = "fixed"` to `[context_corrections]`.
     pub fn add_context_correction(&mut self, prev_lower: &str, typed_lower: &str, fixed: &str) {
         self.sync_external_edits_before_write();
-        self.compiled.context_corrections.insert(
+        let prev_target = self.compiled.context_corrections.insert(
             (prev_lower.to_string(), typed_lower.to_string()),
             fixed.to_string(),
         );
+        let superseded = prev_target.as_deref().filter(|old| *old != fixed);
+
+        let mut item_val = Value::from(fixed);
+        if self.compiled.diagnostics.annotate_rules {
+            let comment = self.format_provenance_comment("learned 2x", superseded);
+            item_val.decor_mut().set_suffix(comment);
+        }
+
         let key = format!("{prev_lower} {typed_lower}");
         let tbl = self
             .doc
@@ -744,8 +980,15 @@ impl RuleStore {
             .or_insert(Item::Table(Table::new()))
             .as_table_mut()
             .unwrap();
-        tbl[&key] = toml_edit::value(fixed);
+        tbl[&key] = Item::Value(item_val);
         let _ = self.flush_rules();
+
+        let rule_str = format!("{prev_lower} {typed_lower}->{fixed}");
+        if let Some(old) = superseded {
+            self.log_rule_learned(&rule_str, "superseded", Some(old.to_string()));
+        } else if prev_target.is_none() {
+            self.log_rule_learned(&rule_str, "graduated_2x", None);
+        }
     }
 
     /// Permanently adds an ASCII word to `telex_passthrough` (for `fcitx5-lotus` bilingual mode).
@@ -836,6 +1079,29 @@ impl RuleStore {
                 .and_then(Item::as_bool)
             {
                 out.scorer_config.enable_missed_space_split = b;
+            }
+        }
+
+        if let Some(diag) = doc.get("diagnostics").and_then(Item::as_table) {
+            if let Some(b) = diag.get("event_log").and_then(Item::as_bool) {
+                out.diagnostics.event_log = b;
+            }
+            if let Some(lvl) = diag.get("log_level").and_then(Item::as_str) {
+                out.diagnostics.log_level = EventLogLevel::parse(lvl);
+            }
+            if let Some(days) = diag.get("keep_days").and_then(Item::as_integer) {
+                if days >= 0 {
+                    out.diagnostics.keep_days = days as u32;
+                }
+            }
+            if let Some(band) = diag
+                .get("near_miss_band")
+                .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+            {
+                out.diagnostics.near_miss_band = (band as f32).clamp(0.0, 1.0);
+            }
+            if let Some(b) = diag.get("annotate_rules").and_then(Item::as_bool) {
+                out.diagnostics.annotate_rules = b;
             }
         }
 
@@ -985,5 +1251,9 @@ impl UserRuleView for RuleStore {
             Some(cnt) if cnt >= 2 => (0.06 * (cnt.min(4) as f32)).min(0.22),
             _ => 0.0,
         }
+    }
+
+    fn personal_words(&self) -> Option<&BTreeSet<String>> {
+        Some(&self.compiled.personal_dict)
     }
 }

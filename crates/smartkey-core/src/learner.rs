@@ -243,6 +243,24 @@ pub fn resolve_restored_edit(
         return vec![edit_ev];
     }
     store.add_permanent_block(&raw_lower, &rej_lower);
+    let rej_in_lexicon = lang.as_str() == "en"
+        && lexicon.is_some_and(|l| l.contains_any_english(&rej_lower));
+    if !rej_in_lexicon && store.is_explicit_personal_word(lang, &rej_lower) {
+        let demote_key = format!("demote:{}:{}", lang.as_str(), rej_lower);
+        let cnt = {
+            let e = store
+                .state_mut()
+                .staged_undo_keep
+                .entry(demote_key)
+                .or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        };
+        if cnt >= 2 {
+            store.remove_personal_word(lang, &rej_lower);
+        }
+        let _ = store.flush_state();
+    }
     vec![
         LearnEvent::BlockedPairPermanent {
             typed: raw_lower,
@@ -406,35 +424,67 @@ fn record_manual_edit_inner(
         }
     }
 
-    // Target word validity check (prevents learning a typo-to-typo edit like `fomr -> fomrr`)
+    // Target word validity check (prevents learning a typo-to-typo edit like `fomr -> fomrr`
+    // or promoting a known typo like `recieve` into `personal_dict`).
+    let mut target_is_novel_unknown = false;
     if effective_lang.as_str() == "en" {
         if let Some(lex) = lexicon {
             if !lex.contains_any_english(&fixed_lower) && !store.is_personal_word(&fixed_lower) {
-                store.state_mut().record_skipped(
-                    effective_lang.as_str(),
-                    prev_word,
-                    &orig_lower,
-                    &fixed_lower,
-                    SkipReason::TargetNotValidWord.as_str(),
-                );
-                let _ = store.flush_state();
-                return LearnEvent::Ignored(SkipReason::TargetNotValidWord);
+                let is_key_bounce_extension = fixed_lower.starts_with(&orig_lower)
+                    && fixed_chars.len() == orig_chars.len() + 1
+                    && fixed_chars.last() == orig_chars.last();
+                let is_stretch = is_expressive_stretch(&fixed_lower, |w| {
+                    store.is_personal_word(w) || lex.contains_any_english(w)
+                });
+                if fixed_chars.len() < 4
+                    || is_key_bounce_extension
+                    || is_stretch
+                    || lex.lookup_known_typos(&fixed_lower).is_some()
+                {
+                    store.state_mut().record_skipped(
+                        effective_lang.as_str(),
+                        prev_word,
+                        &orig_lower,
+                        &fixed_lower,
+                        SkipReason::TargetNotValidWord.as_str(),
+                    );
+                    let _ = store.flush_state();
+                    return LearnEvent::Ignored(SkipReason::TargetNotValidWord);
+                }
+                target_is_novel_unknown = true;
             }
         }
     }
 
-    // Guard 2: Valid-Word Shield (`"form" -> "from"` must NEVER learn as a global unigram rule!)
-    let orig_is_valid = store.is_personal_word(&orig_lower)
-        || (effective_lang.as_str() == "en"
-            && lexicon.is_some_and(|l| l.contains_any_english(&orig_lower)));
+    // Guard 2: Valid-Word Shield (`"form" -> "from"` must NEVER learn as a global unigram rule!).
+    // Core lexicon words are permanently shielded; `personal_dict`-only words can be un-dictionaried
+    // if the user manually fixes them into another word `2x`.
+    let orig_in_lexicon = effective_lang.as_str() == "en"
+        && lexicon.is_some_and(|l| l.contains_any_english(&orig_lower));
 
-    if !orig_is_valid {
+    if !orig_in_lexicon {
         // Track `trouble_words` prior so future similar smashes near `fixed_lower` get a tie-break boost
         *store
             .state_mut()
             .trouble_words
             .entry(fixed_lower.clone())
             .or_insert(0) += 1;
+
+        if target_is_novel_unknown {
+            let unk_key = format!("{}:{}", effective_lang.as_str(), fixed_lower);
+            let unk_cnt = {
+                let e = store
+                    .state_mut()
+                    .untouched_unknowns
+                    .entry(unk_key)
+                    .or_insert(0);
+                *e = e.saturating_add(1);
+                *e
+            };
+            if unk_cnt >= 3 {
+                store.add_personal_word(&effective_lang, &fixed_lower);
+            }
+        }
 
         let stage_key = format!(
             "{}:{}->{}",
@@ -460,6 +510,16 @@ fn record_manual_edit_inner(
         };
 
         if count >= 2 {
+            if store.is_explicit_personal_word(&effective_lang, &orig_lower) {
+                store.remove_personal_word(&effective_lang, &orig_lower);
+            }
+            if target_is_novel_unknown && !store.is_personal_word(&fixed_lower) {
+                store.add_personal_word_with_stage(
+                    &effective_lang,
+                    &fixed_lower,
+                    "personal_promoted_2x",
+                );
+            }
             store.add_correction(&effective_lang, &orig_lower, &target_to_save);
             let _ = store.flush_state();
             return LearnEvent::GraduatedCorrection {

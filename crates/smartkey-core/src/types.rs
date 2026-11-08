@@ -126,6 +126,7 @@ pub enum MatchKind {
     MissedSpaceSplit,
     FuzzyLexicon,
     SmashRescue,
+    PersonalDict,
     VietnameseTelexRescue,
 }
 

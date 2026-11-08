@@ -613,3 +613,337 @@ fn test_unfixed_unknown_logging() {
         DiagnosticEvent::UnfixedUnknown { word, .. } if word == "xkzqw"
     )));
 }
+
+#[test]
+fn test_diagnostics_config_and_jsonl_event_log() {
+    static NEXT_DIAG_ID: AtomicU64 = AtomicU64::new(100);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "smartkey_diag_test_{}_{}",
+        std::process::id(),
+        NEXT_DIAG_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    let rules_path = tmp_dir.join("rules.toml");
+    let state_path = tmp_dir.join("learner_state.json");
+    let log_dir = tmp_dir.join("logs");
+
+    // Pre-create a stale log file that should be pruned on init
+    fs::create_dir_all(&log_dir).unwrap();
+    let stale_log = log_dir.join("events-2020-01-01.jsonl");
+    let unrelated_file = log_dir.join("notes.txt");
+    fs::write(&stale_log, "{}\n").unwrap();
+    fs::write(&unrelated_file, "keep me\n").unwrap();
+
+    // Configure log_level = "all" so WordUnchanged and RealWordDeclined are recorded
+    let toml_content = Preset::Balanced
+        .initial_toml()
+        .replace("log_level = \"interesting\"", "log_level = \"all\"")
+        .replace("near_miss_band = 0.5", "near_miss_band = 0.25")
+        .replace("keep_days = 14", "keep_days = 7");
+    fs::write(&rules_path, toml_content).unwrap();
+
+    let mut store =
+        RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced).unwrap();
+    assert_eq!(
+        store.compiled().diagnostics.log_level,
+        smartkey_core::EventLogLevel::All
+    );
+    store.set_log_dir(Some(log_dir.clone()));
+
+    store.log_app_bypass("kitty", smartkey_core::AppProfile::Bypass, "class_match");
+
+    // Stale log file should be pruned on first write; unrelated file preserved
+    assert!(!stale_log.exists(), "stale events-2020-01-01.jsonl should be pruned");
+    assert!(unrelated_file.exists(), "non-event files must not be deleted");
+
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    session.set_app(Some("kitty"));
+    let mut buf = String::new();
+
+    // 1. "sent form " -> "sent" is WordUnchanged, "form" triggers RealWordDeclined (candidate "from")
+    feed_keys(&mut session, &mut engine, &mut buf, "sent form ");
+    assert_eq!(buf, "sent form ");
+
+    // 2. "teh " -> AutocorrectApplied ("the")
+    feed_keys(&mut session, &mut engine, &mut buf, "teh ");
+    assert_eq!(buf, "sent form the ");
+
+    // Verify JSONL file was created and contains valid envelopes
+    let entries: Vec<PathBuf> = fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|s| s.starts_with("events-") && s.ends_with(".jsonl"))
+        })
+        .collect();
+    assert_eq!(entries.len(), 1, "expected exactly 1 daily JSONL file");
+
+    let raw_jsonl = fs::read_to_string(&entries[0]).unwrap();
+    let lines: Vec<serde_json::Value> = raw_jsonl
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSONL line"))
+        .collect();
+
+    assert!(lines.iter().all(|v| v["v"] == 1 && v["ts_ms"].is_u64()));
+    assert!(lines.iter().any(|v| v["event"] == "app_bypass"
+        && v["app"] == "kitty"
+        && v["profile"] == "bypass"
+        && v["reason"] == "class_match"));
+    assert!(lines.iter().any(|v| v["event"] == "word_unchanged"
+        && v["word"] == "sent"
+        && v["app"] == "kitty"));
+    assert!(lines.iter().any(|v| v["event"] == "real_word_declined"
+        && v["prev"] == "sent"
+        && v["word"] == "form"
+        && v["candidate"] == "from"
+        && v["candidate_score"].as_f64().unwrap() > v["typed_score"].as_f64().unwrap()));
+    assert!(lines.iter().any(|v| v["event"] == "autocorrect_applied"
+        && v["typed"] == "teh"
+        && v["applied"] == "the"));
+
+    // Verify learner_state.json recent_events only contains the 4 core variants (not bloated by WordUnchanged/RealWordDeclined)
+    assert!(engine.store().state().recent_events.iter().all(|ev| !matches!(
+        ev,
+        DiagnosticEvent::WordUnchanged { .. }
+            | DiagnosticEvent::RealWordDeclined { .. }
+            | DiagnosticEvent::AppBypass { .. }
+            | DiagnosticEvent::RuleLearned { .. }
+    )));
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_rule_supersession_and_toml_provenance_annotation() {
+    static NEXT_SUP_ID: AtomicU64 = AtomicU64::new(200);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "smartkey_sup_test_{}_{}",
+        std::process::id(),
+        NEXT_SUP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    let rules_path = tmp_dir.join("rules.toml");
+    let state_path = tmp_dir.join("learner_state.json");
+    let log_dir = tmp_dir.join("logs");
+
+    let mut store =
+        RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced).unwrap();
+    store.set_log_dir(Some(log_dir.clone()));
+
+    store.add_correction(&LangId::en(), "adpatr", "adapter");
+    store.add_correction(&LangId::en(), "adpatr", "adaptor");
+
+    let rules_raw = fs::read_to_string(&rules_path).unwrap();
+    assert!(
+        rules_raw.contains("# learned 2x ") && rules_raw.contains("— was: \"adapter\""),
+        "expected provenance comment in rules.toml, got:\n{rules_raw}"
+    );
+
+    let entries: Vec<PathBuf> = fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|s| s.starts_with("events-") && s.ends_with(".jsonl"))
+        })
+        .collect();
+    let raw_jsonl = fs::read_to_string(&entries[0]).unwrap();
+    let lines: Vec<serde_json::Value> = raw_jsonl
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    assert!(lines.iter().any(|v| v["event"] == "rule_learned"
+        && v["rule"] == "adpatr->adapter"
+        && v["stage"] == "graduated_2x"
+        && v["previous"].is_null()));
+    assert!(lines.iter().any(|v| v["event"] == "rule_learned"
+        && v["rule"] == "adpatr->adaptor"
+        && v["stage"] == "superseded"
+        && v["previous"] == "adapter"));
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_unknown_target_2x_promotion_step5_personal_dict_and_2x_undictionary() {
+    static NEXT_PROMO_ID: AtomicU64 = AtomicU64::new(300);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "smartkey_promo_test_{}_{}",
+        std::process::id(),
+        NEXT_PROMO_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    let rules_path = tmp_dir.join("rules.toml");
+    let state_path = tmp_dir.join("learner_state.json");
+    let log_dir = tmp_dir.join("logs");
+
+    let mut store =
+        RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced).unwrap();
+    store.set_log_dir(Some(log_dir.clone()));
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    // 1. 1x manual fix of unknown word `protmpcord -> promptcord`:
+    // Must stage (1/2) and NOT immediately add `promptcord` to `personal_dict`!
+    let evs1 = feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "protmpcord <CBS>promptcord ",
+    );
+    assert!(evs1.iter().any(|e| matches!(
+        e,
+        LearnEvent::StagedCorrection {
+            orig,
+            fixed,
+            count: 1,
+            ..
+        } if orig == "protmpcord" && fixed == "promptcord"
+    )));
+    assert!(
+        !engine.store().compiled().personal_dict.contains("promptcord"),
+        "1x manual fix must not promote unknown target to personal_dict yet"
+    );
+    assert!(
+        !engine.store().compiled().corrections.contains_key("protmpcord"),
+        "1x manual fix must not graduate correction yet"
+    );
+
+    // 2. 2x manual fix of `protmpcord -> promptcord`:
+    // Promotes `promptcord` to `personal_dict` AND graduates `protmpcord -> promptcord`!
+    buf.clear();
+    let evs2 = feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "protmpcord <CBS>promptcord ",
+    );
+    assert!(evs2.iter().any(|e| matches!(
+        e,
+        LearnEvent::GraduatedCorrection { orig, fixed, .. }
+            if orig == "protmpcord" && fixed == "promptcord"
+    )));
+    assert!(engine.store().compiled().personal_dict.contains("promptcord"));
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .corrections
+            .get("protmpcord")
+            .map(String::as_str),
+        Some("promptcord")
+    );
+
+    // 3. Step 5f PersonalDict candidate generation:
+    // Typing a brand-new adjacent-key typo `promptxord ` (never seen before) autocorrects to `promptcord `!
+    buf.clear();
+    feed_keys(&mut session, &mut engine, &mut buf, "promptxord ");
+    assert_eq!(buf, "promptcord ");
+
+    // 4. Guards on unknown-target promotion:
+    // Known typo `recieve` is rejected by `known_typos`
+    buf.clear();
+    let evs_typo = feed_keys(&mut session, &mut engine, &mut buf, "reciev <CBS>recieve ");
+    assert!(evs_typo.contains(&LearnEvent::Ignored(SkipReason::TargetNotValidWord)));
+    assert!(!engine.store().compiled().personal_dict.contains("recieve"));
+
+    // Key-bounce extension `zyxqwert -> zyxqwertt` is rejected
+    buf.clear();
+    let evs_bounce = feed_keys(&mut session, &mut engine, &mut buf, "zyxqwert <CBS>zyxqwertt ");
+    assert!(evs_bounce.contains(&LearnEvent::Ignored(SkipReason::TargetNotValidWord)));
+    assert!(!engine.store().compiled().personal_dict.contains("zyxqwertt"));
+
+    // 5. Automatic 2x "Un-dictionary":
+    // Suppose `promptcord` in `personal_dict` was itself a mistake and the user fixes `promptcord -> promptcard` 2x:
+    buf.clear();
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "promptcord <CBS>promptcard ",
+    );
+    // After 1x, `promptcord` is still in `personal_dict`
+    assert!(engine.store().compiled().personal_dict.contains("promptcord"));
+
+    buf.clear();
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "promptcord <CBS>promptcard ",
+    );
+    // After 2x, `promptcord` is automatically un-dictionaried and replaced by `promptcard`,
+    // and `promptcord -> promptcard` graduates to `[corrections]`!
+    assert!(
+        !engine.store().compiled().personal_dict.contains("promptcord"),
+        "2x manual fix away from a personal_dict word must un-dictionary it"
+    );
+    assert!(engine.store().compiled().personal_dict.contains("promptcard"));
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .corrections
+            .get("promptcord")
+            .map(String::as_str),
+        Some("promptcard")
+    );
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_learner_state_serde_backward_compatibility() {
+    static NEXT_COMPAT_ID: AtomicU64 = AtomicU64::new(400);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "smartkey_compat_test_{}_{}",
+        std::process::id(),
+        NEXT_COMPAT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    let rules_path = tmp_dir.join("rules.toml");
+    let state_path = tmp_dir.join("learner_state.json");
+
+    let legacy_json = r#"{
+  "version": 1,
+  "staged_corrections": {},
+  "staged_context": {},
+  "untouched_unknowns": {},
+  "trouble_words": {},
+  "skipped_edits": [],
+  "applied_counts": { "teh->the": 2 },
+  "undo_counts": {},
+  "manual_fix_counts": {},
+  "recent_events": [
+    {
+      "event": "autocorrect_applied",
+      "typed": "teh",
+      "applied": "the",
+      "kind": "known_typo_dict",
+      "total_count": 2
+    }
+  ]
+}"#;
+    fs::write(&state_path, legacy_json).unwrap();
+
+    let store =
+        RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced).unwrap();
+    assert_eq!(store.state().recent_events.len(), 1);
+    assert_eq!(store.state().applied_counts.get("teh->the"), Some(&2));
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}

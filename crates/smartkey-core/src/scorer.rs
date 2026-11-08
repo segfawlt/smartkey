@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::casing::{analyze_token, project_case, TokenAnalysis};
 use crate::keyboard::{
@@ -34,6 +34,9 @@ pub trait UserRuleView {
     fn trouble_word_boost(&self, candidate_lower: &str) -> f32 {
         let _ = candidate_lower;
         0.0
+    }
+    fn personal_words(&self) -> Option<&BTreeSet<String>> {
+        None
     }
 }
 
@@ -185,6 +188,71 @@ impl EnglishScorer {
 
     pub fn lexicon(&self) -> &EnglishLexicon {
         &self.lexicon
+    }
+
+    /// Evaluates whether a valid English word `token` committed after `prev` has a close
+    /// keyboard/transposition neighbor (`known_typos` or `d <= 1`) that context strongly prefers.
+    ///
+    /// Returns `Some((candidate_lower, candidate_bigram, typed_bigram))` when Guard 3 asymmetry
+    /// holds (`typed_bg < 0.25`, `cand_bg >= 0.50`, `cand_bg - typed_bg >= 0.35`).
+    pub fn find_real_word_context_alternative(
+        &self,
+        token: &str,
+        prev: &str,
+        config: &ScorerConfig,
+        rules: &dyn UserRuleView,
+    ) -> Option<(String, f32, f32)> {
+        let core_lower = token
+            .trim_matches(|c: char| !c.is_alphabetic() && c != '\'' && c != '’')
+            .to_lowercase();
+        let prev_lower = prev
+            .trim_matches(|c: char| !c.is_alphabetic() && c != '\'' && c != '’')
+            .to_lowercase();
+        if core_lower.chars().count() < 2 || prev_lower.is_empty() {
+            return None;
+        }
+        let typed_bg = self.lexicon.bigram_score(&prev_lower, &core_lower);
+        if typed_bg >= 0.25 {
+            return None;
+        }
+
+        let mut best: Option<(String, f32)> = None;
+        let mut consider = |cand_lower: &str| {
+            if cand_lower == core_lower
+                || cand_lower.contains(' ')
+                || rules.is_pair_blocked(&core_lower, cand_lower)
+            {
+                return;
+            }
+            if weighted_keyboard_cost(&core_lower, cand_lower) > 1.25 {
+                return;
+            }
+            let bg = self.lexicon.bigram_score(&prev_lower, cand_lower);
+            if bg >= 0.50 && (bg - typed_bg) >= 0.35 {
+                if best.as_ref().is_none_or(|(_, best_bg)| bg > *best_bg) {
+                    best = Some((cand_lower.to_string(), bg));
+                }
+            }
+        };
+
+        if let Some(targets) = self.lexicon.lookup_known_typos(&core_lower) {
+            for raw_t in targets {
+                let mapped = self.lexicon.map_dialect(raw_t, config.dialect);
+                consider(mapped);
+            }
+        }
+
+        let mut fuzzy_hits = Vec::new();
+        self.lexicon.search_fuzzy(&core_lower, 1, &mut fuzzy_hits);
+        for (w, meta) in fuzzy_hits {
+            if meta.is_offensive() || !meta.is_valid_for_dialect(config.dialect) {
+                continue;
+            }
+            let mapped = self.lexicon.map_dialect(&w, config.dialect);
+            consider(mapped);
+        }
+
+        best.map(|(cand, cand_bg)| (cand, cand_bg, typed_bg))
     }
 
     fn thresholds(aggr: Aggressiveness) -> (f32, f32) {
@@ -905,6 +973,52 @@ impl EnglishScorer {
                     MatchKind::SmashRescue,
                     Some(damped_scramble_cost),
                 );
+            }
+        }
+
+        // 5f. Personal dictionary words (`personal_dict` in `rules.toml`)
+        if char_len >= 3 && !skip_heavy_dfa {
+            if let Some(pwords) = rules.personal_words() {
+                for pword in pwords {
+                    let plen = pword.chars().count();
+                    if plen < 3 || plen.abs_diff(char_len) > 2 {
+                        continue;
+                    }
+                    let dl = damerau_levenshtein_chars(&core_lower, pword);
+                    let overlap = if core_lower.is_ascii() && pword.is_ascii() {
+                        multiset_overlap(&core_lower, pword)
+                    } else {
+                        0.0
+                    };
+                    let max_dl = if char_len >= 8 && overlap >= 0.85 {
+                        3
+                    } else if char_len >= 5 {
+                        2
+                    } else {
+                        1
+                    };
+                    if dl > max_dl {
+                        continue;
+                    }
+                    let cost = weighted_keyboard_cost(&core_lower, pword);
+                    if char_len == 3 && cost > 0.65 {
+                        continue;
+                    }
+                    if char_len == 4 && cost > 1.05 {
+                        continue;
+                    }
+                    if cost > 1.45 {
+                        continue;
+                    }
+                    push_candidate(
+                        &mut pool,
+                        pword,
+                        165,
+                        0.10,
+                        MatchKind::PersonalDict,
+                        Some(cost),
+                    );
+                }
             }
         }
 

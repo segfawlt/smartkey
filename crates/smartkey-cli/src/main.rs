@@ -419,6 +419,7 @@ fn match_kind_slug(kind: MatchKind) -> &'static str {
         MatchKind::FuzzyLexicon => "fuzzy_lexicon",
         MatchKind::SmashRescue => "smash_rescue",
         MatchKind::VietnameseTelexRescue => "vietnamese_telex_rescue",
+        MatchKind::PersonalDict => "personal_dict",
     }
 }
 
@@ -646,6 +647,39 @@ fn cmd_log(args: &[String]) -> Result<(), String> {
                 } else {
                     println!("  [{total_count}x] UNFIXED {word:?} (no valid candidates)");
                 }
+            }
+            DiagnosticEvent::RealWordDeclined {
+                prev,
+                word,
+                candidate,
+                candidate_score,
+                typed_score,
+            } => {
+                println!(
+                    "  REAL_WORD_DECLINED prev={prev:?} {word:?} (candidate: {candidate:?} score={candidate_score:.2} vs typed={typed_score:.2})"
+                );
+            }
+            DiagnosticEvent::AppBypass {
+                app,
+                profile,
+                reason,
+            } => {
+                println!("  APP_BYPASS app={app:?} profile={profile:?} reason={reason:?}");
+            }
+            DiagnosticEvent::RuleLearned {
+                rule,
+                stage,
+                previous,
+            } => {
+                println!(
+                    "  RULE_LEARNED ({stage}) {rule} (previous={previous:?})"
+                );
+            }
+            DiagnosticEvent::WordUnchanged { word, reason } => {
+                println!(
+                    "  WORD_UNCHANGED ({}) {word:?}",
+                    match_kind_slug(*reason)
+                );
             }
         }
     }
@@ -1082,10 +1116,12 @@ fn cmd_repl(args: &[String]) -> Result<(), String> {
     }
 
     let scorer = load_scorer()?;
-    let store = if in_memory {
+    let mut store = if in_memory {
         RuleStore::in_memory(Preset::Balanced)
     } else {
-        load_rule_store(&dir, Preset::Balanced)?
+        let mut s = load_rule_store(&dir, Preset::Balanced)?;
+        s.set_log_dir(Some(smartkey_core::default_state_log_dir()));
+        s
     };
 
     let rules_label = store
@@ -1093,9 +1129,11 @@ fn cmd_repl(args: &[String]) -> Result<(), String> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<in-memory>".to_string());
 
+    let _ = &mut store;
     let mut engine = SmartKeyEngine::new(Some(scorer), store);
     let mut session = SmartKeySession::new();
     session.set_lang(lang);
+    session.set_app(Some("smartkey-repl"));
     let t0 = Instant::now();
 
     println!("SmartKey Interactive REPL — Layer 1 + Layer 2 Learning Active");

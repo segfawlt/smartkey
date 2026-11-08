@@ -422,6 +422,7 @@ enum Mode {
 pub struct SmartKeySession {
     profile: AppProfile,
     lang: LangId,
+    app: Option<String>,
     mode: Mode,
     prev_word: Option<String>,
     at_sentence_start: bool,
@@ -445,6 +446,7 @@ impl SmartKeySession {
         Self {
             profile: AppProfile::Prose,
             lang: LangId::en(),
+            app: None,
             mode: Mode::Idle,
             prev_word: None,
             at_sentence_start: true,
@@ -474,6 +476,14 @@ impl SmartKeySession {
         &self.lang
     }
 
+    pub fn set_app(&mut self, app: Option<&str>) {
+        self.app = app.map(str::to_string);
+    }
+
+    pub fn app(&self) -> Option<&str> {
+        self.app.as_deref()
+    }
+
     pub fn in_markdown_code(&self) -> bool {
         self.in_markdown_code
     }
@@ -491,6 +501,8 @@ impl SmartKeySession {
     /// Flushes any confirmed untouched unknown word before resetting session state,
     /// and hot-reloads `rules.toml` / `learner_state.json` if modified externally.
     pub fn reset(&mut self, engine: &mut SmartKeyEngine) -> Vec<LearnEvent> {
+        engine.store.set_active_lang(self.lang.clone());
+        engine.store.set_current_app(self.app.as_deref());
         let mut events = Vec::new();
         self.flush_pending_unknown(engine, &mut events);
         engine.store.reload_if_modified();
@@ -576,6 +588,7 @@ impl SmartKeySession {
             return SessionOutput::passthrough();
         }
         engine.store.set_active_lang(self.lang.clone());
+        engine.store.set_current_app(self.app.as_deref());
 
         match key {
             KeyInput::NavOrClick | KeyInput::Tab => {
@@ -1380,25 +1393,66 @@ impl SmartKeySession {
                     learn_events,
                 }
             }
-            EvalOutcome::Unchanged { do_not_learn, .. } => {
+            EvalOutcome::Unchanged {
+                reason,
+                do_not_learn,
+            } => {
                 if !do_not_learn {
                     self.pending_unknown = Some((self.lang.clone(), word.clone()));
-                    let (best_candidate, best_score, threshold) = if let Some(scorer) = engine.scorer() {
-                        let explanation = scorer.explain(&word, &ctx, engine.store.scorer_config(), &engine.store);
-                        let thresh = match engine.store.scorer_config().aggressiveness {
-                            Aggressiveness::Conservative => 0.24,
-                            Aggressiveness::Balanced => 0.14,
-                            Aggressiveness::Aggressive => 0.06,
+                    let (best_candidate, best_score, threshold) =
+                        if let Some(scorer) = engine.scorer() {
+                            let explanation = scorer.explain(
+                                &word,
+                                &ctx,
+                                engine.store.scorer_config(),
+                                &engine.store,
+                            );
+                            let thresh = match engine.store.scorer_config().aggressiveness {
+                                Aggressiveness::Conservative => 0.24,
+                                Aggressiveness::Balanced => 0.14,
+                                Aggressiveness::Aggressive => 0.06,
+                            };
+                            let (cand, score) = match explanation.top_candidates.first() {
+                                Some(c) => (Some(c.replacement.clone()), c.score),
+                                None => (None, 0.0),
+                            };
+                            (cand, score, thresh)
+                        } else {
+                            (None, 0.0, 0.14)
                         };
-                        let (cand, score) = match explanation.top_candidates.first() {
-                            Some(c) => (Some(c.replacement.clone()), c.score),
-                            None => (None, 0.0),
-                        };
-                        (cand, score, thresh)
-                    } else {
-                        (None, 0.0, 0.14)
-                    };
-                    engine.store.log_unfixed_unknown(&word, best_candidate.as_deref(), best_score, threshold);
+                    engine.store.log_unfixed_unknown(
+                        &word,
+                        best_candidate.as_deref(),
+                        best_score,
+                        threshold,
+                    );
+                } else {
+                    if reason == MatchKind::ValidWord
+                        && self.lang.as_str() == "en"
+                        && engine.store.diagnostics().event_log
+                    {
+                        if let (Some(prev), Some(scorer)) =
+                            (prev_before.as_deref(), engine.scorer())
+                        {
+                            let alt = scorer.find_real_word_context_alternative(
+                                &word,
+                                prev,
+                                engine.store.scorer_config(),
+                                &engine.store,
+                            );
+                            if let Some((cand, cand_bg, typed_bg)) = alt {
+                                engine
+                                    .store
+                                    .log_real_word_declined(&word, prev, &cand, cand_bg, typed_bg);
+                            }
+                        }
+                    }
+                    if engine.store.diagnostics().event_log
+                        && engine.store.diagnostics().log_level
+                            == crate::event_log::EventLogLevel::All
+                    {
+                        engine.store.log_word_unchanged(&word, reason);
+                    }
                 }
                 self.update_context_after_commit(
                     &word,

@@ -1,4 +1,5 @@
 pub mod casing;
+pub mod event_log;
 pub mod keyboard;
 pub mod learner;
 pub mod lexicon;
@@ -8,6 +9,7 @@ pub mod store;
 pub mod types;
 pub mod vi_telex;
 
+pub use event_log::{default_state_log_dir, DiagnosticsConfig, EventLog, EventLogLevel};
 pub use learner::{LearnEvent, SkipReason};
 pub use lexicon::{
     compile_skdict_from_sources, default_user_dict_dir, resolve_dict_path, EnglishLexicon,
