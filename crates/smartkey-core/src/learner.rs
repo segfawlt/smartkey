@@ -177,8 +177,13 @@ pub fn record_undo_keep_verbatim(
     };
 
     if cnt >= 2 {
+        let word_to_save = if typed_raw.trim().chars().any(char::is_uppercase) {
+            typed_raw.trim()
+        } else {
+            &typed_lower
+        };
         if is_prose_word_token(&typed_lower) {
-            store.add_personal_word(lang, &typed_lower);
+            store.add_personal_word(lang, word_to_save);
         }
         let _ = store.flush_state();
         LearnEvent::GraduatedUndoKeep {
@@ -480,6 +485,20 @@ fn record_manual_edit_inner(
             .entry(fixed_lower.clone())
             .or_insert(0) += 1;
 
+        // Preserve target casing if explicitly non-ASCII (`"Đắk"`), mixed-case (`"PyTorch"`, `"FastAPI"`),
+        // or intentional TitleCase (`"Hyprland"` when `orig_raw` was lowercase or `target_is_novel_unknown`).
+        let fixed_trimmed = fixed_raw.trim();
+        let has_internal_upper = fixed_trimmed.chars().skip(1).any(char::is_uppercase);
+        let has_intentional_title = fixed_trimmed.chars().next().is_some_and(char::is_uppercase)
+            && (target_is_novel_unknown
+                || orig_raw.trim().chars().next().is_some_and(char::is_lowercase)
+                || lexicon.is_some_and(|l| l.lookup_word(&fixed_lower).is_some_and(|m| m.is_tech())));
+        let target_to_save = if target_has_non_ascii || has_internal_upper || has_intentional_title {
+            fixed_trimmed.to_string()
+        } else {
+            fixed_lower.clone()
+        };
+
         if target_is_novel_unknown {
             let unk_key = format!("{}:{}", effective_lang.as_str(), fixed_lower);
             let unk_cnt = {
@@ -492,7 +511,7 @@ fn record_manual_edit_inner(
                 *e
             };
             if unk_cnt >= 3 {
-                store.add_personal_word(&effective_lang, &fixed_lower);
+                store.add_personal_word(&effective_lang, &target_to_save);
             }
         }
 
@@ -512,21 +531,16 @@ fn record_manual_edit_inner(
             *e
         };
 
-        // Preserve target casing only if explicitly non-ASCII / proper (like `"Đắk"`), otherwise lowercase
-        let target_to_save = if target_has_non_ascii {
-            fixed_raw.trim().to_string()
-        } else {
-            fixed_lower.clone()
-        };
-
         if count >= 2 {
             if store.is_explicit_personal_word(&effective_lang, &orig_lower) {
                 store.remove_personal_word(&effective_lang, &orig_lower);
             }
-            if target_is_novel_unknown && !store.is_personal_word(&fixed_lower) {
+            if (target_is_novel_unknown || has_internal_upper || has_intentional_title)
+                && !store.is_personal_word(&fixed_lower)
+            {
                 store.add_personal_word_with_stage(
                     &effective_lang,
-                    &fixed_lower,
+                    &target_to_save,
                     "personal_promoted_2x",
                 );
             }
@@ -612,7 +626,8 @@ pub fn record_untouched_unknown(
     lang: &LangId,
     word_raw: &str,
 ) -> LearnEvent {
-    let lower = word_raw.trim().to_lowercase();
+    let word_trimmed = word_raw.trim();
+    let lower = word_trimmed.to_lowercase();
     let char_count = lower.chars().count();
     if char_count < 2 || !is_prose_word_token(&lower) {
         return LearnEvent::None;
@@ -625,8 +640,21 @@ pub fn record_untouched_unknown(
         return LearnEvent::None;
     }
 
-    if store.is_personal_word(&lower)
-        || (lang.as_str() == "en" && lexicon.is_some_and(|l| l.contains_any_english(&lower)))
+    let has_upper = word_trimmed.chars().any(char::is_uppercase);
+    let has_internal_upper = word_trimmed.chars().skip(1).any(char::is_uppercase);
+    let is_cased_tech_word = has_upper
+        && lexicon.is_some_and(|l| {
+            l.lookup_proper_noun(&lower).is_none()
+                && l.lookup_word(&lower).is_some_and(|m| m.is_tech())
+        });
+
+    if store.is_personal_word(&lower) {
+        return LearnEvent::None;
+    }
+    if lang.as_str() == "en"
+        && !has_internal_upper
+        && !is_cased_tech_word
+        && lexicon.is_some_and(|l| l.contains_any_english(&lower))
     {
         return LearnEvent::None;
     }
@@ -645,19 +673,24 @@ pub fn record_untouched_unknown(
         .iter()
         .any(|(k, &v)| v >= 1 && k.starts_with(&undo_prefix));
     let required_count = if has_prior_undo { 1 } else { 3 };
+    let word_to_save = if has_upper {
+        word_trimmed.to_string()
+    } else {
+        lower.clone()
+    };
 
     if count >= required_count {
-        store.add_personal_word(lang, &lower);
+        store.add_personal_word(lang, &word_to_save);
         let _ = store.flush_state();
         LearnEvent::GraduatedPersonalWord {
             lang: lang.0.clone(),
-            word: lower,
+            word: word_to_save,
         }
     } else {
         let _ = store.flush_state();
         LearnEvent::StagedUntouchedUnknown {
             lang: lang.0.clone(),
-            word: lower,
+            word: word_to_save,
             count,
         }
     }

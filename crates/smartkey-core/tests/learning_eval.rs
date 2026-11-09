@@ -1005,3 +1005,155 @@ fn test_undo_recovery_purges_bad_learned_correction_and_guard_vi_ascii_telex() {
         "raw ASCII Telex edits in vi mode must never pollute [lang.vi.corrections]"
     );
 }
+
+#[test]
+fn test_canonical_casing_learning_and_typo_repair() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    // 1. MixedCaseWord ("PyTorch", "OpenClaw") and TitleCase tech word ("Hyprland") learn canonical casing at 3x untouched
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "PyTorch, PyTorch, PyTorch.<ENTER>",
+    );
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .personal_dict_canonical
+            .get("pytorch")
+            .map(String::as_str),
+        Some("PyTorch")
+    );
+    assert!(engine.store().to_toml_string().contains("\"PyTorch\""));
+
+    buf.clear();
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "Hyprland, Hyprland; Hyprland.<ENTER>",
+    );
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .personal_dict_canonical
+            .get("hyprland")
+            .map(String::as_str),
+        Some("Hyprland")
+    );
+
+    // 2. Mid-word edit before space ("OpenClaww<BS> ") still counts toward 3x untouched graduation
+    buf.clear();
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "OpenClaww<BS> OpenClaw `code` OpenClaw <ENTER>",
+    );
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .personal_dict_canonical
+            .get("openclaw")
+            .map(String::as_str),
+        Some("OpenClaw")
+    );
+
+    // 3. Typos ("pytroch", "Pytroch", "hypland", "Hypland") and lowercase ("pytorch", "hyprland")
+    //    autocorrect to the canonical form ("PyTorch", "Hyprland") regardless of typo casing!
+    buf.clear();
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "pytroch Pytroch pytorch hypland Hypland hyprland ",
+    );
+    assert_eq!(
+        buf,
+        "PyTorch PyTorch PyTorch Hyprland Hyprland Hyprland "
+    );
+
+    // 4. CapsLock inversion ("cHAGNES") and sentence-start late-shift ("cHagnes") repair typos to "Changes"
+    buf.clear();
+    feed_keys(&mut session, &mut engine, &mut buf, "<ENTER>cHagnes cHAGNES ");
+    assert_eq!(buf, "\nChanges Changes ");
+}
+
+#[test]
+fn test_untouched_unknowns_cleanup_on_manual_fix_backspace_and_demotion() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    // 1. Immediate backspace cancels tentative unfixed_unknown counter
+    feed_keys(&mut session, &mut engine, &mut buf, "zellij <CBS>nvim ");
+    assert!(
+        !engine.store().state().untouched_unknowns.contains_key("zellij"),
+        "immediate Ctrl+BackSpace must cancel tentative untouched_unknowns entry"
+    );
+
+    // 2. Typing a typo 2x untouched and then manually fixing it clears untouched_unknowns
+    //    so a later untouched slip cannot falsely graduate at 3x
+    buf.clear();
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "zyxwvut zyxwvut zyxwvut <CBS>zyxwvuts ",
+    );
+    assert!(
+        !engine
+            .store()
+            .state()
+            .untouched_unknowns
+            .contains_key("en:zyxwvut"),
+        "manual fix must purge staged untouched_unknowns for the typo"
+    );
+    feed_keys(&mut session, &mut engine, &mut buf, "zyxwvut <ENTER>");
+    assert!(
+        !engine.store().compiled().personal_dict.contains("zyxwvut"),
+        "cleared untouched_unknowns must not graduate on a single subsequent slip"
+    );
+
+    // 3. Demoting a personal_dict word clears untouched_unknowns so 1x subsequent use does not re-promote it
+    buf.clear();
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "quxkorp quxkorp quxkorp <ENTER>",
+    );
+    assert!(engine.store().compiled().personal_dict.contains("quxkorp"));
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "quxkorp <CBS>quxcore quxkorp <CBS>quxcore ",
+    );
+    assert!(!engine.store().compiled().personal_dict.contains("quxkorp"));
+
+    // Even if user unblocks/clears correction or types it once, untouched_unknowns was reset to 0
+    assert!(
+        !engine
+            .store()
+            .state()
+            .untouched_unknowns
+            .contains_key("en:quxkorp"),
+        "remove_personal_word must clear untouched_unknowns counter"
+    );
+
+    // 4. Vietnamese toneless dictionary words ("anh", "em", "hai", "ba") do not log as untouched_unknowns
+    session.set_lang(LangId::vi());
+    buf.clear();
+    feed_keys(&mut session, &mut engine, &mut buf, "anh em hai ba <ENTER>");
+    assert!(!engine.store().state().untouched_unknowns.contains_key("anh"));
+    assert!(!engine.store().state().untouched_unknowns.contains_key("vi:anh"));
+}

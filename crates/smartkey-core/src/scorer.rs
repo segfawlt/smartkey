@@ -27,6 +27,10 @@ pub trait UserRuleView {
         let _ = lower_word;
         false
     }
+    fn lookup_personal_canonical(&self, lower_word: &str) -> Option<&str> {
+        let _ = lower_word;
+        None
+    }
     fn is_undo_shielded(&self, lower_word: &str) -> bool {
         let _ = lower_word;
         false
@@ -40,6 +44,9 @@ pub trait UserRuleView {
         0.0
     }
     fn personal_words(&self) -> Option<&BTreeSet<String>> {
+        None
+    }
+    fn lang_personal_words(&self) -> Option<&BTreeSet<String>> {
         None
     }
 }
@@ -313,49 +320,61 @@ impl EnglishScorer {
             |w| self.lexicon.contains_any_english(w) || rules.is_personal_word(w),
         );
 
-        let (leading_quotes, core, trailing_quotes, shift_slip_fixed, user_title_case) =
-            match analysis {
-                TokenAnalysis::Bypass => {
-                    return (
-                        EvalOutcome::Unchanged {
-                            reason: MatchKind::Bypass,
-                            do_not_learn: true,
-                        },
-                        Vec::new(),
-                    )
-                }
-                TokenAnalysis::LeadingApostropheValid => {
-                    return (
-                        EvalOutcome::Unchanged {
-                            reason: MatchKind::ValidWord,
-                            do_not_learn: true,
-                        },
-                        Vec::new(),
-                    )
-                }
-                TokenAnalysis::StretchedWord => {
-                    return (
-                        EvalOutcome::Unchanged {
-                            reason: MatchKind::StretchedWord,
-                            do_not_learn: true,
-                        },
-                        Vec::new(),
-                    )
-                }
-                TokenAnalysis::Evaluate {
-                    leading_quotes,
-                    core,
-                    trailing_quotes,
-                    shift_slip_fixed,
-                    user_title_case,
-                } => (
-                    leading_quotes,
-                    core,
-                    trailing_quotes,
-                    shift_slip_fixed,
-                    user_title_case,
-                ),
-            };
+        let (
+            leading_quotes,
+            core,
+            trailing_quotes,
+            shift_slip_fixed,
+            user_title_case,
+            is_mixed_case_word,
+        ) = match analysis {
+            TokenAnalysis::Bypass => {
+                return (
+                    EvalOutcome::Unchanged {
+                        reason: MatchKind::Bypass,
+                        do_not_learn: true,
+                    },
+                    Vec::new(),
+                )
+            }
+            TokenAnalysis::LeadingApostropheValid => {
+                return (
+                    EvalOutcome::Unchanged {
+                        reason: MatchKind::ValidWord,
+                        do_not_learn: true,
+                    },
+                    Vec::new(),
+                )
+            }
+            TokenAnalysis::StretchedWord => {
+                return (
+                    EvalOutcome::Unchanged {
+                        reason: MatchKind::StretchedWord,
+                        do_not_learn: true,
+                    },
+                    Vec::new(),
+                )
+            }
+            TokenAnalysis::MixedCaseWord {
+                leading_quotes,
+                core,
+                trailing_quotes,
+            } => (leading_quotes, core, trailing_quotes, false, false, true),
+            TokenAnalysis::Evaluate {
+                leading_quotes,
+                core,
+                trailing_quotes,
+                shift_slip_fixed,
+                user_title_case,
+            } => (
+                leading_quotes,
+                core,
+                trailing_quotes,
+                shift_slip_fixed,
+                user_title_case,
+                false,
+            ),
+        };
 
         let wrap = |body: &str| -> String {
             if leading_quotes.is_empty() && trailing_quotes.is_empty() {
@@ -371,11 +390,19 @@ impl EnglishScorer {
         let core_lower = core.to_lowercase();
         let prev_lower = ctx.prev_word.map(|p| p.to_lowercase());
 
+        let format_rule_target = |target: &str| -> String {
+            if target.chars().any(char::is_uppercase) {
+                wrap(target)
+            } else {
+                wrap(&project_case(target, cap_initial))
+            }
+        };
+
         // Step 1: User contextual & unigram correction rules (`rules.toml`)
         if let Some(prev) = prev_lower.as_deref() {
             if let Some(target) = rules.lookup_context_rule(prev, &core_lower) {
                 if !rules.is_pair_blocked(&core_lower, &target.to_lowercase()) {
-                    let rep = wrap(&project_case(target, cap_initial));
+                    let rep = format_rule_target(target);
                     return (
                         EvalOutcome::Autocorrect {
                             replacement: rep.clone(),
@@ -398,7 +425,7 @@ impl EnglishScorer {
 
         if let Some(target) = rules.lookup_correction(&core_lower) {
             if !rules.is_pair_blocked(&core_lower, &target.to_lowercase()) {
-                let rep = wrap(&project_case(target, cap_initial));
+                let rep = format_rule_target(target);
                 return (
                     EvalOutcome::Autocorrect {
                         replacement: rep.clone(),
@@ -470,7 +497,7 @@ impl EnglishScorer {
         }
 
         // Step 2b: Transposed apostrophes (`do'nt -> don't`, `does'nt -> doesn't`)
-        if core_lower.contains('\'') {
+        if core_lower.contains('\'') && !is_mixed_case_word {
             for &(bad, good) in TRANSPOSED_APOSTROPHES {
                 if core_lower == bad && !rules.is_pair_blocked(&core_lower, &good.to_lowercase()) {
                     let rep = wrap(&project_case(good, cap_initial));
@@ -498,16 +525,50 @@ impl EnglishScorer {
         let in_personal = rules.is_personal_word(&core_lower);
         if in_personal || rules.is_undo_shielded(&core_lower) {
             if shift_slip_fixed {
-                let rep = wrap(&core);
-                return (
-                    EvalOutcome::Autocorrect {
-                        replacement: rep,
-                        kind: MatchKind::ShiftSlip,
-                        score: 4.0,
-                        margin: 4.0,
-                    },
-                    Vec::new(),
-                );
+                let canon_or_core = rules
+                    .lookup_personal_canonical(&core_lower)
+                    .filter(|c| c.chars().any(char::is_uppercase))
+                    .unwrap_or(&core);
+                let rep = wrap(canon_or_core);
+                if rep != token {
+                    return (
+                        EvalOutcome::Autocorrect {
+                            replacement: rep,
+                            kind: MatchKind::ShiftSlip,
+                            score: 4.0,
+                            margin: 4.0,
+                        },
+                        Vec::new(),
+                    );
+                }
+            }
+            if in_personal && !rules.is_undo_shielded(&core_lower) && config.fix_proper_nouns {
+                if let Some(canon) = rules.lookup_personal_canonical(&core_lower) {
+                    if canon.chars().any(char::is_uppercase)
+                        && core != canon
+                        && !rules.is_pair_blocked(&core_lower, &canon.to_lowercase())
+                    {
+                        let rep = wrap(canon);
+                        if rep != token {
+                            return (
+                                EvalOutcome::Autocorrect {
+                                    replacement: rep.clone(),
+                                    kind: MatchKind::PersonalDict,
+                                    score: 4.5,
+                                    margin: 4.5,
+                                },
+                                vec![Candidate {
+                                    replacement: rep,
+                                    score: 4.5,
+                                    edit_cost: 0.2,
+                                    freq: 210,
+                                    bigram_boost: 0.0,
+                                    kind: MatchKind::PersonalDict,
+                                }],
+                            );
+                        }
+                    }
+                }
             }
             return (
                 EvalOutcome::Unchanged {
@@ -516,6 +577,16 @@ impl EnglishScorer {
                     // `1x` undo-shielded (`in_personal == false`), set `do_not_learn: false` so its
                     // next untouched use graduates it into `personal_dict`!
                     do_not_learn: in_personal,
+                },
+                Vec::new(),
+            );
+        }
+
+        if is_mixed_case_word {
+            return (
+                EvalOutcome::Unchanged {
+                    reason: MatchKind::ValidWord,
+                    do_not_learn: false,
                 },
                 Vec::new(),
             );
@@ -717,10 +788,18 @@ impl EnglishScorer {
                     );
                 }
             }
+            let allow_title_case_learn = user_title_case
+                && !shift_slip_fixed
+                && !in_personal
+                && self.lexicon.lookup_proper_noun(&core_lower).is_none()
+                && self
+                    .lexicon
+                    .lookup_word(&core_lower)
+                    .is_some_and(|m| m.is_tech());
             return (
                 EvalOutcome::Unchanged {
                     reason: MatchKind::ValidWord,
-                    do_not_learn: true,
+                    do_not_learn: !allow_title_case_learn,
                 },
                 Vec::new(),
             );
@@ -800,7 +879,15 @@ impl EnglishScorer {
             let score = freq_term + bg_term + bonus + anagram_bonus + trouble
                 - (length_damping * edit_cost);
 
-            let formatted = wrap(&project_case(cand_lower, cap_initial));
+            let formatted = if let Some(canon) = rules.lookup_personal_canonical(cand_lower) {
+                if canon.chars().any(char::is_uppercase) {
+                    wrap(canon)
+                } else {
+                    wrap(&project_case(cand_lower, cap_initial))
+                }
+            } else {
+                wrap(&project_case(cand_lower, cap_initial))
+            };
             match pool.get_mut(cand_lower) {
                 Some(existing) => {
                     if score > existing.score {
@@ -1014,49 +1101,52 @@ impl EnglishScorer {
             }
         }
 
-        // 5f. Personal dictionary words (`personal_dict` in `rules.toml`)
-        if char_len >= 3 && !skip_heavy_dfa {
-            if let Some(pwords) = rules.personal_words() {
-                for pword in pwords {
-                    let plen = pword.chars().count();
-                    if plen < 3 || plen.abs_diff(char_len) > 2 {
-                        continue;
-                    }
-                    let dl = damerau_levenshtein_chars(&core_lower, pword);
-                    let overlap = if core_lower.is_ascii() && pword.is_ascii() {
-                        multiset_overlap(&core_lower, pword)
-                    } else {
-                        0.0
-                    };
-                    let max_dl = if char_len >= 8 && overlap >= 0.85 {
-                        3
-                    } else if char_len >= 5 {
-                        2
-                    } else {
-                        1
-                    };
-                    if dl > max_dl {
-                        continue;
-                    }
-                    let cost = weighted_keyboard_cost(&core_lower, pword);
-                    if char_len == 3 && cost > 0.65 {
-                        continue;
-                    }
-                    if char_len == 4 && cost > 1.05 {
-                        continue;
-                    }
-                    if cost > 1.45 {
-                        continue;
-                    }
-                    push_candidate(
-                        &mut pool,
-                        pword,
-                        165,
-                        0.10,
-                        MatchKind::PersonalDict,
-                        Some(cost),
-                    );
+        // 5f. Personal dictionary words (`personal_dict` and `[lang.<id>].personal_dict` in `rules.toml`)
+        if char_len >= 3 {
+            let personal_iter = rules
+                .personal_words()
+                .into_iter()
+                .flatten()
+                .chain(rules.lang_personal_words().into_iter().flatten());
+            for pword in personal_iter {
+                let plen = pword.chars().count();
+                if plen < 3 || plen.abs_diff(char_len) > 2 {
+                    continue;
                 }
+                let dl = damerau_levenshtein_chars(&core_lower, pword);
+                let overlap = if core_lower.is_ascii() && pword.is_ascii() {
+                    multiset_overlap(&core_lower, pword)
+                } else {
+                    0.0
+                };
+                let max_dl = if char_len >= 8 && overlap >= 0.85 {
+                    3
+                } else if char_len >= 5 {
+                    2
+                } else {
+                    1
+                };
+                if dl > max_dl {
+                    continue;
+                }
+                let cost = weighted_keyboard_cost(&core_lower, pword);
+                if char_len == 3 && cost > 0.65 {
+                    continue;
+                }
+                if char_len == 4 && cost > 1.05 {
+                    continue;
+                }
+                if cost > 1.45 {
+                    continue;
+                }
+                push_candidate(
+                    &mut pool,
+                    pword,
+                    175,
+                    0.14,
+                    MatchKind::PersonalDict,
+                    Some(cost),
+                );
             }
         }
 
@@ -1069,6 +1159,7 @@ impl EnglishScorer {
         });
 
         let (t_auto, min_margin) = Self::thresholds(config.aggressiveness);
+        let mut ambiguous_high_score_tie = false;
         if let Some(top) = ranked.first() {
             let second_score = ranked.get(1).map(|c| c.score).unwrap_or(0.0);
             let margin = top.score - second_score.max(0.0);
@@ -1087,13 +1178,16 @@ impl EnglishScorer {
                 }
                 return (outcome, ranked);
             }
+            if top.score >= t_auto && !passes_margin {
+                ambiguous_high_score_tie = true;
+            }
         }
 
         ranked.truncate(5);
         (
             EvalOutcome::Unchanged {
                 reason: MatchKind::Bypass,
-                do_not_learn: false,
+                do_not_learn: ambiguous_high_score_tie,
             },
             ranked,
         )

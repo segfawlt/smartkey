@@ -242,7 +242,9 @@ pub struct CompiledRules {
     pub scorer_config: ScorerConfig,
     pub diagnostics: DiagnosticsConfig,
     pub personal_dict: BTreeSet<String>,
+    pub personal_dict_canonical: BTreeMap<String, String>,
     pub lang_personal_dict: BTreeMap<String, BTreeSet<String>>,
+    pub lang_personal_dict_canonical: BTreeMap<String, BTreeMap<String, String>>,
     pub telex_passthrough: BTreeSet<String>,
     pub blocklist: BTreeSet<(String, String)>,
     pub corrections: BTreeMap<String, String>,
@@ -705,6 +707,34 @@ impl RuleStore {
         let _ = self.flush_state();
     }
 
+    /// Reverts the tentative `log_unfixed_unknown` counter and trailing diagnostic event when the user
+    /// immediately backspaces into or deletes a just-committed unknown word.
+    pub fn cancel_pending_unfixed_unknown(&mut self, word: &str) {
+        self.sync_external_state_before_write();
+        let word_trimmed = word.trim();
+        let word_l = word_trimmed.to_lowercase();
+        if word_l.is_empty() {
+            return;
+        }
+        if let Some(cnt) = self.state.untouched_unknowns.get_mut(&word_l) {
+            if *cnt <= 1 {
+                self.state.untouched_unknowns.remove(&word_l);
+            } else {
+                *cnt -= 1;
+            }
+        }
+        if let Some(pos) = self.state.recent_events.iter().rposition(|ev| {
+            matches!(
+                ev,
+                DiagnosticEvent::UnfixedUnknown { word: w, .. }
+                    if w.eq_ignore_ascii_case(word_trimmed) || w.to_lowercase() == word_l
+            )
+        }) {
+            self.state.recent_events.remove(pos);
+        }
+        let _ = self.flush_state();
+    }
+
     pub fn log_real_word_declined(
         &mut self,
         word: &str,
@@ -846,22 +876,55 @@ impl RuleStore {
         self.compiled.personal_dict.contains(lower_word)
     }
 
-    /// Permanently adds `word_lower` to `personal_dict` (or `[lang.<id>].personal_dict` for non-English).
-    pub fn add_personal_word(&mut self, lang: &LangId, word_lower: &str) {
-        self.add_personal_word_with_stage(lang, word_lower, "personal_graduated");
+    /// Permanently adds `word` to `personal_dict` (or `[lang.<id>].personal_dict` for non-English),
+    /// preserving canonical casing (`"Hyprland"`, `"PyTorch"`, `"FastAPI"`).
+    pub fn add_personal_word(&mut self, lang: &LangId, word: &str) {
+        self.add_personal_word_with_stage(lang, word, "personal_graduated");
     }
 
-    pub fn add_personal_word_with_stage(&mut self, lang: &LangId, word_lower: &str, stage: &str) {
+    pub fn add_personal_word_with_stage(&mut self, lang: &LangId, word: &str, stage: &str) {
+        let word_trimmed = word.trim();
+        let word_lower = word_trimmed.to_lowercase();
+        if word_lower.is_empty() {
+            return;
+        }
         self.sync_external_edits_before_write();
         if lang.as_str() == "en" {
-            if !self.compiled.personal_dict.insert(word_lower.to_string()) {
+            let is_new = self.compiled.personal_dict.insert(word_lower.clone());
+            if !is_new {
+                // Upgrade canonical casing if previously lowercase and now explicitly cased
+                if word_trimmed.chars().any(char::is_uppercase)
+                    && self
+                        .compiled
+                        .personal_dict_canonical
+                        .get(&word_lower)
+                        .is_none_or(|c| c != word_trimmed)
+                {
+                    self.compiled
+                        .personal_dict_canonical
+                        .insert(word_lower.clone(), word_trimmed.to_string());
+                    if let Some(arr) = self.doc.get_mut("personal_dict").and_then(Item::as_array_mut) {
+                        for item in arr.iter_mut() {
+                            if item
+                                .as_str()
+                                .is_some_and(|s| s.to_lowercase() == word_lower)
+                            {
+                                *item = Value::from(word_trimmed);
+                            }
+                        }
+                    }
+                    let _ = self.flush_rules();
+                }
                 return;
             }
+            self.compiled
+                .personal_dict_canonical
+                .insert(word_lower.clone(), word_trimmed.to_string());
             if !self.doc.contains_key("personal_dict") {
                 self.doc["personal_dict"] = Item::Value(Value::Array(Array::new()));
             }
             if let Some(arr) = self.doc["personal_dict"].as_array_mut() {
-                arr.push(word_lower);
+                arr.push(word_trimmed);
             }
         } else {
             let set = self
@@ -869,9 +932,40 @@ impl RuleStore {
                 .lang_personal_dict
                 .entry(lang.as_str().to_string())
                 .or_default();
-            if !set.insert(word_lower.to_string()) {
+            let is_new = set.insert(word_lower.clone());
+            let canon_map = self
+                .compiled
+                .lang_personal_dict_canonical
+                .entry(lang.as_str().to_string())
+                .or_default();
+            if !is_new {
+                if word_trimmed.chars().any(char::is_uppercase)
+                    && canon_map.get(&word_lower).is_none_or(|c| c != word_trimmed)
+                {
+                    canon_map.insert(word_lower.clone(), word_trimmed.to_string());
+                    if let Some(arr) = self
+                        .doc
+                        .get_mut("lang")
+                        .and_then(Item::as_table_mut)
+                        .and_then(|t| t.get_mut(lang.as_str()))
+                        .and_then(Item::as_table_mut)
+                        .and_then(|t| t.get_mut("personal_dict"))
+                        .and_then(Item::as_array_mut)
+                    {
+                        for item in arr.iter_mut() {
+                            if item
+                                .as_str()
+                                .is_some_and(|s| s.to_lowercase() == word_lower)
+                            {
+                                *item = Value::from(word_trimmed);
+                            }
+                        }
+                    }
+                    let _ = self.flush_rules();
+                }
                 return;
             }
+            canon_map.insert(word_lower.clone(), word_trimmed.to_string());
             let lang_root = self
                 .doc
                 .entry("lang")
@@ -887,42 +981,58 @@ impl RuleStore {
                 sub["personal_dict"] = Item::Value(Value::Array(Array::new()));
             }
             if let Some(arr) = sub["personal_dict"].as_array_mut() {
-                arr.push(word_lower);
+                arr.push(word_trimmed);
             }
         }
         let _ = self.flush_rules();
-        self.log_rule_learned(&format!("personal_dict:{word_lower}"), stage, None);
+        self.log_rule_learned(&format!("personal_dict:{word_trimmed}"), stage, None);
     }
 
-    /// Clears any `1x` undo-keep shield for `word_lower` when the user manually edits `word_lower`
-    /// into a different word.
+    /// Clears any staged `untouched_unknowns` counters for `word_lower` (both raw and lang-prefixed).
+    pub fn clear_untouched_unknown(&mut self, lang: &LangId, word_lower: &str) {
+        self.state.untouched_unknowns.remove(word_lower);
+        let key = format!("{}:{word_lower}", lang.as_str());
+        self.state.untouched_unknowns.remove(&key);
+    }
+
+    /// Clears any `1x` undo-keep shield and untouched-unknown staging for `word_lower` when the user
+    /// manually edits `word_lower` into a different word.
     pub fn clear_undo_shield(&mut self, lang: &LangId, word_lower: &str) {
         self.session_shielded_words.remove(word_lower);
         let prefix = format!("{}:{word_lower}->", lang.as_str());
         self.state
             .staged_undo_keep
             .retain(|k, _| !k.starts_with(&prefix));
+        self.clear_untouched_unknown(lang, word_lower);
     }
 
     /// Removes `word_lower` from `personal_dict` (used when a user repeatedly corrects or rejects
     /// a mistaken `personal_dict` entry — automatic "un-dictionary").
     pub fn remove_personal_word(&mut self, lang: &LangId, word_lower: &str) -> bool {
         self.sync_external_edits_before_write();
-        self.clear_undo_shield(lang, word_lower);
+        let word_l = word_lower.trim().to_lowercase();
+        self.clear_undo_shield(lang, &word_l);
         let removed = if lang.as_str() == "en" {
-            let did_remove = self.compiled.personal_dict.remove(word_lower);
+            self.compiled.personal_dict_canonical.remove(&word_l);
+            let did_remove = self.compiled.personal_dict.remove(&word_l);
             if did_remove {
                 if let Some(arr) = self.doc.get_mut("personal_dict").and_then(Item::as_array_mut) {
-                    arr.retain(|v| !v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(word_lower)));
+                    arr.retain(|v| {
+                        !v.as_str()
+                            .is_some_and(|s| s.eq_ignore_ascii_case(&word_l) || s.to_lowercase() == word_l)
+                    });
                 }
             }
             did_remove
         } else {
+            if let Some(m) = self.compiled.lang_personal_dict_canonical.get_mut(lang.as_str()) {
+                m.remove(&word_l);
+            }
             let did_remove = self
                 .compiled
                 .lang_personal_dict
                 .get_mut(lang.as_str())
-                .is_some_and(|s| s.remove(word_lower));
+                .is_some_and(|s| s.remove(&word_l));
             if did_remove {
                 if let Some(arr) = self
                     .doc
@@ -933,17 +1043,21 @@ impl RuleStore {
                     .and_then(|t| t.get_mut("personal_dict"))
                     .and_then(Item::as_array_mut)
                 {
-                    arr.retain(|v| !v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(word_lower)));
+                    arr.retain(|v| {
+                        !v.as_str()
+                            .is_some_and(|s| s.eq_ignore_ascii_case(&word_l) || s.to_lowercase() == word_l)
+                    });
                 }
             }
             did_remove
         };
         if removed {
             let _ = self.flush_rules();
+            let _ = self.flush_state();
             self.log_rule_learned(
-                &format!("personal_dict:{word_lower}"),
+                &format!("personal_dict:{word_l}"),
                 "personal_demoted_2x",
-                Some(word_lower.to_string()),
+                Some(word_l),
             );
         }
         removed
@@ -1161,7 +1275,12 @@ impl RuleStore {
         if let Some(arr) = doc.get("personal_dict").and_then(Item::as_array) {
             for val in arr {
                 if let Some(s) = val.as_str() {
-                    out.personal_dict.insert(s.to_lowercase());
+                    let trimmed = s.trim();
+                    let lower = trimmed.to_lowercase();
+                    if !lower.is_empty() {
+                        out.personal_dict.insert(lower.clone());
+                        out.personal_dict_canonical.insert(lower, trimmed.to_string());
+                    }
                 }
             }
         }
@@ -1222,9 +1341,18 @@ impl RuleStore {
                             .lang_personal_dict
                             .entry(lang_key.to_string())
                             .or_default();
+                        let canon_map = out
+                            .lang_personal_dict_canonical
+                            .entry(lang_key.to_string())
+                            .or_default();
                         for val in arr {
                             if let Some(s) = val.as_str() {
-                                set.insert(s.to_lowercase());
+                                let trimmed = s.trim();
+                                let lower = trimmed.to_lowercase();
+                                if !lower.is_empty() {
+                                    set.insert(lower.clone());
+                                    canon_map.insert(lower, trimmed.to_string());
+                                }
                             }
                         }
                     }
@@ -1291,6 +1419,24 @@ impl UserRuleView for RuleStore {
         self.compiled.personal_dict.contains(lower_word)
     }
 
+    fn lookup_personal_canonical(&self, lower_word: &str) -> Option<&str> {
+        let lang = self.active_lang.as_str();
+        if lang != "en" {
+            if let Some(c) = self
+                .compiled
+                .lang_personal_dict_canonical
+                .get(lang)
+                .and_then(|m| m.get(lower_word))
+            {
+                return Some(c.as_str());
+            }
+        }
+        self.compiled
+            .personal_dict_canonical
+            .get(lower_word)
+            .map(String::as_str)
+    }
+
     fn is_undo_shielded(&self, lower_word: &str) -> bool {
         if self.session_shielded_words.contains(lower_word) {
             return true;
@@ -1316,5 +1462,14 @@ impl UserRuleView for RuleStore {
 
     fn personal_words(&self) -> Option<&BTreeSet<String>> {
         Some(&self.compiled.personal_dict)
+    }
+
+    fn lang_personal_words(&self) -> Option<&BTreeSet<String>> {
+        let lang = self.active_lang.as_str();
+        if lang != "en" {
+            self.compiled.lang_personal_dict.get(lang)
+        } else {
+            None
+        }
     }
 }

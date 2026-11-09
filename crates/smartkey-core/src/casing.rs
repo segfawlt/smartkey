@@ -61,6 +61,10 @@ pub const CASING_EXCLUSIONS: &[&str] = &[
     "SQLite",
     "PyTorch",
     "TensorFlow",
+    "mMap",
+    "iNode",
+    "vTable",
+    "oAuth",
 ];
 
 /// Two-letter `xY` units/notations excluded from 2-char Caps Lock inversion (`iS -> Is`).
@@ -120,12 +124,19 @@ pub fn is_abbreviation(word: &str) -> bool {
 /// Result of pre-processing a raw token for outer quotes, bypass guards, and Shift/CapsLock slips.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenAnalysis {
-    /// Code, URL, number, acronym, or `camelCase` identifier: skip completely (`do_not_learn = true`).
+    /// Code, URL, number, acronym, or short unit notation: skip completely (`do_not_learn = true`).
     Bypass,
     /// Valid colloquial leading-apostrophe token (`'90s`, `'em`, `'cause`).
     LeadingApostropheValid,
     /// Expressive trailing character stretch (`soooo`, `trờiiii`): keep verbatim, do not learn.
     StretchedWord,
+    /// Intentional mixed-case word (`PyTorch`, `FastAPI`, `OpenClaw`): keep untouched unless matched
+    /// by an explicit user rule, and allow `3x` untouched graduation into `personal_dict`.
+    MixedCaseWord {
+        leading_quotes: String,
+        core: String,
+        trailing_quotes: String,
+    },
     /// Prose candidate ready for Layer 1 evaluation.
     Evaluate {
         leading_quotes: String,
@@ -279,6 +290,19 @@ pub fn analyze_token(
     }
 
     if CASING_EXCLUSIONS.contains(&inner) {
+        let alpha_count = inner.chars().filter(|c| c.is_alphabetic()).count();
+        if alpha_count >= 4
+            && !matches!(
+                inner,
+                "mRNA" | "tRNA" | "rRNA" | "dsRNA" | "ssRNA" | "cDNA"
+            )
+        {
+            return TokenAnalysis::MixedCaseWord {
+                leading_quotes: leading_q.to_string(),
+                core: inner.to_string(),
+                trailing_quotes: trailing_q.to_string(),
+            };
+        }
         return TokenAnalysis::Bypass;
     }
 
@@ -350,6 +374,13 @@ pub fn analyze_token(
     }
 
     if !fix_shift_slips {
+        if semicolon_count == 0 && alpha_len >= 4 {
+            return TokenAnalysis::MixedCaseWord {
+                leading_quotes: leading_q.to_string(),
+                core: inner.to_string(),
+                trailing_quotes: trailing_q.to_string(),
+            };
+        }
         return TokenAnalysis::Bypass;
     }
 
@@ -410,7 +441,7 @@ pub fn analyze_token(
         }
     }
 
-    // Case 5: Accidental Caps Lock Inversion (`tHIS -> This`, `hELLO -> Hello`, `iS -> Is`):
+    // Case 5: Accidental Caps Lock Inversion (`tHIS -> This`, `hELLO -> Hello`, `iS -> Is`, `cHAGNES -> Changes`):
     // 1st alphabetic char is lowercase, all remaining alphabetic chars (`>= 1`) are uppercase.
     if alpha_len >= 2
         && inner_chars[0].is_alphabetic()
@@ -419,7 +450,7 @@ pub fn analyze_token(
         && !(alpha_len == 2 && TWO_CHAR_CAPSLOCK_EXCLUSIONS.contains(&inner))
     {
         let lower_check = inner.to_lowercase();
-        if is_valid_word(&lower_check) {
+        if alpha_len >= 4 || is_valid_word(&lower_check) {
             let mut title = String::with_capacity(inner.len());
             for c in inner_chars[0].to_uppercase() {
                 title.push(c);
@@ -439,7 +470,7 @@ pub fn analyze_token(
         }
     }
 
-    // Case 6: Sentence-Start Late-Shift (`tHis -> This`, `tHe -> The`, `wHat -> What`):
+    // Case 6: Sentence-Start Late-Shift (`tHis -> This`, `tHe -> The`, `wHat -> What`, `cHagnes -> Changes`):
     // Strictly gated to `at_sentence_start == true` so mid-sentence `mMap`, `iNode`, `vTable`, `oAuth` stay untouched!
     if at_sentence_start
         && alpha_len >= 3
@@ -451,7 +482,7 @@ pub fn analyze_token(
         && alpha_chars[2..].iter().all(|c| c.is_lowercase())
     {
         let lower_check = inner.to_lowercase();
-        if is_valid_word(&lower_check) {
+        if alpha_len >= 4 || is_valid_word(&lower_check) {
             let mut title = String::with_capacity(inner.len());
             for c in inner_chars[0].to_uppercase() {
                 title.push(c);
@@ -472,7 +503,15 @@ pub fn analyze_token(
         }
     }
 
-    // Any other mixed-case token (`useState`, `smartKey`, `mMap`, `apPle`) is treated as an identifier -> Bypass!
+    // Any other mixed-case token (`useState`, `smartKey`, `OpenClaw`) is kept untouched as a MixedCaseWord
+    // if `alpha_len >= 4` so repeated use (`3x`) can graduate it into `personal_dict`.
+    if semicolon_count == 0 && alpha_len >= 4 {
+        return TokenAnalysis::MixedCaseWord {
+            leading_quotes: leading_q.to_string(),
+            core: inner.to_string(),
+            trailing_quotes: trailing_q.to_string(),
+        };
+    }
     TokenAnalysis::Bypass
 }
 

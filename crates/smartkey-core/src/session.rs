@@ -237,7 +237,9 @@ impl SmartKeyEngine {
             }
             return EvalOutcome::Unchanged {
                 reason: MatchKind::ValidWord,
-                do_not_learn: sim.is_composed_vietnamese
+                do_not_learn: sim.is_valid_vietnamese
+                    || sim.is_composed_vietnamese
+                    || crate::vi_telex::is_vietnamese_dict_word(&lower)
                     || crate::vi_telex::is_vietnamese_slang_word(&lower)
                     || self.store.is_personal_word(&lower),
             };
@@ -746,12 +748,46 @@ impl SmartKeySession {
                         &orig_word,
                         &buf,
                     );
+                    let check_unknown = matches!(
+                        ev,
+                        LearnEvent::Ignored(
+                            crate::learner::SkipReason::TargetNotValidWord
+                                | crate::learner::SkipReason::SameWord
+                        )
+                    );
                     if !matches!(ev, LearnEvent::None) {
                         events.push(ev);
                     }
+                    if check_unknown && !self.in_markdown_code {
+                        let ctx = EvalContext {
+                            prev_word: prev_word_before.as_deref(),
+                            boundary_punct: None,
+                            at_sentence_start: self.at_sentence_start,
+                            suppress_sentence_cap: self.suppress_sentence_cap,
+                            in_markdown_code: self.in_markdown_code,
+                            profile: self.profile,
+                        };
+                        if let EvalOutcome::Unchanged {
+                            do_not_learn: false,
+                            ..
+                        } = engine.evaluate_token(&buf, &ctx)
+                        {
+                            self.flush_pending_unknown(engine, events);
+                            self.pending_unknown = Some((self.lang.clone(), buf));
+                        }
+                    }
                 }
             }
-            Mode::Composing {
+            Mode::PendingTrailingDot {
+                word: buf,
+                peak_before_bs,
+                ..
+            }
+            | Mode::PendingSemicolon {
+                word: buf,
+                peak_before_bs,
+            }
+            | Mode::Composing {
                 buf,
                 peak_before_bs,
                 ..
@@ -766,8 +802,33 @@ impl SmartKeySession {
                             &peak,
                             &buf,
                         );
+                        let check_unknown = matches!(
+                            ev,
+                            LearnEvent::Ignored(
+                                crate::learner::SkipReason::TargetNotValidWord
+                                    | crate::learner::SkipReason::SameWord
+                            )
+                        );
                         if !matches!(ev, LearnEvent::None) {
                             events.push(ev);
+                        }
+                        if check_unknown && !self.in_markdown_code {
+                            let ctx = EvalContext {
+                                prev_word: self.prev_word.as_deref(),
+                                boundary_punct: None,
+                                at_sentence_start: self.at_sentence_start,
+                                suppress_sentence_cap: self.suppress_sentence_cap,
+                                in_markdown_code: self.in_markdown_code,
+                                profile: self.profile,
+                            };
+                            if let EvalOutcome::Unchanged {
+                                do_not_learn: false,
+                                ..
+                            } = engine.evaluate_token(&buf, &ctx)
+                            {
+                                self.flush_pending_unknown(engine, events);
+                                self.pending_unknown = Some((self.lang.clone(), buf));
+                            }
                         }
                     }
                 } else if !buf.is_empty() && !self.in_markdown_code {
@@ -784,6 +845,7 @@ impl SmartKeySession {
                         ..
                     } = engine.evaluate_token(&buf, &ctx)
                     {
+                        self.flush_pending_unknown(engine, events);
                         self.pending_unknown = Some((self.lang.clone(), buf));
                     }
                 }
@@ -796,6 +858,9 @@ impl SmartKeySession {
         let mode = std::mem::replace(&mut self.mode, Mode::Idle);
         match mode {
             Mode::Idle => {
+                if let Some((_, pending_w)) = self.pending_unknown.take() {
+                    engine.store.cancel_pending_unfixed_unknown(&pending_w);
+                }
                 self.prev_word = None;
                 SessionOutput::passthrough()
             }
@@ -871,7 +936,9 @@ impl SmartKeySession {
                 trailing_spaces,
             } => {
                 // Cancel untouched-unknown staging since user immediately backspaced into this word!
-                self.pending_unknown = None;
+                if let Some((_, pending_w)) = self.pending_unknown.take() {
+                    engine.store.cancel_pending_unfixed_unknown(&pending_w);
+                }
                 if trailing_spaces > 1 {
                     self.mode = Mode::AfterWord {
                         word,
@@ -961,7 +1028,9 @@ impl SmartKeySession {
                 prev_word_before,
                 ..
             } => {
-                self.pending_unknown = None;
+                if let Some((_, pending_w)) = self.pending_unknown.take() {
+                    engine.store.cancel_pending_unfixed_unknown(&pending_w);
+                }
                 self.prev_word = prev_word_before.clone();
                 self.mode = Mode::EditingPrevious {
                     orig_word: word,
@@ -1022,6 +1091,9 @@ impl SmartKeySession {
             }
             _ => {
                 // Deleting past index 0 into previous word -> reset cleanly to Idle
+                if let Some((_, pending_w)) = self.pending_unknown.take() {
+                    engine.store.cancel_pending_unfixed_unknown(&pending_w);
+                }
                 self.prev_word = None;
             }
         }
@@ -1031,9 +1103,12 @@ impl SmartKeySession {
     fn handle_char(&mut self, engine: &mut SmartKeyEngine, ch: char, now_ms: u64) -> SessionOutput {
         // Backtick toggles inline Markdown code immunity (`` `code` ``)
         if ch == '`' {
+            let mut learn_events = Vec::new();
+            self.commit_active_without_autocorrect(engine, &mut learn_events);
+            self.flush_pending_unknown(engine, &mut learn_events);
             self.mode = Mode::Idle;
             self.in_markdown_code = !self.in_markdown_code;
-            return SessionOutput::passthrough();
+            return SessionOutput::with_events(learn_events);
         }
 
         let mut learn_events = Vec::new();
@@ -1168,6 +1243,8 @@ impl SmartKeySession {
                 if Self::is_immediate_boundary(ch)
                     || (!buf.is_empty() && matches!(ch, '.' | ':' | ';'))
                 {
+                    let is_space = ch == ' ' || ch == '\t';
+                    let punct = if is_space { None } else { Some(ch) };
                     if !buf.is_empty() {
                         let lex = engine.scorer.as_ref().map(|s| s.lexicon());
                         let ev = record_manual_edit(
@@ -1178,12 +1255,35 @@ impl SmartKeySession {
                             &orig_word,
                             &buf,
                         );
+                        let check_unknown = matches!(
+                            ev,
+                            LearnEvent::Ignored(
+                                crate::learner::SkipReason::TargetNotValidWord
+                                    | crate::learner::SkipReason::SameWord
+                            )
+                        );
                         if !matches!(ev, LearnEvent::None) {
                             learn_events.push(ev);
                         }
+                        if check_unknown && !self.in_markdown_code {
+                            let ctx = EvalContext {
+                                prev_word: prev_word_before.as_deref(),
+                                boundary_punct: punct,
+                                at_sentence_start: self.at_sentence_start,
+                                suppress_sentence_cap: self.suppress_sentence_cap,
+                                in_markdown_code: self.in_markdown_code,
+                                profile: self.profile,
+                            };
+                            if let EvalOutcome::Unchanged {
+                                do_not_learn: false,
+                                ..
+                            } = engine.evaluate_token(&buf, &ctx)
+                            {
+                                self.flush_pending_unknown(engine, &mut learn_events);
+                                self.pending_unknown = Some((self.lang.clone(), buf.clone()));
+                            }
+                        }
                     }
-                    let is_space = ch == ' ' || ch == '\t';
-                    let punct = if is_space { None } else { Some(ch) };
                     self.update_context_after_commit(&buf, punct, is_space);
                     if is_space && !buf.is_empty() {
                         self.mode = Mode::AfterWord {
@@ -1309,6 +1409,9 @@ impl SmartKeySession {
             return SessionOutput::with_events(learn_events);
         }
 
+        // User began typing a new word without backspacing any prior punctuation-terminated unknown word
+        self.flush_pending_unknown(engine, &mut learn_events);
+
         let mut buf = String::with_capacity(8);
         buf.push(ch);
         self.mode = Mode::Composing {
@@ -1331,6 +1434,7 @@ impl SmartKeySession {
         now_ms: u64,
         mut learn_events: Vec<LearnEvent>,
     ) -> SessionOutput {
+        self.flush_pending_unknown(engine, &mut learn_events);
         let is_trigger_space = trigger_ch == ' ' || trigger_ch == '\t';
         let effective_punct = prior_punct.or(if is_trigger_space {
             None
@@ -1343,7 +1447,7 @@ impl SmartKeySession {
         // The user ALREADY manually edited this word mid-flight; learn from `(peak -> word)` and
         // do not overwrite their fresh manual edit with statistical guesses!
         if let Some(peak) = peak_before_bs {
-            if self.lang.as_str() != "vi" {
+            let check_unknown = if self.lang.as_str() != "vi" {
                 let lex = engine.scorer.as_ref().map(|s| s.lexicon());
                 let ev = record_manual_edit(
                     &mut engine.store,
@@ -1353,8 +1457,35 @@ impl SmartKeySession {
                     &peak,
                     &word,
                 );
+                let is_unk = matches!(
+                    ev,
+                    LearnEvent::Ignored(
+                        crate::learner::SkipReason::TargetNotValidWord
+                            | crate::learner::SkipReason::SameWord
+                    )
+                );
                 if !matches!(ev, LearnEvent::None) {
                     learn_events.push(ev);
+                }
+                is_unk
+            } else {
+                true
+            };
+            if check_unknown && !self.in_markdown_code {
+                let ctx = EvalContext {
+                    prev_word: prev_before.as_deref(),
+                    boundary_punct: effective_punct,
+                    at_sentence_start: self.at_sentence_start,
+                    suppress_sentence_cap: self.suppress_sentence_cap,
+                    in_markdown_code: self.in_markdown_code,
+                    profile: self.profile,
+                };
+                if let EvalOutcome::Unchanged {
+                    do_not_learn: false,
+                    ..
+                } = engine.evaluate_token(&word, &ctx)
+                {
+                    self.pending_unknown = Some((self.lang.clone(), word.clone()));
                 }
             }
             self.update_context_after_commit(
