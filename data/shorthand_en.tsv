@@ -1,0 +1,73 @@
+# SmartKey English Shorthand Auto-Expansions (shorthand_en.tsv) — v1.1 frequency trim
+# Format: trigger<TAB>expansion  — one entry per line, UTF-8, LF line endings.
+# Lines starting with '#' are comments. Parsing rule: first TAB splits columns.
+# Curation: trigger is never a standalone English word (Rule 1) and has ONE
+# unambiguous expansion covering >90% of everyday typing (Rule 2).
+# v1.1: trimmed to high-frequency triggers only. Low-frequency/variant triggers
+# live in shorthand_en_extended.tsv (opt-in); intentional dev shorthands
+# (perf, wrt) moved to slang_en.txt.
+# Casing policy: expansions use lowercase except "I" and proper nouns;
+# ALL-CAPS input never auto-expands (protects BC, GM, JW, FAQ...).
+
+# --- Group A: conversational single-word shortenings ---
+pls	please
+plz	please
+thx	thanks
+sry	sorry
+ppl	people
+msg	message
+bday	birthday
+tmr	tomorrow
+tmrw	tomorrow
+bc	because
+smth	something
+
+# --- Group B: multi-word conversational initialisms ---
+# status, availability & replies
+rn	right now
+brb	be right back
+omw	on my way
+otw	on the way
+ttyl	talk to you later
+nvm	never mind
+dw	don't worry
+nbd	no big deal
+yw	you're welcome
+wbu	what about you
+hbu	how about you
+# opinions & framing
+tbh	to be honest
+tbf	to be fair
+imo	in my opinion
+imho	in my humble opinion
+ngl	not gonna lie
+ikr	I know, right
+istg	I swear to God
+jw	just wondering
+jic	just in case
+ofc	of course
+fwiw	for what it's worth
+# knowledge, questions & comprehension
+idk	I don't know
+idc	I don't care
+afaik	as far as I know
+iirc	if I recall correctly
+iiuc	if I understand correctly
+wdym	what do you mean
+wdyt	what do you think
+wyd	what are you doing
+lmk	let me know
+# gratitude & affection
+tysm	thank you so much
+ily	I love you
+imy	I miss you
+hbd	happy birthday
+gm	good morning
+gn	good night
+# meta, forum & handoff
+btw	by the way
+fyi	for your information
+icymi	in case you missed it
+hth	hope this helps
+iykyk	if you know, you know
+tmi	too much information

@@ -150,8 +150,9 @@ fn is_prose_word_token(s: &str) -> bool {
 }
 
 /// Row 2: `Undo + Keep Verbatim` (`"hok " -> "hot " -> BS -> Space`).
-/// - `1x`: Immediately shields `typed_lower` in-session so try #2 today will NOT autocorrect it.
-/// - `2x`: Permanently writes `(typed, rejected)` to `blocklist` AND `typed` to `personal_dict` in `rules.toml`.
+/// - `1x`: Immediately blocks `(typed, rejected)` in `blocklist` on disk AND shields `typed_lower` in-session
+///   so the user never has to backspace the same unwanted replacement twice.
+/// - `2x`: Permanently promotes `typed` to `personal_dict` in `rules.toml`.
 pub fn record_undo_keep_verbatim(
     store: &mut RuleStore,
     lang: &LangId,
@@ -166,6 +167,7 @@ pub fn record_undo_keep_verbatim(
 
     store.add_session_word_shield(&typed_lower);
     store.add_session_pair_block(&typed_lower, &rejected_lower);
+    store.add_permanent_block(&typed_lower, &rejected_lower);
 
     let key = format!("{}:{}->{}", lang.as_str(), typed_lower, rejected_lower);
     let cnt = {
@@ -175,7 +177,6 @@ pub fn record_undo_keep_verbatim(
     };
 
     if cnt >= 2 {
-        store.add_permanent_block(&typed_lower, &rejected_lower);
         if is_prose_word_token(&typed_lower) {
             store.add_personal_word(lang, &typed_lower);
         }
@@ -331,6 +332,11 @@ fn record_manual_edit_inner(
     let target_has_non_ascii = fixed_chars
         .iter()
         .any(|c| !c.is_ascii() && c.is_alphabetic());
+    // In `fcitx5-lotus` (`lang == "vi"`), `PreInputMethod` only observes raw ASCII Telex keys (`"nhir" -> "nhi"`,
+    // `"maf" -> "ma"`, `"quas" -> "qua"`). Never learn pure-ASCII Telex key edits as `[lang.vi.corrections]`.
+    if lang.as_str() == "vi" && !target_has_non_ascii {
+        return LearnEvent::None;
+    }
     let effective_lang = if target_has_non_ascii && lang.as_str() == "en" {
         LangId("vi".to_string())
     } else {
@@ -463,6 +469,10 @@ fn record_manual_edit_inner(
         && lexicon.is_some_and(|l| l.contains_any_english(&orig_lower));
 
     if !orig_in_lexicon {
+        // If `orig_lower` previously had a `1x` undo-keep shield (e.g. an accidental `1x` undo on `"forn"`),
+        // manually fixing `orig_lower -> fixed_lower` immediately clears that undo shield.
+        store.clear_undo_shield(&effective_lang, &orig_lower);
+
         // Track `trouble_words` prior so future similar smashes near `fixed_lower` get a tie-break boost
         *store
             .state_mut()
@@ -628,7 +638,15 @@ pub fn record_untouched_unknown(
         *e
     };
 
-    if count >= 3 {
+    let undo_prefix = format!("{}:{}->", lang.as_str(), lower);
+    let has_prior_undo = store
+        .state()
+        .staged_undo_keep
+        .iter()
+        .any(|(k, &v)| v >= 1 && k.starts_with(&undo_prefix));
+    let required_count = if has_prior_undo { 1 } else { 3 };
+
+    if count >= required_count {
         store.add_personal_word(lang, &lower);
         let _ = store.flush_state();
         LearnEvent::GraduatedPersonalWord {

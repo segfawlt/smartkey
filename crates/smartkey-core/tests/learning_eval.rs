@@ -178,7 +178,8 @@ fn six_row_matrix_and_guards_behave_exact_to_spec() {
             "clearing input to write a different word must not poison blocklist"
         );
 
-        // 4. Row 2: Undo + Keep Verbatim (`1x` shields in session ONLY, NOT permanent on disk yet)
+        // 4. Row 2: Undo + Keep Verbatim (`1x` immediately blocks the pair on disk so the user
+        //    never has to backspace a 2nd time, while `personal_dict` waits for a 2nd confirmation)
         buf.clear();
         let evs = feed_keys(&mut session, &mut engine, &mut buf, "alot <BS> ");
         assert_eq!(buf, "alot ");
@@ -186,12 +187,13 @@ fn six_row_matrix_and_guards_behave_exact_to_spec() {
             word: "alot".to_string()
         }));
         assert!(
-            engine.store().compiled().personal_dict.is_empty(),
-            "1x undo+keep must NOT permanently write personal_dict yet"
+            engine.store().is_pair_blocked("alot", "a lot"),
+            "1x undo+keep must immediately block (alot, a lot) in blocklist on disk"
         );
-        // Shielded for rest of Session 1:
-        feed_keys(&mut session, &mut engine, &mut buf, "alot ");
-        assert_eq!(buf, "alot alot ");
+        assert!(
+            engine.store().compiled().personal_dict.is_empty(),
+            "1x undo+keep must NOT permanently write personal_dict on the first occurrence"
+        );
 
         // 5. Guard 2: Standalone valid-word edit (`form -> from`) must NEVER learn unigram!
         buf.clear();
@@ -251,24 +253,25 @@ fn six_row_matrix_and_guards_behave_exact_to_spec() {
         );
         assert!(!engine.store().compiled().corrections.contains_key("dak"));
 
-        // 9. Active `lang = "vi"` scopes `3x` untouched slang (`khum`) to `[lang.vi]`, NOT English!
+        // 9. Active `lang = "vi"` scopes `3x` untouched custom words (`vinuni`) to `[lang.vi]`, NOT English!
+        //    Built-in Vietnamese slang (`khum`) is already shielded out-of-the-box.
         session.set_lang(LangId("vi".to_string()));
         feed_keys(
             &mut session,
             &mut engine,
             &mut buf,
-            "khum mot khum hai khum ba <ENTER>",
+            "vinuni mot vinuni hai vinuni ba <ENTER>",
         );
         assert!(engine
             .store()
             .compiled()
             .lang_personal_dict
             .get("vi")
-            .is_some_and(|s| s.contains("khum")));
-        assert!(!engine.store().compiled().personal_dict.contains("khum"));
+            .is_some_and(|s| s.contains("vinuni")));
+        assert!(!engine.store().compiled().personal_dict.contains("vinuni"));
     }
 
-    // --- Session 2 (Reload from disk: verifies `2x` Undo+Keep permanent graduation & comment preservation) ---
+    // --- Session 2 (Reload from disk: verifies `1x` pair-block persistence & 2nd-use `personal_dict` graduation) ---
     {
         let store =
             RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
@@ -277,16 +280,18 @@ fn six_row_matrix_and_guards_behave_exact_to_spec() {
         let mut session = SmartKeySession::new();
         let mut buf = String::new();
 
-        // In Session 2, `alot` was only 1x Undo+Keep in Session 1, so it autocorrects once more:
-        // Undoing + keeping a 2nd time graduates `alot` permanently to `blocklist` + `personal_dict`!
-        let evs = feed_keys(&mut session, &mut engine, &mut buf, "alot <BS> ");
-        assert_eq!(buf, "alot ");
-        assert!(evs.contains(&LearnEvent::GraduatedUndoKeep {
-            typed: "alot".to_string(),
-            rejected: "a lot".to_string(),
+        // In Session 2, `("alot", "a lot")` is ALREADY blocked from the `1x` Undo+Keep in Session 1!
+        assert!(engine.store().is_pair_blocked("alot", "a lot"));
+        assert!(!engine.store().compiled().personal_dict.contains("alot"));
+
+        // Typing `alot ` a 2nd time stays `alot ` without needing another Backspace, and graduates `alot` to `personal_dict`!
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "alot <ENTER>");
+        assert_eq!(buf, "alot \n");
+        assert!(evs.contains(&LearnEvent::GraduatedPersonalWord {
+            lang: "en".to_string(),
+            word: "alot".to_string(),
         }));
         assert!(engine.store().compiled().personal_dict.contains("alot"));
-        assert!(engine.store().is_pair_blocked("alot", "a lot"));
     }
 
     // Verify custom comments survived all automatic TOML graduations!
@@ -585,15 +590,21 @@ fn test_proper_noun_capitalization_and_undo() {
 }
 
 #[test]
-fn test_slang_shielding_ofc() {
+fn test_slang_shielding_and_shorthand_expansion() {
     let store = RuleStore::in_memory(Preset::Balanced);
     let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
     let mut session = SmartKeySession::new();
     let mut buf = String::new();
 
-    // "ofc " must NOT become "of "
-    feed_keys(&mut session, &mut engine, &mut buf, "ofc ");
-    assert_eq!(buf, "ofc ");
+    // Pure slang & clipped words (`onl`, `obv`, `notif`, `bruh`) must stay verbatim:
+    feed_keys(&mut session, &mut engine, &mut buf, "onl obv notif bruh ");
+    assert_eq!(buf, "onl obv notif bruh ");
+
+    // Shorthand triggers (`ofc`, `rn`) auto-expand, and `1x BackSpace` reverts the entire phrase
+    // and blocks that pair permanently so the next `rn ` stays `rn `:
+    buf.clear();
+    feed_keys(&mut session, &mut engine, &mut buf, "ofc rn <BS> rn ");
+    assert_eq!(buf, "of course rn rn ");
 }
 
 #[test]
@@ -946,4 +957,51 @@ fn test_learner_state_serde_backward_compatibility() {
     assert_eq!(store.state().applied_counts.get("teh->the"), Some(&2));
 
     let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_undo_recovery_purges_bad_learned_correction_and_guard_vi_ascii_telex() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    // 1. Seed a bad learned rule `fomr -> forn` in `[corrections]`:
+    engine
+        .store_mut()
+        .add_correction(&LangId::en(), "fomr", "forn");
+    assert_eq!(
+        engine.store().compiled().corrections.get("fomr").map(String::as_str),
+        Some("forn")
+    );
+
+    // Next time `fomr ` autocorrects to `forn `, user presses `<BS>` and edits to `form `:
+    // `add_permanent_block("fomr", "forn")` immediately deletes the bad `"fomr" = "forn"` rule!
+    feed_keys(&mut session, &mut engine, &mut buf, "fomr <BS><BS><BS>rm ");
+    assert_eq!(buf, "form ");
+    assert!(
+        !engine.store().compiled().corrections.contains_key("fomr"),
+        "1x undo+edit must immediately purge bad learned [corrections] rule"
+    );
+    assert!(engine.store().is_pair_blocked("fomr", "forn"));
+
+    // 2. In `lang = "vi"`, raw ASCII Telex tone-strip edits (`nhir -> nhi`, `maf -> ma`, `quas -> qua`)
+    //    must NEVER be learned into `[lang.vi.corrections]`:
+    session.set_lang(LangId::vi());
+    buf.clear();
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "nhir <CBS>nhi nhir <CBS>nhi maf <CBS>ma maf <CBS>ma ",
+    );
+    assert!(
+        engine
+            .store()
+            .compiled()
+            .lang_corrections
+            .get("vi")
+            .is_none_or(|m| m.is_empty()),
+        "raw ASCII Telex edits in vi mode must never pollute [lang.vi.corrections]"
+    );
 }

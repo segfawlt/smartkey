@@ -27,6 +27,10 @@ pub trait UserRuleView {
         let _ = lower_word;
         false
     }
+    fn is_undo_shielded(&self, lower_word: &str) -> bool {
+        let _ = lower_word;
+        false
+    }
     fn is_pair_blocked(&self, typed_lower: &str, candidate_lower: &str) -> bool {
         let _ = (typed_lower, candidate_lower);
         false
@@ -490,8 +494,9 @@ impl EnglishScorer {
             }
         }
 
-        // Step 3: Personal dictionary / session shield check BEFORE contractions so user shields win!
-        if rules.is_personal_word(&core_lower) {
+        // Step 3: Personal dictionary / undo shield check BEFORE contractions so user shields win!
+        let in_personal = rules.is_personal_word(&core_lower);
+        if in_personal || rules.is_undo_shielded(&core_lower) {
             if shift_slip_fixed {
                 let rep = wrap(&core);
                 return (
@@ -507,7 +512,10 @@ impl EnglishScorer {
             return (
                 EvalOutcome::Unchanged {
                     reason: MatchKind::ValidWord,
-                    do_not_learn: true,
+                    // If `in_personal` is already true, no need to stage it again; if it is only
+                    // `1x` undo-shielded (`in_personal == false`), set `do_not_learn: false` so its
+                    // next untouched use graduates it into `personal_dict`!
+                    do_not_learn: in_personal,
                 },
                 Vec::new(),
             );
@@ -585,6 +593,36 @@ impl EnglishScorer {
                             kind: MatchKind::UnmergedCompound,
                         }],
                     );
+                }
+            }
+        }
+
+        // Step 3c: Built-in Shorthand Auto-Expansion (`pls -> please`, `rn -> right now`, `idk -> I don't know`)
+        if config.expand_shorthand && !shift_slip_fixed {
+            if let Some(expanded) = crate::lexicon::lookup_english_shorthand(&core_lower) {
+                let exp_lower = expanded.to_lowercase();
+                if !rules.is_pair_blocked(&core_lower, &exp_lower) {
+                    let projected =
+                        crate::vi_telex::project_shorthand_case(&core, expanded, cap_initial);
+                    let rep = wrap(&projected);
+                    if rep != token {
+                        return (
+                            EvalOutcome::Autocorrect {
+                                replacement: rep.clone(),
+                                kind: MatchKind::ShorthandExpansion,
+                                score: 4.4,
+                                margin: 4.4,
+                            },
+                            vec![Candidate {
+                                replacement: rep,
+                                score: 4.4,
+                                edit_cost: 0.2,
+                                freq: 215,
+                                bigram_boost: 0.0,
+                                kind: MatchKind::ShorthandExpansion,
+                            }],
+                        );
+                    }
                 }
             }
         }

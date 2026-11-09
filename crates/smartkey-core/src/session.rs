@@ -175,9 +175,58 @@ impl SmartKeyEngine {
         let lower = token.to_lowercase();
         let sim = crate::vi_telex::simulate_lotus_word(token);
 
+        // 1b. Built-in Vietnamese Shorthand Auto-Expansion (`ko -> không`, `dc -> được`, `ntn -> như thế nào`)
+        //     Enabled when `expand_shorthand = true` (default). `1x BackSpace` reverts the entire expanded
+        //     phrase back to the raw shorthand trigger (`is_snippet = true` when expansion contains spaces).
+        if self.store.scorer_config().expand_shorthand {
+            let char_len = token.chars().count();
+            let is_all_caps_acronym =
+                char_len >= 2 && token.chars().all(|c| !c.is_alphabetic() || c.is_uppercase());
+            // For 1-char Vietnamese shorthand (`j -> gì`, `k -> không`, `h -> giờ`, `r -> rồi`, `uh / u -> ừ`),
+            // skip uppercase single letters mid-sentence (`J`, `S`, `H`) so middle initials are untouched.
+            let is_single_upper_initial = char_len == 1
+                && token.chars().next().is_some_and(char::is_uppercase)
+                && !ctx.at_sentence_start;
+
+            if !is_all_caps_acronym && !is_single_upper_initial {
+                let committed_lower = sim.committed_at_break.to_lowercase();
+                let exp = crate::vi_telex::lookup_vietnamese_shorthand(&lower).or_else(|| {
+                    if committed_lower != lower {
+                        crate::vi_telex::lookup_vietnamese_shorthand(&committed_lower)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(expansion) = exp {
+                    let exp_lower = expansion.to_lowercase();
+                    if !self.store.is_pair_blocked(&lower, &exp_lower)
+                        && !self.store.is_pair_blocked(&committed_lower, &exp_lower)
+                    {
+                        let cap_initial = ctx.at_sentence_start
+                            && !ctx.suppress_sentence_cap
+                            && self.store.scorer_config().auto_capitalize_sentence;
+                        return EvalOutcome::Autocorrect {
+                            replacement: crate::vi_telex::project_shorthand_case(
+                                token,
+                                expansion,
+                                cap_initial,
+                            ),
+                            kind: MatchKind::ShorthandExpansion,
+                            score: 9.4,
+                            margin: 9.4,
+                        };
+                    }
+                }
+            }
+        }
+
         // 2. If Lotus composed this into Vietnamese, or if it is a valid Vietnamese syllable
-        //    (including toneless Vietnamese words like `anh`, `em`, `nha`, `con`, `cho`):
-        if sim.is_valid_vietnamese || crate::vi_telex::is_vietnamese_dict_word(&lower) {
+        //    (including toneless Vietnamese words like `anh`, `em`, `nha`, `con`, `cho`) or
+        //    conversational Vietnamese slang (`ib`, `rep`, `onl`, `uk`, `uhm`, `okela`, `bt`, `nc`):
+        if sim.is_valid_vietnamese
+            || crate::vi_telex::is_vietnamese_dict_word(&lower)
+            || crate::vi_telex::is_vietnamese_slang_word(&lower)
+        {
             if sim.is_composed_vietnamese && self.is_telex_passthrough(token) {
                 return EvalOutcome::Autocorrect {
                     replacement: token.to_string(),
@@ -188,7 +237,9 @@ impl SmartKeyEngine {
             }
             return EvalOutcome::Unchanged {
                 reason: MatchKind::ValidWord,
-                do_not_learn: sim.is_composed_vietnamese || self.store.is_personal_word(&lower),
+                do_not_learn: sim.is_composed_vietnamese
+                    || crate::vi_telex::is_vietnamese_slang_word(&lower)
+                    || self.store.is_personal_word(&lower),
             };
         }
 
@@ -272,7 +323,7 @@ impl SmartKeyEngine {
             let mut top_candidates = Vec::new();
             if let EvalOutcome::Autocorrect {
                 ref replacement,
-                kind: MatchKind::VietnameseTelexRescue,
+                kind: kind @ (MatchKind::VietnameseTelexRescue | MatchKind::ShorthandExpansion),
                 score,
                 ..
             } = outcome
@@ -283,7 +334,7 @@ impl SmartKeyEngine {
                     edit_cost: 1.0,
                     freq: 250,
                     bigram_boost: 0.0,
-                    kind: MatchKind::VietnameseTelexRescue,
+                    kind,
                 });
             }
             if let Some(scorer) = &self.scorer {
@@ -504,6 +555,16 @@ impl SmartKeySession {
         engine.store.set_active_lang(self.lang.clone());
         engine.store.set_current_app(self.app.as_deref());
         let mut events = Vec::new();
+        if let Mode::EditingRestored {
+            ref raw_typed,
+            ref buf,
+            ..
+        } = self.mode
+        {
+            if buf.eq_ignore_ascii_case(raw_typed) {
+                self.commit_active_without_autocorrect(engine, &mut events);
+            }
+        }
         self.flush_pending_unknown(engine, &mut events);
         engine.store.reload_if_modified();
         self.reset_state_only();
@@ -593,6 +654,16 @@ impl SmartKeySession {
         match key {
             KeyInput::NavOrClick | KeyInput::Tab => {
                 let mut events = Vec::new();
+                if let Mode::EditingRestored {
+                    ref raw_typed,
+                    ref buf,
+                    ..
+                } = self.mode
+                {
+                    if buf.eq_ignore_ascii_case(raw_typed) {
+                        self.commit_active_without_autocorrect(engine, &mut events);
+                    }
+                }
                 self.flush_pending_unknown(engine, &mut events);
                 self.mode = Mode::Idle;
                 self.prev_word = None;
@@ -1317,7 +1388,10 @@ impl SmartKeySession {
             }
             // If Lotus already composed a valid Vietnamese word with Vietnamese runes (e.g. `"tiếng"`),
             // leave it untouched unless the raw ASCII token is in `telex_passthrough`.
-            if sim.is_composed_vietnamese && !engine.is_telex_passthrough(&word) {
+            if sim.is_valid_vietnamese
+                && sim.is_composed_vietnamese
+                && !engine.is_telex_passthrough(&word)
+            {
                 self.update_context_after_commit(
                     &sim.committed_at_break,
                     effective_punct,

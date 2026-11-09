@@ -97,3 +97,21 @@ too	mcu	-	much
 -	conitnuing	-	continuing
 -	ahve	-	have
 -	implementintion	-	implementation
+
+# 9. Built-in Shorthand Auto-Expansions (expand_shorthand = true)
+-	pls	-	please
+-	plz	-	please
+-	thx	-	thanks
+-	tysm	-	thank you so much
+-	ofc	-	of course
+-	btw	-	by the way
+-	tbh	-	to be honest
+-	ngl	-	not gonna lie
+-	idk	-	I don't know
+-	ikr	-	I know, right
+-	imo	-	in my opinion
+-	rn	-	right now
+-	wdym	-	what do you mean
+-	ttyl	-	talk to you later
+-	istg	-	I swear to God
+-	tbf	-	to be fair

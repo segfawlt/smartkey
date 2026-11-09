@@ -87,6 +87,12 @@ pub struct ScorerConfig {
     pub fix_proper_nouns: bool,
     pub enable_contractions: bool,
     pub enable_missed_space_split: bool,
+    #[serde(default = "default_true")]
+    pub expand_shorthand: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ScorerConfig {
@@ -100,6 +106,7 @@ impl Default for ScorerConfig {
             fix_proper_nouns: true,
             enable_contractions: true,
             enable_missed_space_split: true,
+            expand_shorthand: true,
         }
     }
 }
@@ -112,6 +119,7 @@ pub enum MatchKind {
     ValidWord,
     StretchedWord,
     UserSnippet,
+    ShorthandExpansion,
     UserContextRule,
     UserCorrectionRule,
     ShiftSlip,

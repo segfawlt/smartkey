@@ -61,6 +61,7 @@ fix_shift_slips = true          # THat's -> That's, situatioN: -> situation:, tH
 fix_proper_nouns = {fix_proper}         # english -> English, monday -> Monday
 enable_contractions = true
 enable_missed_space_split = {split_spaces}
+expand_shorthand = true         # pls -> please, rn -> right now, ko -> không, dc -> được
 
 # Modular language & input-method bridge plugins (`smartkey plugin list|enable|disable|toggle`).
 [plugins]
@@ -773,23 +774,62 @@ impl RuleStore {
         self.flush_state()
     }
 
-    /// Permanently adds `(typed, rejected)` to `blocklist` in `rules.toml` (comment-preserving).
+    /// Permanently adds `(typed, rejected)` to `blocklist` in `rules.toml` (comment-preserving),
+    /// and removes any learned `[corrections]` entry that mapped `typed_lower -> rejected_lower`.
     pub fn add_permanent_block(&mut self, typed_lower: &str, rejected_lower: &str) {
         self.sync_external_edits_before_write();
+        let mut modified = false;
+
+        if self
+            .compiled
+            .corrections
+            .get(typed_lower)
+            .is_some_and(|t| t.eq_ignore_ascii_case(rejected_lower) || t.to_lowercase() == rejected_lower)
+        {
+            self.compiled.corrections.remove(typed_lower);
+            if let Some(tbl) = self.doc.get_mut("corrections").and_then(Item::as_table_mut) {
+                tbl.remove(typed_lower);
+            }
+            modified = true;
+        }
+
+        for (lang_key, map) in &mut self.compiled.lang_corrections {
+            if map
+                .get(typed_lower)
+                .is_some_and(|t| t.to_lowercase() == rejected_lower)
+            {
+                map.remove(typed_lower);
+                if let Some(corr_tbl) = self
+                    .doc
+                    .get_mut("lang")
+                    .and_then(Item::as_table_mut)
+                    .and_then(|t| t.get_mut(lang_key.as_str()))
+                    .and_then(Item::as_table_mut)
+                    .and_then(|t| t.get_mut("corrections"))
+                    .and_then(Item::as_table_mut)
+                {
+                    corr_tbl.remove(typed_lower);
+                }
+                modified = true;
+            }
+        }
+
         let pair = (typed_lower.to_string(), rejected_lower.to_string());
-        if !self.compiled.blocklist.insert(pair) {
-            return;
+        if self.compiled.blocklist.insert(pair) {
+            if !self.doc.contains_key("blocklist") {
+                self.doc["blocklist"] = Item::Value(Value::Array(Array::new()));
+            }
+            if let Some(arr) = self.doc["blocklist"].as_array_mut() {
+                let mut tbl = InlineTable::new();
+                tbl.insert("typed", Value::from(typed_lower));
+                tbl.insert("rejected", Value::from(rejected_lower));
+                arr.push_formatted(Value::InlineTable(tbl));
+            }
+            modified = true;
         }
-        if !self.doc.contains_key("blocklist") {
-            self.doc["blocklist"] = Item::Value(Value::Array(Array::new()));
+        if modified {
+            let _ = self.flush_rules();
         }
-        if let Some(arr) = self.doc["blocklist"].as_array_mut() {
-            let mut tbl = InlineTable::new();
-            tbl.insert("typed", Value::from(typed_lower));
-            tbl.insert("rejected", Value::from(rejected_lower));
-            arr.push_formatted(Value::InlineTable(tbl));
-        }
-        let _ = self.flush_rules();
     }
 
     /// Returns true if `lower_word` is explicitly stored in `personal_dict` (excluding session shields).
@@ -854,11 +894,21 @@ impl RuleStore {
         self.log_rule_learned(&format!("personal_dict:{word_lower}"), stage, None);
     }
 
+    /// Clears any `1x` undo-keep shield for `word_lower` when the user manually edits `word_lower`
+    /// into a different word.
+    pub fn clear_undo_shield(&mut self, lang: &LangId, word_lower: &str) {
+        self.session_shielded_words.remove(word_lower);
+        let prefix = format!("{}:{word_lower}->", lang.as_str());
+        self.state
+            .staged_undo_keep
+            .retain(|k, _| !k.starts_with(&prefix));
+    }
+
     /// Removes `word_lower` from `personal_dict` (used when a user repeatedly corrects or rejects
     /// a mistaken `personal_dict` entry — automatic "un-dictionary").
     pub fn remove_personal_word(&mut self, lang: &LangId, word_lower: &str) -> bool {
         self.sync_external_edits_before_write();
-        self.session_shielded_words.remove(word_lower);
+        self.clear_undo_shield(lang, word_lower);
         let removed = if lang.as_str() == "en" {
             let did_remove = self.compiled.personal_dict.remove(word_lower);
             if did_remove {
@@ -1080,6 +1130,9 @@ impl RuleStore {
             {
                 out.scorer_config.enable_missed_space_split = b;
             }
+            if let Some(b) = settings.get("expand_shorthand").and_then(Item::as_bool) {
+                out.scorer_config.expand_shorthand = b;
+            }
         }
 
         if let Some(diag) = doc.get("diagnostics").and_then(Item::as_table) {
@@ -1225,9 +1278,6 @@ impl UserRuleView for RuleStore {
     }
 
     fn is_personal_word(&self, lower_word: &str) -> bool {
-        if self.session_shielded_words.contains(lower_word) {
-            return true;
-        }
         let lang = self.active_lang.as_str();
         if lang != "en"
             && self
@@ -1239,6 +1289,17 @@ impl UserRuleView for RuleStore {
             return true;
         }
         self.compiled.personal_dict.contains(lower_word)
+    }
+
+    fn is_undo_shielded(&self, lower_word: &str) -> bool {
+        if self.session_shielded_words.contains(lower_word) {
+            return true;
+        }
+        let prefix = format!("{}:{lower_word}->", self.active_lang.as_str());
+        self.state
+            .staged_undo_keep
+            .keys()
+            .any(|k| k.starts_with(&prefix))
     }
 
     fn is_pair_blocked(&self, typed_lower: &str, candidate_lower: &str) -> bool {

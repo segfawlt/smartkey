@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use smartkey_core::{
     apply_key_to_buffer, EvalContext, EvalOutcome, KeyInput, LangId, MatchKind, Preset, RuleStore,
-    SessionAction, SmartKeyEngine, SmartKeySession,
+    SessionAction, SmartKeyEngine, SmartKeySession, UserRuleView,
 };
 
 fn make_vi_engine_and_session() -> (SmartKeyEngine, SmartKeySession) {
@@ -216,4 +216,38 @@ fn test_vi_lotus_backspace_undo_and_modular_plugin_toggle() {
             margin: 9.2,
         }
     );
+}
+
+#[test]
+fn test_vi_lotus_shorthand_expansion_and_slang_shielding() {
+    let (mut engine, mut session) = make_vi_engine_and_session();
+
+    // 1. Vietnamese shorthand auto-expansions (`ko -> không`, `dc -> được`, `ntn -> như thế nào`, `mn -> mọi người`):
+    let (buf, _) = type_sequence(&mut session, &mut engine, "ko dc ntn mn ");
+    assert_eq!(buf, "không được như thế nào mọi người ");
+
+    // 2. `1x BackSpace` immediately after multi-word Vietnamese shorthand expansion (`ntn -> như thế nào`)
+    //    deletes the entire expanded phrase `"như thế nào "` and restores `"ntn"`, and Space blocks the pair!
+    let (mut buf2, _) = type_sequence(&mut session, &mut engine, "ntn ");
+    assert_eq!(buf2, "như thế nào ");
+    let bs_out = session.process_key(&mut engine, KeyInput::BackSpace, 5_000);
+    apply_key_to_buffer(&mut buf2, KeyInput::BackSpace, &bs_out.action);
+    assert_eq!(buf2, "ntn");
+    let sp_out = session.process_key(&mut engine, KeyInput::Char(' '), 5_050);
+    apply_key_to_buffer(&mut buf2, KeyInput::Char(' '), &sp_out.action);
+    assert_eq!(buf2, "ntn ");
+    assert!(engine.store().is_pair_blocked("ntn", "như thế nào"));
+
+    // Next time `ntn ` is typed, it stays `"ntn "`!
+    let (buf3, _) = type_sequence(&mut session, &mut engine, "ntn ");
+    assert_eq!(buf3, "ntn ");
+
+    // 3. Vietnamese slang & clipped words (`ib`, `rep`, `onl`, `uk`, `uhm`, `bt`, `nc`, `khum`)
+    //    are shielded 100% and never corrupted into English or other Vietnamese words:
+    let (buf4, _) = type_sequence(
+        &mut session,
+        &mut engine,
+        "ib rep onl uk uhm bt nc khum okela ",
+    );
+    assert_eq!(buf4, "ib rep onl uk uhm bt nc khum okela ");
 }

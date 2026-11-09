@@ -1,6 +1,8 @@
 use std::sync::OnceLock;
 
 const RAW_VI_DICT: &str = include_str!("../../../data/vietnamese.cm.dict");
+const RAW_VI_SLANG: &str = include_str!("../../../data/slang_vi.txt");
+const RAW_VI_SHORTHAND: &str = include_str!("../../../data/shorthand_vi.tsv");
 
 const VOWELS: [char; 72] = [
     'a', 'à', 'á', 'ả', 'ã', 'ạ', // 0..6
@@ -78,6 +80,93 @@ pub fn is_vietnamese_dict_word(word_lower: &str) -> bool {
         return false;
     }
     vi_dict().binary_search(&word_lower).is_ok()
+}
+
+fn vi_slang_set() -> &'static Vec<&'static str> {
+    static SLANG: OnceLock<Vec<&'static str>> = OnceLock::new();
+    SLANG.get_or_init(|| {
+        let mut words: Vec<&'static str> = RAW_VI_SLANG
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with('#'))
+            .collect();
+        for &(trig, _) in vi_shorthand_map() {
+            words.push(trig);
+        }
+        words.sort_unstable();
+        words.dedup();
+        words
+    })
+}
+
+fn vi_shorthand_map() -> &'static Vec<(&'static str, &'static str)> {
+    static MAP: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut pairs: Vec<(&'static str, &'static str)> = RAW_VI_SHORTHAND
+            .lines()
+            .filter_map(|line| {
+                let s = line.trim();
+                if s.is_empty() || s.starts_with('#') {
+                    return None;
+                }
+                let mut cols = s.split('\t');
+                let trig = cols.next()?.trim();
+                let exp = cols.next()?.trim();
+                if trig.is_empty() || exp.is_empty() {
+                    return None;
+                }
+                Some((trig, exp))
+            })
+            .collect();
+        pairs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        pairs.dedup_by(|a, b| a.0 == b.0);
+        pairs
+    })
+}
+
+/// Checks whether `word_lower` is in the Vietnamese slang/loanword shield (`slang_vi.txt` or `shorthand_vi.tsv`).
+/// Note: Kept completely separate from `vietnamese.cm.dict` so `simulate_lotus_word` remains 1:1 with `fcitx5-lotus`.
+pub fn is_vietnamese_slang_word(word_lower: &str) -> bool {
+    if word_lower.is_empty() {
+        return false;
+    }
+    vi_slang_set().binary_search(&word_lower).is_ok()
+}
+
+/// Looks up a curated unambiguous Vietnamese shorthand auto-expansion (`ko -> không`, `dc -> được`).
+pub fn lookup_vietnamese_shorthand(word_lower: &str) -> Option<&'static str> {
+    if word_lower.is_empty() {
+        return None;
+    }
+    let map = vi_shorthand_map();
+    map.binary_search_by(|(k, _)| (*k).cmp(word_lower))
+        .ok()
+        .map(|idx| map[idx].1)
+}
+
+/// Projects user/sentence capitalization onto a canonical shorthand expansion (`Ko -> Không`, `Pls -> Please`,
+/// `idk -> I don't know`, `vn -> Việt Nam`) without lowercasing proper nouns inside the expansion.
+pub fn project_shorthand_case(
+    raw_typed: &str,
+    canonical_expansion: &str,
+    force_cap_initial: bool,
+) -> String {
+    let mut typed_chars = raw_typed.chars().filter(|c| c.is_alphabetic());
+    let first_alpha = typed_chars.next();
+    let cap_first = force_cap_initial || first_alpha.is_some_and(|c| c.is_uppercase());
+    if !cap_first {
+        return canonical_expansion.to_string();
+    }
+    let mut exp_chars = canonical_expansion.chars();
+    let Some(first) = exp_chars.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(canonical_expansion.len() + 4);
+    for uc in first.to_uppercase() {
+        out.push(uc);
+    }
+    out.extend(exp_chars);
+    out
 }
 
 /// Checks whether `word_lower` is a word or prefix of any word in `vietnamese.cm.dict`

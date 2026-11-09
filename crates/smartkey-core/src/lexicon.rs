@@ -1,12 +1,51 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::OnceLock;
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA, SINK_STATE};
 
 use crate::keyboard::ascii_letter_mask;
 use crate::types::Dialect;
+
+const RAW_EN_SHORTHAND: &str = include_str!("../../../data/shorthand_en.tsv");
+
+fn en_shorthand_map() -> &'static Vec<(&'static str, &'static str)> {
+    static MAP: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut pairs: Vec<(&'static str, &'static str)> = RAW_EN_SHORTHAND
+            .lines()
+            .filter_map(|line| {
+                let s = line.trim();
+                if s.is_empty() || s.starts_with('#') {
+                    return None;
+                }
+                let mut cols = s.split('\t');
+                let trig = cols.next()?.trim();
+                let exp = cols.next()?.trim();
+                if trig.is_empty() || exp.is_empty() {
+                    return None;
+                }
+                Some((trig, exp))
+            })
+            .collect();
+        pairs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        pairs.dedup_by(|a, b| a.0 == b.0);
+        pairs
+    })
+}
+
+/// Looks up a curated unambiguous English shorthand auto-expansion (`pls -> please`, `rn -> right now`).
+pub fn lookup_english_shorthand(lower_word: &str) -> Option<&'static str> {
+    if lower_word.is_empty() {
+        return None;
+    }
+    let map = en_shorthand_map();
+    map.binary_search_by(|(k, _)| (*k).cmp(lower_word))
+        .ok()
+        .map(|idx| map[idx].1)
+}
 
 pub const MAGIC_V1: &[u8; 8] = b"SKDICT01";
 pub const MAGIC_V2: &[u8; 8] = b"SKDICT02";
@@ -676,7 +715,8 @@ pub fn compile_skdict_from_sources(
         entry.gb_freq = entry.gb_freq.max(172);
     }
 
-    // Merge curated internet abbreviations & slang shield (`slang.txt`)
+    // Merge curated internet abbreviations & slang shield (`slang.txt`) as shield-only
+    // (leaving `us_freq`/`gb_freq` untouched so pure slang is never proposed as a fuzzy target).
     for line in slang_terms.lines() {
         let w = line.trim();
         if w.is_empty() || w.starts_with('#') {
@@ -685,8 +725,14 @@ pub fn compile_skdict_from_sources(
         let lower = w.to_lowercase();
         let entry = words.entry(lower).or_default();
         entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_TECH | FLAG_IN_US | FLAG_IN_GB;
-        entry.us_freq = entry.us_freq.max(185);
-        entry.gb_freq = entry.gb_freq.max(185);
+    }
+
+    // Also shield all English shorthand triggers (`shorthand_en.tsv`) so that if `expand_shorthand = false`
+    // or a shorthand pair is in `blocklist`, the trigger remains shielded as a valid word.
+    for &(trig, _) in en_shorthand_map() {
+        let lower = trig.to_lowercase();
+        let entry = words.entry(lower).or_default();
+        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_TECH | FLAG_IN_US | FLAG_IN_GB;
     }
 
     // Parse curated unambiguous proper nouns (`proper_nouns.tsv`)

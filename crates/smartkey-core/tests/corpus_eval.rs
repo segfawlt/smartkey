@@ -149,3 +149,41 @@ fn dialect_modes_mixed_us_and_gb_work() {
         other => panic!("expected beahviour -> behaviour in EnGb, got {other:?}"),
     }
 }
+
+#[test]
+fn shorthand_toggle_and_slang_zero_fuzzy_pollution() {
+    let scorer = EnglishScorer::new_bundled().expect("bundled English lexicon must load");
+    let ctx = EvalContext::default();
+
+    // When `expand_shorthand = false`, shorthand triggers are still shielded as valid tokens
+    // and never corrupted into unrelated dictionary words:
+    let no_shorthand = ScorerConfig {
+        expand_shorthand: false,
+        ..ScorerConfig::default()
+    };
+    for tok in [
+        "pls", "plz", "rn", "idk", "ikr", "ofc", "btw", "tbh", "ngl", "thx", "wdym", "ttyl",
+    ] {
+        assert!(
+            matches!(
+                scorer.evaluate(tok, &ctx, &no_shorthand, &EmptyUserRules),
+                EvalOutcome::Unchanged { .. }
+            ),
+            "expected {tok:?} to remain unchanged when expand_shorthand = false"
+        );
+    }
+
+    // Pure slang & clipped words (`onl`, `obv`, `notif`, `bruh`) must have `freq == 0` in the FST
+    // so they are shielded verbatim when typed, yet NEVER proposed as fuzzy candidates for typos:
+    for slang in ["onl", "offl", "obv", "notif", "collab", "priv"] {
+        let meta = scorer
+            .lexicon()
+            .lookup_word(slang)
+            .unwrap_or_else(|| panic!("{slang:?} must be in lexicon"));
+        assert!(meta.is_valid_for_dialect(Dialect::Mixed));
+        assert_eq!(
+            meta.us_freq, 0,
+            "pure slang {slang:?} must have us_freq == 0 so it never pollutes fuzzy search"
+        );
+    }
+}

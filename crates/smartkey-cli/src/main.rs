@@ -419,6 +419,7 @@ fn match_kind_slug(kind: MatchKind) -> &'static str {
         MatchKind::FuzzyLexicon => "fuzzy_lexicon",
         MatchKind::SmashRescue => "smash_rescue",
         MatchKind::VietnameseTelexRescue => "vietnamese_telex_rescue",
+        MatchKind::ShorthandExpansion => "shorthand_expansion",
         MatchKind::PersonalDict => "personal_dict",
     }
 }
