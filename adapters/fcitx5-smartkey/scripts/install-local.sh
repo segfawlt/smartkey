@@ -13,7 +13,7 @@ DICT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/smartkey/dicts"
 mkdir -p "${BIN_DIR}" "${DICT_DIR}"
 
 echo "Building smartkey CLI..."
-cargo build --release --manifest-path "${ROOT_DIR}/Cargo.toml" -p smartkey-cli --bin smartkey
+cargo build --release --locked --manifest-path "${ROOT_DIR}/Cargo.toml" -p smartkey-cli --bin smartkey
 install -m 755 "${ROOT_DIR}/target/release/smartkey" "${BIN_DIR}/smartkey"
 ln -sf smartkey "${BIN_DIR}/smartkeyctl"
 install -m 644 "${ROOT_DIR}/crates/smartkey-core/assets/en_lexicon.skdict" "${DICT_DIR}/en.skdict"
@@ -30,7 +30,8 @@ fi
 cmake -S "${ADAPTER_DIR}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${HOME}/.local" \
-    -DCMAKE_INSTALL_LIBDIR=lib
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DSMARTKEY_CARGO_FLAGS="--locked"
 
 cmake --build "${BUILD_DIR}" -j"$(nproc)"
 cmake --install "${BUILD_DIR}"
@@ -48,3 +49,7 @@ if command -v busctl >/dev/null 2>&1 && command -v fcitx5-remote >/dev/null 2>&1
 else
     echo "Restart Fcitx5 in your desktop session to activate: fcitx5 -r -d"
 fi
+
+echo ""
+"${BIN_DIR}/smartkey" --version
+echo "Source: $(git -C "${ROOT_DIR}" describe --always --tags --dirty 2>/dev/null || echo 'no git checkout')"

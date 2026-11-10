@@ -6,7 +6,7 @@ pkgdesc="Privacy-first on-device PC English autocorrect and backspace learner fo
 arch=('x86_64' 'aarch64')
 url="https://github.com/segfawlt/smartkey"
 license=('GPL-3.0-or-later')
-depends=('fcitx5' 'gcc-libs' 'glibc')
+depends=('fcitx5>=5.0.20' 'gcc-libs' 'glibc' 'curl')
 makedepends=('cargo' 'cmake')
 options=('!debug' '!lto')
 source=("$pkgname-$pkgver.tar.gz")
@@ -28,12 +28,17 @@ build() {
     cmake -B build -S adapters/fcitx5-smartkey \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr \
-        -DFCITX_INSTALL_USE_FCITX_SYS_PATHS=ON
+        -DFCITX_INSTALL_USE_FCITX_SYS_PATHS=ON \
+        -DSMARTKEY_CARGO_FLAGS="--frozen"
     cmake --build build -j"$(nproc)"
 }
 
 check() {
     cd "$pkgname-$pkgver"
+    export PATH="$HOME/.cargo/bin:$PATH"
+    export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable}
+    export CARGO_TARGET_DIR=target
+    cargo test --frozen --workspace
     ctest --test-dir build --output-on-failure
 }
 

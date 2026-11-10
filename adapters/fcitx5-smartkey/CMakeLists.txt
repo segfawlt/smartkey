@@ -14,11 +14,21 @@ if(NOT DEFINED CMAKE_INSTALL_LIBDIR)
     set(CMAKE_INSTALL_LIBDIR "lib" CACHE PATH "Output directory for libraries")
 endif()
 
-find_package(Fcitx5Core 5.0.0 REQUIRED)
-find_package(Fcitx5Utils 5.0.0 REQUIRED)
+find_package(Fcitx5Core 5.0.20 REQUIRED)
+find_package(Fcitx5Utils 5.0.20 REQUIRED)
 
 get_filename_component(SMARTKEY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-set(SMARTKEY_FFI_LIB "${SMARTKEY_ROOT}/target/release/libsmartkey_ffi.a")
+set(SMARTKEY_CARGO_FLAGS "--locked" CACHE STRING "Extra flags passed to cargo build (e.g. --locked or --frozen)")
+set(SMARTKEY_CARGO_TARGET "" CACHE STRING "Optional Rust target triple for cross-compilation")
+separate_arguments(SMARTKEY_CARGO_ARGS NATIVE_COMMAND "${SMARTKEY_CARGO_FLAGS}")
+
+if(SMARTKEY_CARGO_TARGET)
+    set(SMARTKEY_FFI_LIB "${SMARTKEY_ROOT}/target/${SMARTKEY_CARGO_TARGET}/release/libsmartkey_ffi.a")
+    set(SMARTKEY_CARGO_TARGET_ARGS --target "${SMARTKEY_CARGO_TARGET}")
+else()
+    set(SMARTKEY_FFI_LIB "${SMARTKEY_ROOT}/target/release/libsmartkey_ffi.a")
+    set(SMARTKEY_CARGO_TARGET_ARGS "")
+endif()
 
 find_program(CARGO_EXECUTABLE cargo HINTS "$ENV{HOME}/.cargo/bin")
 if(NOT CARGO_EXECUTABLE)
@@ -26,7 +36,7 @@ if(NOT CARGO_EXECUTABLE)
 endif()
 
 add_custom_target(smartkey_ffi_build ALL
-    COMMAND "${CARGO_EXECUTABLE}" build --release --manifest-path "${SMARTKEY_ROOT}/Cargo.toml" -p smartkey-ffi
+    COMMAND "${CARGO_EXECUTABLE}" build --release ${SMARTKEY_CARGO_ARGS} ${SMARTKEY_CARGO_TARGET_ARGS} --manifest-path "${SMARTKEY_ROOT}/Cargo.toml" -p smartkey-ffi
     BYPRODUCTS "${SMARTKEY_FFI_LIB}"
     WORKING_DIRECTORY "${SMARTKEY_ROOT}"
     COMMENT "Building Rust static library libsmartkey_ffi.a"

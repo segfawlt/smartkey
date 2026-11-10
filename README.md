@@ -21,7 +21,7 @@ SmartKey is designed from the ground up for desktop environments:
    - **1x Backspace:** Immediately reverts an unwanted suggestion back to what you literally typed.
    - **2x Fix:** Fixing the same typo twice promotes your fix permanently to your personal dictionary and learned rules.
    - **Plain-text Brain:** All learned preferences live in a human-readable, comment-preserving `~/.config/smartkey/rules.toml` that you can inspect, edit, or sync with Git.
-3. **Seamless Bilingual Coexistence:** Runs as a lightweight Fcitx5 module addon on top of standard English layouts (`keyboard-us`), but instantly steps aside whenever you switch to Vietnamese input engines like `fcitx5-bamboo` or `fcitx5-lotus`.
+3. **Seamless Bilingual Coexistence (`vi-lotus` Bridge):** Runs as a lightweight Fcitx5 module addon on standard English layouts (`keyboard-us`), includes an optional zero-fork **`vi-lotus`** bridge for `fcitx5-lotus` (rescuing broken Telex smashes like `nuowcss → nước` and shielding English prose momentum like `type of → type of`), and steps aside cleanly on `fcitx5-bamboo` or when `fcitx5-lotus` is in `Off`/macro mode.
 
 ---
 
@@ -47,8 +47,21 @@ SmartKey is designed from the ground up for desktop environments:
 
 - **`crates/smartkey-core`** — Pure-Rust Layer 1 scorer, `SmartKeySession` shadow-buffer learner, diagnostic event logger, and comment-preserving `toml_edit` `RuleStore` (zero OS/C-sys/`$HOME` dependencies).
 - **`crates/smartkey-ffi`** — Panic-safe `extern "C"` ABI (`include/smartkey.h`) for desktop input method modules (`fcitx5`) and portable word-level JNI hooks for Android `HeliBoard`.
-- **`crates/smartkey-cli`** — Control CLI (`smartkey`: `status`, `toggle`, `reload`, `log`, `dict`, `rules`, `explain`, `init`, `repl`; aliased as `smartkeyctl`) and developer corpus tools (`smartkey-dev`: `eval`, `build-lexicon`).
-- **`adapters/fcitx5-smartkey`** — Standalone C++20 `fcitx5` module addon (`Category=Module`, zero `sudo` user-local install to `~/.local`) that runs English autocorrect on `keyboard-*` layouts while stepping aside automatically when `Alt+Z` switches to `fcitx5-bamboo` or `fcitx5-lotus`.
+- **`crates/smartkey-cli`** — Control CLI (`smartkey`: `status`, `toggle`, `reload`, `log`, `rules`, `config`, `plugin`, `dict`, `explain`, `init`, `repl`; aliased as `smartkeyctl`) and developer corpus tools (`smartkey-dev`: `eval`, `build-lexicon`).
+- **`adapters/fcitx5-smartkey`** — Standalone C++20 `fcitx5` module addon (`Category=Module`, requires `fcitx5 >= 5.0.20`, zero `sudo` user-local install to `~/.local`) that runs English autocorrect on `keyboard-*` layouts, bridges `fcitx5-lotus` (`vi-lotus` plugin), and steps aside automatically on other CJK/Vietnamese input engines.
+
+## Prerequisites & Desktop IM Environment
+
+SmartKey runs inside **Fcitx5 (`>= 5.0.20`)**. Install `fcitx5` from your distribution first (`sudo pacman -S fcitx5`, `sudo apt install fcitx5`, or `sudo dnf install fcitx5`), then ensure your desktop session routes input through Fcitx5:
+
+- **Wayland (Hyprland, Sway, KDE Plasma 6, GNOME Wayland):**
+  - Launch `fcitx5 -d` via your compositor/DE virtual-keyboard or autostart config.
+  - Set `XMODIFIERS=@im=fcitx` (and `QT_IM_MODULE=fcitx` if needed for XWayland/Qt5 apps).
+  - **Leave `GTK_IM_MODULE` unset on Wayland** so GTK4/libadwaita apps use native Wayland `text-input-v3` (surrounding-text replacement) instead of legacy DBus key forwarding.
+- **X11:**
+  - Set `GTK_IM_MODULE=fcitx`, `QT_IM_MODULE=fcitx`, and `XMODIFIERS=@im=fcitx` in `~/.xprofile` or `/etc/environment`.
+
+Run `smartkey status` at any time to verify Fcitx5 daemon state, addon library discovery, and IM environment routing.
 
 ## Installation
 
@@ -56,8 +69,10 @@ SmartKey is designed from the ground up for desktop environments:
 
 #### Arch Linux (`.pkg.tar.zst`)
 ```bash
-# 1. Download latest release package locally (avoids pacman remote .sig check)
+# 1. Download latest release package and checksum
 curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst.sha256
+sha256sum -c fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst.sha256
 
 # 2. Install local package
 sudo pacman -U ./fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst
@@ -67,11 +82,15 @@ fcitx5 -r -d
 smartkey status
 ```
 
-#### Generic Linux (Ubuntu / Fedora / Debian / SUSE)
+#### Generic Linux (Debian 12+ / Ubuntu 24.04+ / Fedora 39+ / openSUSE)
+> **Compatibility floor:** Prebuilt portable bundles target `x86_64` Linux with **`glibc >= 2.36`** and **`fcitx5 >= 5.0.20`** (`libFcitx5Core.so.7`). On older distros (e.g. Ubuntu 22.04 with `glibc 2.35`) or `aarch64`, build from source using Option A below.
+
 ```bash
-# Download and unpack portable bundle
+# Download, verify checksum, and unpack portable bundle
 curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst
-tar --zstd -xf fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst.sha256
+sha256sum -c fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst.sha256
+zstd -d -c fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst | tar -xf -
 cd fcitx5-smartkey-0.1.1-linux-x86_64
 
 # Install to ~/.local (no sudo required)
@@ -83,7 +102,7 @@ smartkey status
 
 ### 2. Build From Source
 
-Clone the repository and its dependencies:
+Clone the repository (requires Rust stable toolchain, `cmake >= 3.20`, and Fcitx5 development headers such as `fcitx5` on Arch, `libfcitx5core-dev libfcitx5utils-dev` on Debian/Ubuntu, or `fcitx5-devel` on Fedora):
 
 ```bash
 git clone https://github.com/segfawlt/smartkey.git
@@ -107,45 +126,57 @@ sudo pacman -U dist/fcitx5-smartkey-*.pkg.tar.zst
 
 #### Option C: Build Portable Release Bundle
 ```bash
-./scripts/package-portable.sh
-# Outputs dist/fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst
+# Host build (or pass --container to build inside Debian 12 for glibc >= 2.36 portability):
+./scripts/package-portable.sh --container
+# Outputs dist/fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst (+ .sha256)
 ```
 
 ## Quick Start & CLI Usage
+
+`smartkey` is the primary control binary (`smartkeyctl` is installed alongside it as a compatibility symlink):
 
 ```bash
 # Run full test suite & corpus evaluation
 cargo test --workspace
 cargo run --release -p smartkey-cli --bin smartkey-dev -- eval
 
-# Query status and inspect running Fcitx5 addon
-smartkeyctl status
+# Query status, daemon health, IM environment, and personal brain stats
+smartkey status
 
 # Toggle SmartKey autocorrect on/off (ideal for WM keybindings)
-smartkeyctl toggle
+smartkey toggle
 
-# Reload rules.toml in running Fcitx5 daemon
-smartkeyctl reload
+# Manage settings & diagnostics in ~/.config/smartkey/rules.toml
+smartkey config list
+smartkey config set aggressiveness conservative
+smartkey plugin toggle vi-lotus
 
-# Inspect live autocorrects, 1x/2x/3x+ backspace undos, and manual fixes
-smartkeyctl log
-smartkeyctl rules
+# Inspect or edit personal words, corrections, snippets, and blocklist pairs
+smartkey rules list
+smartkey rules add word FastAPI
+smartkey rules add fix teh the
+smartkey rules add snippet "addr;" "123 Main St"
+
+# Query cumulative counters and durable day-partitioned JSONL event logs
+smartkey log
+smartkey log --today
+smartkey log --since 2h --grep discord
+smartkey log --yesterday --json
 
 # Inspect how SmartKey scores and ranks candidates for a token
-smartkeyctl explain "implementintion"
-smartkeyctl explain --prev "over" "ther"
-
-# Initialize or reconfigure rules.toml with preset
-smartkeyctl init
+smartkey explain "implementintion"
+smartkey explain --prev "over" "ther"
+smartkey explain --lang vi "nuowcss"
 
 # Launch interactive terminal typing + live backspace-learning sandbox
-smartkeyctl repl
+smartkey repl
 ```
 
 ### App Context Profiles (`fcitx5-smartkey`)
 
-- **Bypass (`100%` hands-off):** Password/PIN/URL/email/numeric fields (`CapabilityFlags`), terminals (`kitty`, `alacritty`, `foot`, `ghostty`, `wezterm`, `konsole`, `gnome-terminal`, `xterm`, etc.), and code editors/IDEs (`code`, `codium`, `zed`, `nvim`, `vim`, `emacs`, `helix`, `jetbrains-*`).
-- **Active (`keyboard-*` only):** Browsers (`firefox`, `zen`, `chromium`, `brave`), chat apps (`discord`, `vesktop`, `telegram`, `slack`, `signal`), and general prose/text editors (`gnome-text-editor`, `kate`, `kwrite`, `gedit`, `obsidian`, `libreoffice`). Switching to Vietnamese (`bamboo` / `lotus`) via `Alt+Z` steps SmartKey aside automatically.
+- **Bypass (`100%` hands-off):** Password/PIN/URL/email/numeric fields (`CapabilityFlags`), terminals (`kitty`, `alacritty`, `foot`, `ghostty`, `wezterm`, `konsole`, `gnome-terminal`, `xterm`, etc.), and code editors/IDEs (`code`, `codium`, `cursor`, `windsurf`, `zed`, `sublime_text`, `nvim`, `vim`, `emacs`, `helix`, `jetbrains-*`, `idea`, `clion`, `pycharm`, `rustrover`, etc.).
+- **Active (`keyboard-*` + optional `vi-lotus`):** Browsers (`firefox`, `zen`, `librewolf`, `floorp`, `vivaldi`, `opera`, `thorium`, `chromium`, `brave`, `epiphany`, `qutebrowser` — including Flatpak reverse-DNS IDs), chat apps (`discord`, `vesktop`, `telegram`, `slack`, `signal`), and general prose/text editors (`gnome-text-editor`, `kate`, `kwrite`, `gedit`, `obsidian`, `libreoffice`).
+- **Custom Overrides (`[app_profiles]` in `rules.toml`):** Override any application name or Flatpak ID (`bypass = ["my-custom-ide"]`, `chat = ["element"]`, `browser = [...]`, `prose = [...]`, or `unknown_app_policy = "bypass"` for strict allowlist-only activation).
 
 ## License
 

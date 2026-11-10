@@ -9,8 +9,10 @@ ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PKG_DIR="${ROOT}/packaging/arch"
 DIST_DIR="${ROOT}/dist"
 PKGNAME="fcitx5-smartkey"
-PKGVER="0.1.1"
+PKGVER="$(sed -n 's/^version = "\(.*\)"/\1/p' "${ROOT}/Cargo.toml" | head -n1)"
 TARBALL="${PKG_DIR}/${PKGNAME}-${PKGVER}.tar.gz"
+
+"${SCRIPT_DIR}/check-versions.sh"
 
 mkdir -p "${DIST_DIR}" "${PKG_DIR}"
 
@@ -40,5 +42,12 @@ mv "${PKG_DIR}"/${PKGNAME}-*.pkg.tar.zst "${DIST_DIR}/"
 rm -f "${TARBALL}"
 
 echo ""
+(
+    cd "${DIST_DIR}"
+    for pkg in ${PKGNAME}-${PKGVER}-*.pkg.tar.zst; do
+        [ -f "${pkg}" ] || continue
+        sha256sum "${pkg}" > "${pkg}.sha256"
+    done
+)
 echo "Successfully built Arch package:"
-ls -lh "${DIST_DIR}"/${PKGNAME}-*.pkg.tar.zst
+ls -lh "${DIST_DIR}"/${PKGNAME}-${PKGVER}-*.pkg.tar.zst*
