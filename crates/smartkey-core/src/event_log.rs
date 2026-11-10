@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,6 +7,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::store::DiagnosticEvent;
+
+/// Parsed record from a durable `events-YYYY-MM-DD.jsonl` file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoggedDiagnosticRecord {
+    pub v: u8,
+    pub ts_ms: u64,
+    pub app: Option<String>,
+    pub lang: String,
+    pub event: DiagnosticEvent,
+    pub raw_line: String,
+}
 
 /// Verbosity level for the durable JSONL event log (`[diagnostics].log_level`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -306,6 +317,112 @@ impl EventLog {
                 }
             }
         }
+    }
+
+    /// Removes all `events-YYYY-MM-DD.jsonl` files in `dir`, returning the number of deleted files.
+    pub fn clear_all_files(dir: &Path) -> io::Result<usize> {
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0usize;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if parse_event_filename_days(&name).is_some() {
+                fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Reads durable JSONL records from `dir` whose `ts_ms` falls within `[start_ms, end_ms)`.
+    ///
+    /// Because `events-YYYY-MM-DD.jsonl` files are partitioned by UTC day (`ts_ms / 86_400_000`),
+    /// local-midnight queries (`--today`, `--yesterday`, `--since YYYY-MM-DD`) in non-UTC timezones
+    /// straddle two UTC day files. We scan `[min_utc_day - 1, max_utc_day + 1]` in chronological
+    /// order and filter records strictly by `ts_ms`.
+    pub fn read_records_in_range(
+        dir: &Path,
+        start_ms: Option<u64>,
+        end_ms: Option<u64>,
+    ) -> io::Result<Vec<LoggedDiagnosticRecord>> {
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let min_file_day = start_ms.map(|ms| (ms / 86_400_000) as i64 - 1);
+        let max_file_day = end_ms.map(|ms| (ms / 86_400_000) as i64 + 1);
+
+        let mut files: Vec<(i64, PathBuf)> = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Some(file_days) = parse_event_filename_days(&name) else {
+                continue;
+            };
+            if min_file_day.is_some_and(|min_d| file_days < min_d) {
+                continue;
+            }
+            if max_file_day.is_some_and(|max_d| file_days > max_d) {
+                continue;
+            }
+            files.push((file_days, entry.path()));
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut records = Vec::new();
+        for (_, path) in files {
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+                    continue;
+                };
+                let ts_ms = val.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
+                if start_ms.is_some_and(|s| ts_ms < s) {
+                    continue;
+                }
+                if end_ms.is_some_and(|e| ts_ms >= e) {
+                    continue;
+                }
+                let v = val
+                    .get("v")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u8)
+                    .unwrap_or(1);
+                let app = val
+                    .get("app")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let lang = val
+                    .get("lang")
+                    .and_then(Value::as_str)
+                    .unwrap_or("en")
+                    .to_string();
+                let Ok(event) = serde_json::from_value::<DiagnosticEvent>(val) else {
+                    continue;
+                };
+                records.push(LoggedDiagnosticRecord {
+                    v,
+                    ts_ms,
+                    app,
+                    lang,
+                    event,
+                    raw_line: trimmed.to_string(),
+                });
+            }
+        }
+        records.sort_by_key(|r| r.ts_ms);
+        Ok(records)
     }
 }
 

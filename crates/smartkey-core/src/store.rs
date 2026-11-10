@@ -1620,6 +1620,820 @@ impl RuleStore {
         let _ = self.flush_rules();
     }
 
+    // -------------------------------------------------------------------------
+    // Explicit User / CLI Rule CRUD & Settings Accessors (error-propagating)
+    // -------------------------------------------------------------------------
+
+    /// Inserts or updates a user-authored `[corrections]` (or `[lang.<id>.corrections]`) rule
+    /// without stamping machine-learned provenance comments, propagating write/lock errors.
+    pub fn set_user_correction(
+        &mut self,
+        lang: &LangId,
+        typed: &str,
+        fixed: &str,
+    ) -> io::Result<Option<String>> {
+        let typed_lower = typed.trim().to_lowercase();
+        let fixed_trimmed = fixed.trim();
+        if typed_lower.is_empty() || fixed_trimmed.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "typed token and replacement must be non-empty",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let prev_target = if lang.as_str() == "en" {
+            let tbl = self
+                .doc
+                .entry("corrections")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .unwrap();
+            let stale_keys: Vec<String> = tbl
+                .iter()
+                .filter(|(k, _)| *k != typed_lower && k.to_lowercase() == typed_lower)
+                .map(|(k, _)| k.to_string())
+                .collect();
+            for k in stale_keys {
+                tbl.remove(&k);
+            }
+            tbl[&typed_lower] = toml_edit::value(fixed_trimmed);
+            self.compiled
+                .corrections
+                .insert(typed_lower, fixed_trimmed.to_string())
+        } else {
+            let lang_root = self
+                .doc
+                .entry("lang")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .unwrap();
+            let sub = lang_root
+                .entry(lang.as_str())
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .unwrap();
+            let corr = sub
+                .entry("corrections")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .unwrap();
+            let stale_keys: Vec<String> = corr
+                .iter()
+                .filter(|(k, _)| *k != typed_lower && k.to_lowercase() == typed_lower)
+                .map(|(k, _)| k.to_string())
+                .collect();
+            for k in stale_keys {
+                corr.remove(&k);
+            }
+            corr[&typed_lower] = toml_edit::value(fixed_trimmed);
+            self.compiled
+                .lang_corrections
+                .entry(lang.as_str().to_string())
+                .or_default()
+                .insert(typed_lower, fixed_trimmed.to_string())
+        };
+        self.flush_rules()?;
+        Ok(prev_target)
+    }
+
+    /// Removes `typed` from `[corrections]` (or `[lang.<id>.corrections]`).
+    pub fn remove_correction(&mut self, lang: &LangId, typed: &str) -> io::Result<bool> {
+        let typed_lower = typed.trim().to_lowercase();
+        if typed_lower.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "typed token must be non-empty",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let removed = if lang.as_str() == "en" {
+            let did = self.compiled.corrections.remove(&typed_lower).is_some();
+            if let Some(tbl) = self.doc.get_mut("corrections").and_then(Item::as_table_mut) {
+                let keys: Vec<String> = tbl
+                    .iter()
+                    .filter(|(k, _)| k.to_lowercase() == typed_lower)
+                    .map(|(k, _)| k.to_string())
+                    .collect();
+                for k in keys {
+                    tbl.remove(&k);
+                }
+            }
+            did
+        } else {
+            let did = self
+                .compiled
+                .lang_corrections
+                .get_mut(lang.as_str())
+                .is_some_and(|m| m.remove(&typed_lower).is_some());
+            if let Some(corr) = self
+                .doc
+                .get_mut("lang")
+                .and_then(Item::as_table_mut)
+                .and_then(|t| t.get_mut(lang.as_str()))
+                .and_then(Item::as_table_mut)
+                .and_then(|t| t.get_mut("corrections"))
+                .and_then(Item::as_table_mut)
+            {
+                let keys: Vec<String> = corr
+                    .iter()
+                    .filter(|(k, _)| k.to_lowercase() == typed_lower)
+                    .map(|(k, _)| k.to_string())
+                    .collect();
+                for k in keys {
+                    corr.remove(&k);
+                }
+            }
+            did
+        };
+        if removed {
+            self.flush_rules()?;
+        }
+        Ok(removed)
+    }
+
+    /// Inserts or updates `"prev typed" = "fixed"` in `[context_corrections]` without machine provenance comments.
+    pub fn set_user_context_correction(
+        &mut self,
+        prev: &str,
+        typed: &str,
+        fixed: &str,
+    ) -> io::Result<Option<String>> {
+        let prev_lower = prev.trim().to_lowercase();
+        let typed_lower = typed.trim().to_lowercase();
+        let fixed_trimmed = fixed.trim();
+        if prev_lower.is_empty()
+            || typed_lower.is_empty()
+            || fixed_trimmed.is_empty()
+            || prev_lower.contains(char::is_whitespace)
+            || typed_lower.contains(char::is_whitespace)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prev, typed, and replacement must be non-empty single words (forprev/typed)",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let key = format!("{prev_lower} {typed_lower}");
+        let tbl = self
+            .doc
+            .entry("context_corrections")
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .unwrap();
+        let stale_keys: Vec<String> = tbl
+            .iter()
+            .filter_map(|(k, _)| {
+                k.split_once(' ').and_then(|(p, t)| {
+                    (k != key
+                        && p.trim().to_lowercase() == prev_lower
+                        && t.trim().to_lowercase() == typed_lower)
+                        .then(|| k.to_string())
+                })
+            })
+            .collect();
+        for k in stale_keys {
+            tbl.remove(&k);
+        }
+        tbl[&key] = toml_edit::value(fixed_trimmed);
+        let prev_target = self
+            .compiled
+            .context_corrections
+            .insert((prev_lower, typed_lower), fixed_trimmed.to_string());
+        self.flush_rules()?;
+        Ok(prev_target)
+    }
+
+    /// Removes `"prev typed"` from `[context_corrections]`.
+    pub fn remove_context_correction(&mut self, prev: &str, typed: &str) -> io::Result<bool> {
+        let prev_lower = prev.trim().to_lowercase();
+        let typed_lower = typed.trim().to_lowercase();
+        if prev_lower.is_empty() || typed_lower.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prev and typed tokens must be non-empty",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let removed = self
+            .compiled
+            .context_corrections
+            .remove(&(prev_lower.clone(), typed_lower.clone()))
+            .is_some();
+        if let Some(tbl) = self
+            .doc
+            .get_mut("context_corrections")
+            .and_then(Item::as_table_mut)
+        {
+            let keys: Vec<String> = tbl
+                .iter()
+                .filter_map(|(k, _)| {
+                    k.split_once(' ').and_then(|(p, t)| {
+                        (p.trim().to_lowercase() == prev_lower
+                            && t.trim().to_lowercase() == typed_lower)
+                            .then(|| k.to_string())
+                    })
+                })
+                .collect();
+            for k in keys {
+                tbl.remove(&k);
+            }
+        }
+        if removed {
+            self.flush_rules()?;
+        }
+        Ok(removed)
+    }
+
+    /// Inserts or updates a snippet expansion (`trigger = expansion`) in `[snippets]`.
+    pub fn set_snippet(&mut self, trigger: &str, expansion: &str) -> io::Result<Option<String>> {
+        let trig = trigger.trim();
+        if trig.is_empty() || expansion.is_empty() || trig.chars().any(char::is_whitespace) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snippet trigger must be a non-empty token without whitespace, and expansion must be non-empty",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let tbl = self
+            .doc
+            .entry("snippets")
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .unwrap();
+        tbl[trig] = toml_edit::value(expansion);
+        let prev = self
+            .compiled
+            .snippets
+            .insert(trig.to_string(), expansion.to_string());
+        self.flush_rules()?;
+        Ok(prev)
+    }
+
+    /// Removes `trigger` from `[snippets]`.
+    pub fn remove_snippet(&mut self, trigger: &str) -> io::Result<bool> {
+        let trig = trigger.trim();
+        if trig.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snippet trigger must be non-empty",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let removed = self.compiled.snippets.remove(trig).is_some();
+        if let Some(tbl) = self.doc.get_mut("snippets").and_then(Item::as_table_mut) {
+            tbl.remove(trig);
+        }
+        if removed {
+            self.flush_rules()?;
+        }
+        Ok(removed)
+    }
+
+    /// Adds `word` to `personal_dict` (or `[lang.<id>].personal_dict`), returning `Ok(true)` if modified.
+    pub fn add_user_personal_word(&mut self, lang: &LangId, word: &str) -> io::Result<bool> {
+        let word_trimmed = word.trim();
+        let word_lower = word_trimmed.to_lowercase();
+        if word_lower.is_empty() || word_trimmed.chars().any(char::is_whitespace) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "personal word must be a non-empty single word",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let already_same = if lang.as_str() == "en" {
+            self.compiled.personal_dict.contains(&word_lower)
+                && self
+                    .compiled
+                    .personal_dict_canonical
+                    .get(&word_lower)
+                    .is_some_and(|c| c == word_trimmed)
+        } else {
+            self.compiled
+                .lang_personal_dict
+                .get(lang.as_str())
+                .is_some_and(|s| s.contains(&word_lower))
+                && self
+                    .compiled
+                    .lang_personal_dict_canonical
+                    .get(lang.as_str())
+                    .and_then(|m| m.get(&word_lower))
+                    .is_some_and(|c| c == word_trimmed)
+        };
+        if already_same {
+            return Ok(false);
+        }
+        self.add_personal_word_with_stage(lang, word_trimmed, "manual_cli");
+        self.flush_rules()?;
+        Ok(true)
+    }
+
+    /// Removes `word` from `personal_dict` (or `[lang.<id>].personal_dict`), propagating write errors.
+    pub fn remove_user_personal_word(&mut self, lang: &LangId, word: &str) -> io::Result<bool> {
+        let word_l = word.trim().to_lowercase();
+        if word_l.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "personal word must be non-empty",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let removed = self.remove_personal_word(lang, &word_l);
+        if removed {
+            self.flush_rules()?;
+        }
+        Ok(removed)
+    }
+
+    /// Adds `(typed, rejected)` to `blocklist`, propagating write errors.
+    pub fn add_user_blocklist_pair(&mut self, typed: &str, rejected: &str) -> io::Result<bool> {
+        let typed_l = typed.trim().to_lowercase();
+        let rejected_l = rejected.trim().to_lowercase();
+        if typed_l.is_empty() || rejected_l.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "typed and rejected words must be non-empty",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let already = self
+            .compiled
+            .blocklist
+            .contains(&(typed_l.clone(), rejected_l.clone()));
+        self.add_permanent_block(&typed_l, &rejected_l);
+        self.flush_rules()?;
+        Ok(!already)
+    }
+
+    /// Removes `(typed, rejected)` from `blocklist`.
+    pub fn remove_blocklist_pair(&mut self, typed: &str, rejected: &str) -> io::Result<bool> {
+        let typed_l = typed.trim().to_lowercase();
+        let rejected_l = rejected.trim().to_lowercase();
+        if typed_l.is_empty() || rejected_l.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "typed and rejected words must be non-empty",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let removed = self
+            .compiled
+            .blocklist
+            .remove(&(typed_l.clone(), rejected_l.clone()));
+        if let Some(arr) = self.doc.get_mut("blocklist").and_then(Item::as_array_mut) {
+            arr.retain(|v| {
+                !v.as_inline_table().is_some_and(|tbl| {
+                    let t_match = tbl
+                        .get("typed")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| t.to_lowercase() == typed_l);
+                    let r_match = tbl
+                        .get("rejected")
+                        .and_then(Value::as_str)
+                        .is_some_and(|r| r.to_lowercase() == rejected_l);
+                    t_match && r_match
+                })
+            });
+        }
+        if removed {
+            self.flush_rules()?;
+        }
+        Ok(removed)
+    }
+
+    /// Adds an ASCII word to `telex_passthrough`, propagating write errors.
+    pub fn add_user_telex_passthrough(&mut self, raw_ascii: &str) -> io::Result<bool> {
+        let word_l = raw_ascii.trim().to_lowercase();
+        if word_l.is_empty() || !word_l.is_ascii() || word_l.chars().any(char::is_whitespace) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "telex_passthrough entry must be a non-empty ASCII word",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let is_new = !self.compiled.telex_passthrough.contains(&word_l);
+        if is_new {
+            self.add_telex_passthrough(&word_l);
+            self.flush_rules()?;
+        }
+        Ok(is_new)
+    }
+
+    /// Removes an ASCII word from `telex_passthrough`.
+    pub fn remove_telex_passthrough(&mut self, raw_ascii: &str) -> io::Result<bool> {
+        let word_l = raw_ascii.trim().to_lowercase();
+        if word_l.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "telex_passthrough entry must be non-empty",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let removed = self.compiled.telex_passthrough.remove(&word_l);
+        if let Some(arr) = self
+            .doc
+            .get_mut("telex_passthrough")
+            .and_then(Item::as_array_mut)
+        {
+            arr.retain(|v| !v.as_str().is_some_and(|s| s.to_lowercase() == word_l));
+        }
+        if removed {
+            self.flush_rules()?;
+        }
+        Ok(removed)
+    }
+
+    /// Normalizes a short or section-prefixed setting key to its canonical dotted name.
+    pub fn normalize_setting_key(key: &str) -> Option<&'static str> {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "enabled" | "settings.enabled" => Some("settings.enabled"),
+            "dialect" | "settings.dialect" => Some("settings.dialect"),
+            "aggressiveness" | "settings.aggressiveness" => Some("settings.aggressiveness"),
+            "undo_window_ms" | "settings.undo_window_ms" => Some("settings.undo_window_ms"),
+            "auto_capitalize_i" | "settings.auto_capitalize_i" => {
+                Some("settings.auto_capitalize_i")
+            }
+            "auto_capitalize_sentence" | "settings.auto_capitalize_sentence" => {
+                Some("settings.auto_capitalize_sentence")
+            }
+            "fix_shift_slips"
+            | "fix_double_cap"
+            | "settings.fix_shift_slips"
+            | "settings.fix_double_cap" => Some("settings.fix_shift_slips"),
+            "fix_proper_nouns" | "settings.fix_proper_nouns" => Some("settings.fix_proper_nouns"),
+            "enable_contractions" | "settings.enable_contractions" => {
+                Some("settings.enable_contractions")
+            }
+            "enable_missed_space_split" | "settings.enable_missed_space_split" => {
+                Some("settings.enable_missed_space_split")
+            }
+            "expand_shorthand" | "settings.expand_shorthand" => Some("settings.expand_shorthand"),
+            "vi_lotus" | "vi-lotus" | "plugins.vi_lotus" | "plugins.vi-lotus" => {
+                Some("plugins.vi_lotus")
+            }
+            "event_log" | "diagnostics.event_log" => Some("diagnostics.event_log"),
+            "log_level" | "diagnostics.log_level" => Some("diagnostics.log_level"),
+            "keep_days" | "diagnostics.keep_days" => Some("diagnostics.keep_days"),
+            "near_miss_band" | "diagnostics.near_miss_band" => Some("diagnostics.near_miss_band"),
+            "annotate_rules" | "diagnostics.annotate_rules" => Some("diagnostics.annotate_rules"),
+            "unknown_app_policy" | "app_profiles.unknown_app_policy" => {
+                Some("app_profiles.unknown_app_policy")
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns all canonical setting keys and their current effective string representations.
+    pub fn list_settings(&self) -> Vec<(&'static str, String)> {
+        const KEYS: &[&str] = &[
+            "settings.enabled",
+            "settings.dialect",
+            "settings.aggressiveness",
+            "settings.undo_window_ms",
+            "settings.auto_capitalize_i",
+            "settings.auto_capitalize_sentence",
+            "settings.fix_shift_slips",
+            "settings.fix_proper_nouns",
+            "settings.enable_contractions",
+            "settings.enable_missed_space_split",
+            "settings.expand_shorthand",
+            "plugins.vi_lotus",
+            "diagnostics.event_log",
+            "diagnostics.log_level",
+            "diagnostics.keep_days",
+            "diagnostics.near_miss_band",
+            "diagnostics.annotate_rules",
+            "app_profiles.unknown_app_policy",
+        ];
+        KEYS.iter()
+            .filter_map(|&k| self.get_setting(k).map(|v| (k, v)))
+            .collect()
+    }
+
+    /// Reads the effective value of `key` as a canonical string.
+    pub fn get_setting(&self, key: &str) -> Option<String> {
+        let canon = Self::normalize_setting_key(key)?;
+        let c = &self.compiled;
+        let sc = &c.scorer_config;
+        let val = match canon {
+            "settings.enabled" => c.enabled.to_string(),
+            "settings.dialect" => match sc.dialect {
+                Dialect::Mixed => "mixed".to_string(),
+                Dialect::EnUs => "en_US".to_string(),
+                Dialect::EnGb => "en_GB".to_string(),
+            },
+            "settings.aggressiveness" => match sc.aggressiveness {
+                Aggressiveness::Conservative => "conservative".to_string(),
+                Aggressiveness::Balanced => "balanced".to_string(),
+                Aggressiveness::Aggressive => "aggressive".to_string(),
+            },
+            "settings.undo_window_ms" => c.undo_window_ms.to_string(),
+            "settings.auto_capitalize_i" => sc.auto_capitalize_i.to_string(),
+            "settings.auto_capitalize_sentence" => sc.auto_capitalize_sentence.to_string(),
+            "settings.fix_shift_slips" => sc.fix_shift_slips.to_string(),
+            "settings.fix_proper_nouns" => sc.fix_proper_nouns.to_string(),
+            "settings.enable_contractions" => sc.enable_contractions.to_string(),
+            "settings.enable_missed_space_split" => sc.enable_missed_space_split.to_string(),
+            "settings.expand_shorthand" => sc.expand_shorthand.to_string(),
+            "plugins.vi_lotus" => c.vi_lotus_enabled.to_string(),
+            "diagnostics.event_log" => c.diagnostics.event_log.to_string(),
+            "diagnostics.log_level" => match c.diagnostics.log_level {
+                EventLogLevel::Interesting => "interesting".to_string(),
+                EventLogLevel::All => "all".to_string(),
+            },
+            "diagnostics.keep_days" => c.diagnostics.keep_days.to_string(),
+            "diagnostics.near_miss_band" => format!("{:.2}", c.diagnostics.near_miss_band),
+            "diagnostics.annotate_rules" => c.diagnostics.annotate_rules.to_string(),
+            "app_profiles.unknown_app_policy" => match c.app_profiles.unknown_app_policy {
+                None => "default".to_string(),
+                Some(AppProfile::Bypass) => "bypass".to_string(),
+                Some(AppProfile::Browser) => "browser".to_string(),
+                Some(AppProfile::Chat) => "chat".to_string(),
+                Some(AppProfile::Prose) => "prose".to_string(),
+            },
+            _ => return None,
+        };
+        Some(val)
+    }
+
+    /// Updates `key` in `rules.toml` (preserving comments), recompiles settings, and returns `(canonical_key, canonical_value)`.
+    pub fn set_setting(&mut self, key: &str, raw_value: &str) -> io::Result<(&'static str, String)> {
+        let Some(canon) = Self::normalize_setting_key(key) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown config key {key:?}"),
+            ));
+        };
+        let parse_bool = |raw: &str| -> io::Result<bool> {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "on" | "yes" => Ok(true),
+                "false" | "0" | "off" | "no" => Ok(false),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid boolean {raw:?} for {canon} (expected true or false)"),
+                )),
+            }
+        };
+
+        // Validate value before touching disk or document.
+        enum TomlPatch {
+            Bool(&'static str, &'static str, bool),
+            Int(&'static str, &'static str, i64),
+            Float(&'static str, &'static str, f64),
+            Str(&'static str, &'static str, &'static str),
+            RemoveKey(&'static str, &'static str),
+        }
+
+        let patch = match canon {
+            "settings.enabled" => TomlPatch::Bool("settings", "enabled", parse_bool(raw_value)?),
+            "settings.dialect" => {
+                let s = match raw_value.trim() {
+                    "mixed" | "Mixed" | "auto" => "mixed",
+                    "en_US" | "en_us" | "us" | "US" => "en_US",
+                    "en_GB" | "en_gb" | "gb" | "GB" | "uk" | "UK" => "en_GB",
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "invalid dialect {raw_value:?} (expected mixed, en_US, or en_GB)"
+                            ),
+                        ));
+                    }
+                };
+                TomlPatch::Str("settings", "dialect", s)
+            }
+            "settings.aggressiveness" => {
+                let s = match raw_value.trim().to_ascii_lowercase().as_str() {
+                    "conservative" => "conservative",
+                    "balanced" => "balanced",
+                    "aggressive" => "aggressive",
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "invalid aggressiveness {raw_value:?} (expected conservative, balanced, or aggressive)"
+                            ),
+                        ));
+                    }
+                };
+                TomlPatch::Str("settings", "aggressiveness", s)
+            }
+            "settings.undo_window_ms" => {
+                let ms: i64 = raw_value.trim().parse().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid undo_window_ms {raw_value:?} (expected integer 100..=60000)"),
+                    )
+                })?;
+                if !(100..=60_000).contains(&ms) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("undo_window_ms {ms} out of range (expected 100..=60000)"),
+                    ));
+                }
+                TomlPatch::Int("settings", "undo_window_ms", ms)
+            }
+            "settings.auto_capitalize_i" => {
+                TomlPatch::Bool("settings", "auto_capitalize_i", parse_bool(raw_value)?)
+            }
+            "settings.auto_capitalize_sentence" => TomlPatch::Bool(
+                "settings",
+                "auto_capitalize_sentence",
+                parse_bool(raw_value)?,
+            ),
+            "settings.fix_shift_slips" => {
+                TomlPatch::Bool("settings", "fix_shift_slips", parse_bool(raw_value)?)
+            }
+            "settings.fix_proper_nouns" => {
+                TomlPatch::Bool("settings", "fix_proper_nouns", parse_bool(raw_value)?)
+            }
+            "settings.enable_contractions" => {
+                TomlPatch::Bool("settings", "enable_contractions", parse_bool(raw_value)?)
+            }
+            "settings.enable_missed_space_split" => TomlPatch::Bool(
+                "settings",
+                "enable_missed_space_split",
+                parse_bool(raw_value)?,
+            ),
+            "settings.expand_shorthand" => {
+                TomlPatch::Bool("settings", "expand_shorthand", parse_bool(raw_value)?)
+            }
+            "plugins.vi_lotus" => {
+                TomlPatch::Bool("plugins", "vi_lotus", parse_bool(raw_value)?)
+            }
+            "diagnostics.event_log" => {
+                TomlPatch::Bool("diagnostics", "event_log", parse_bool(raw_value)?)
+            }
+            "diagnostics.log_level" => {
+                let s = match raw_value.trim().to_ascii_lowercase().as_str() {
+                    "interesting" => "interesting",
+                    "all" | "verbose" | "debug" => "all",
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "invalid diagnostics.log_level {raw_value:?} (expected interesting or all)"
+                            ),
+                        ));
+                    }
+                };
+                TomlPatch::Str("diagnostics", "log_level", s)
+            }
+            "diagnostics.keep_days" => {
+                let days: i64 = raw_value.trim().parse().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid diagnostics.keep_days {raw_value:?} (expected integer >= 0)"),
+                    )
+                })?;
+                if !(0..=3650).contains(&days) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("diagnostics.keep_days {days} out of range (expected 0..=3650)"),
+                    ));
+                }
+                TomlPatch::Int("diagnostics", "keep_days", days)
+            }
+            "diagnostics.near_miss_band" => {
+                let band: f64 = raw_value.trim().parse().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "invalid diagnostics.near_miss_band {raw_value:?} (expected float 0.0..=1.0)"
+                        ),
+                    )
+                })?;
+                if !(0.0..=1.0).contains(&band) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("diagnostics.near_miss_band {band} out of range (expected 0.0..=1.0)"),
+                    ));
+                }
+                TomlPatch::Float("diagnostics", "near_miss_band", band)
+            }
+            "diagnostics.annotate_rules" => {
+                TomlPatch::Bool("diagnostics", "annotate_rules", parse_bool(raw_value)?)
+            }
+            "app_profiles.unknown_app_policy" => {
+                match raw_value.trim().to_ascii_lowercase().as_str() {
+                    "default" | "none" | "prose_default" => {
+                        TomlPatch::RemoveKey("app_profiles", "unknown_app_policy")
+                    }
+                    "bypass" | "off" | "disable" => {
+                        TomlPatch::Str("app_profiles", "unknown_app_policy", "bypass")
+                    }
+                    "browser" => TomlPatch::Str("app_profiles", "unknown_app_policy", "browser"),
+                    "chat" => TomlPatch::Str("app_profiles", "unknown_app_policy", "chat"),
+                    "prose" => TomlPatch::Str("app_profiles", "unknown_app_policy", "prose"),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "invalid unknown_app_policy {raw_value:?} (expected default, bypass, browser, chat, or prose)"
+                            ),
+                        ));
+                    }
+                }
+            }
+            _ => unreachable!(),
+        };
+
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+
+        match patch {
+            TomlPatch::Bool(sec, k, b) => {
+                let tbl = self
+                    .doc
+                    .entry(sec)
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                if sec == "settings" && k == "fix_shift_slips" {
+                    tbl.remove("fix_double_cap");
+                }
+                if sec == "plugins" && k == "vi_lotus" {
+                    tbl.remove("vi-lotus");
+                }
+                tbl[k] = toml_edit::value(b);
+            }
+            TomlPatch::Int(sec, k, n) => {
+                let tbl = self
+                    .doc
+                    .entry(sec)
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                tbl[k] = toml_edit::value(n);
+            }
+            TomlPatch::Float(sec, k, f) => {
+                let tbl = self
+                    .doc
+                    .entry(sec)
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                tbl[k] = toml_edit::value(f);
+            }
+            TomlPatch::Str(sec, k, s) => {
+                let tbl = self
+                    .doc
+                    .entry(sec)
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                tbl[k] = toml_edit::value(s);
+            }
+            TomlPatch::RemoveKey(sec, k) => {
+                if let Some(tbl) = self.doc.get_mut(sec).and_then(Item::as_table_mut) {
+                    tbl.remove(k);
+                }
+            }
+        }
+
+        self.compiled = Self::extract_compiled(&self.doc);
+        self.flush_rules()?;
+        let effective = self.get_setting(canon).unwrap_or_default();
+        Ok((canon, effective))
+    }
+
     fn extract_compiled(doc: &DocumentMut) -> CompiledRules {
         let mut out = CompiledRules {
             enabled: true,

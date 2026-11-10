@@ -11,6 +11,7 @@ pub mod vi_telex;
 
 pub use event_log::{
     default_state_log_dir, resolve_home_dir, DiagnosticsConfig, EventLog, EventLogLevel,
+    LoggedDiagnosticRecord,
 };
 pub use learner::{LearnEvent, SkipReason};
 pub use lexicon::{

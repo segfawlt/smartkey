@@ -6,10 +6,11 @@ use std::process::Command;
 use std::time::Instant;
 
 use serde::Serialize;
+use smartkey_core::event_log::current_epoch_ms;
 use smartkey_core::{
     apply_key_to_buffer, DiagnosticEvent, Dialect, EnglishScorer, EvalContext, EvalOutcome,
-    KeyInput, LangId, MatchKind, Preset, RuleStore, SessionAction, SmartKeyEngine,
-    SmartKeySession, UndoResolution,
+    EventLog, KeyInput, LangId, LoggedDiagnosticRecord, MatchKind, Preset, RuleStore,
+    SessionAction, SmartKeyEngine, SmartKeySession, UndoResolution,
 };
 
 /// Git state stamped at build time by `build.rs`: HEAD hash or tag (e.g.
@@ -505,15 +506,561 @@ fn cmd_init(args: &[String]) -> CliResult {
     Ok(())
 }
 
+fn map_store_err(err: io::Error) -> CliError {
+    if err.kind() == io::ErrorKind::InvalidInput {
+        CliError::Usage(err.to_string())
+    } else {
+        CliError::Runtime(err.to_string())
+    }
+}
+
+fn parse_lang_arg(raw: &str) -> Result<LangId, CliError> {
+    match raw.trim() {
+        "en" | "en_US" | "en_GB" => Ok(LangId::en()),
+        "vi" | "vi-lotus" | "vi_lotus" | "lotus" => Ok(LangId::vi()),
+        other if !other.is_empty() && other.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') => {
+            Ok(LangId(other.to_string()))
+        }
+        other => Err(CliError::Usage(format!(
+            "invalid --lang {other:?} (expected en or vi)"
+        ))),
+    }
+}
+
+#[derive(Serialize)]
+struct RulesJson {
+    rules_path: String,
+    initialized: bool,
+    parse_locked: bool,
+    personal_dict: Vec<String>,
+    lang_personal_dict: std::collections::BTreeMap<String, Vec<String>>,
+    corrections: std::collections::BTreeMap<String, String>,
+    lang_corrections: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    context_corrections: std::collections::BTreeMap<String, String>,
+    snippets: std::collections::BTreeMap<String, String>,
+    blocklist: Vec<(String, String)>,
+    telex_passthrough: Vec<String>,
+}
+
+fn print_rules_help() {
+    println!(
+        "USAGE:\n  \
+         smartkey rules [summary|list] [--json] [--dir <path>]\n  \
+         smartkey rules add fix <typed> <replacement> [--lang en|vi] [--dir <path>]\n  \
+         smartkey rules add context <prev> <typed> <replacement> [--dir <path>]\n  \
+         smartkey rules add snippet <trigger> <expansion> [--dir <path>]\n  \
+         smartkey rules add word <word> [--lang en|vi] [--dir <path>]\n  \
+         smartkey rules add block <typed> <rejected> [--dir <path>]\n  \
+         smartkey rules add passthrough <ascii_word> [--dir <path>]\n  \
+         smartkey rules remove <fix|context|snippet|word|block|passthrough> ... [--lang en|vi] [--dir <path>]\n\n\
+         Inspect or edit personal dictionary words, corrections, snippets, blocklist pairs, and Telex passthrough rules."
+    );
+}
+
 fn cmd_rules(args: &[String]) -> CliResult {
     let mut dir = default_config_dir();
+    let mut lang = LangId::en();
+    let mut as_json = false;
+    let mut pos: Vec<&str> = Vec::new();
+    let mut end_of_flags = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if end_of_flags {
+            pos.push(arg);
+            i += 1;
+            continue;
+        }
+        match arg {
+            "--help" | "-h" => {
+                print_rules_help();
+                return Ok(());
+            }
+            "--" => {
+                end_of_flags = true;
+            }
+            "--dir" => {
+                i += 1;
+                let p = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--dir requires a path".to_string()))?;
+                dir = PathBuf::from(p);
+            }
+            "--lang" | "-l" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--lang requires an id (en|vi)".to_string()))?;
+                lang = parse_lang_arg(raw)?;
+            }
+            "--json" => {
+                as_json = true;
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag {other} (run `smartkey rules --help` for usage)"
+                )));
+            }
+            other => pos.push(other),
+        }
+        i += 1;
+    }
+
+    let action = pos.first().copied().unwrap_or("summary");
+    match action {
+        "summary" | "list" | "ls" => {
+            if pos.len() > 1 {
+                return Err(CliError::Usage(format!(
+                    "unexpected argument {:?} (run `smartkey rules --help` for usage)",
+                    pos[1]
+                )));
+            }
+            let (store, initialized) = load_rule_store_readonly(&dir, Preset::Balanced)?;
+            let c = store.compiled();
+            let st = store.state();
+            let expected_rules_path = dir.join("rules.toml");
+
+            if as_json {
+                let mut personal_words: Vec<String> = c
+                    .personal_dict
+                    .iter()
+                    .map(|w| {
+                        c.personal_dict_canonical
+                            .get(w)
+                            .cloned()
+                            .unwrap_or_else(|| w.clone())
+                    })
+                    .collect();
+                personal_words.sort();
+
+                let mut lang_personal_dict = std::collections::BTreeMap::new();
+                for (lk, set) in &c.lang_personal_dict {
+                    let canon_map = c.lang_personal_dict_canonical.get(lk);
+                    let mut words: Vec<String> = set
+                        .iter()
+                        .map(|w| {
+                            canon_map
+                                .and_then(|m| m.get(w))
+                                .cloned()
+                                .unwrap_or_else(|| w.clone())
+                        })
+                        .collect();
+                    words.sort();
+                    lang_personal_dict.insert(lk.clone(), words);
+                }
+
+                let context_corrections: std::collections::BTreeMap<String, String> = c
+                    .context_corrections
+                    .iter()
+                    .map(|((p, t), v)| (format!("{p} {t}"), v.clone()))
+                    .collect();
+
+                let payload = RulesJson {
+                    rules_path: expected_rules_path.display().to_string(),
+                    initialized,
+                    parse_locked: store.is_parse_locked(),
+                    personal_dict: personal_words,
+                    lang_personal_dict,
+                    corrections: c.corrections.clone(),
+                    lang_corrections: c.lang_corrections.clone(),
+                    context_corrections,
+                    snippets: c.snippets.clone(),
+                    blocklist: c.blocklist.iter().cloned().collect(),
+                    telex_passthrough: c.telex_passthrough.iter().cloned().collect(),
+                };
+                println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                return Ok(());
+            }
+
+            let rules_label = if initialized {
+                expected_rules_path.display().to_string()
+            } else {
+                format!("{} (not initialized yet)", expected_rules_path.display())
+            };
+
+            println!("=== SmartKey Personal Rule Brain ===");
+            println!("Rules File           : {rules_label}");
+            if let Some(parse_err) = store.parse_error() {
+                println!("TOML Syntax Warning  : WRITE-LOCKED ({parse_err})");
+            }
+            println!(
+                "Settings             : enabled={} | dialect={:?} | aggressiveness={:?} | undo_window={}ms",
+                c.enabled, c.scorer_config.dialect, c.scorer_config.aggressiveness, c.undo_window_ms
+            );
+            println!("Personal Dict (en)   : {} words", c.personal_dict.len());
+            println!("Blocklist Pairs      : {} pairs", c.blocklist.len());
+            println!(
+                "Learned Corrections  : {} unigram | {} contextual",
+                c.corrections.len(),
+                c.context_corrections.len()
+            );
+            println!("Snippets             : {} triggers", c.snippets.len());
+            println!(
+                "Telex Passthrough    : {} ASCII words",
+                c.telex_passthrough.len()
+            );
+            println!(
+                "Staging Counters     : {} edits | {} context | {} unknowns | {} trouble words",
+                st.staged_corrections.len(),
+                st.staged_context.len(),
+                st.untouched_unknowns.len(),
+                st.trouble_words.len()
+            );
+
+            if action == "list" || action == "ls" {
+                if !c.corrections.is_empty() {
+                    println!("\nCorrections [en] ({}):", c.corrections.len());
+                    for (k, v) in &c.corrections {
+                        println!("  {k:?} -> {v:?}");
+                    }
+                }
+                for (lk, map) in &c.lang_corrections {
+                    if !map.is_empty() {
+                        println!("\nCorrections [{lk}] ({}):", map.len());
+                        for (k, v) in map {
+                            println!("  {k:?} -> {v:?}");
+                        }
+                    }
+                }
+                if !c.context_corrections.is_empty() {
+                    println!("\nContext Corrections ({}):", c.context_corrections.len());
+                    for ((prev, typed), v) in &c.context_corrections {
+                        println!("  \"{prev} {typed}\" -> {v:?}");
+                    }
+                }
+                if !c.snippets.is_empty() {
+                    println!("\nSnippets ({}):", c.snippets.len());
+                    for (k, v) in &c.snippets {
+                        println!("  {k:?} -> {v:?}");
+                    }
+                }
+                if !c.personal_dict.is_empty() {
+                    let words: Vec<&str> = c
+                        .personal_dict
+                        .iter()
+                        .map(|w| {
+                            c.personal_dict_canonical
+                                .get(w)
+                                .map(String::as_str)
+                                .unwrap_or(w.as_str())
+                        })
+                        .collect();
+                    println!("\nPersonal Words [en] ({}): {}", words.len(), words.join(", "));
+                }
+                for (lk, set) in &c.lang_personal_dict {
+                    if !set.is_empty() {
+                        let canon_map = c.lang_personal_dict_canonical.get(lk);
+                        let words: Vec<&str> = set
+                            .iter()
+                            .map(|w| {
+                                canon_map
+                                    .and_then(|m| m.get(w))
+                                    .map(String::as_str)
+                                    .unwrap_or(w.as_str())
+                            })
+                            .collect();
+                        println!("\nPersonal Words [{lk}] ({}): {}", words.len(), words.join(", "));
+                    }
+                }
+                if !c.blocklist.is_empty() {
+                    println!("\nBlocklist ({}):", c.blocklist.len());
+                    for (t, r) in &c.blocklist {
+                        println!("  typed={t:?} rejected={r:?}");
+                    }
+                }
+                if !c.telex_passthrough.is_empty() {
+                    let words: Vec<&str> = c.telex_passthrough.iter().map(String::as_str).collect();
+                    println!("\nTelex Passthrough ({}): {}", words.len(), words.join(", "));
+                }
+            } else if !st.skipped_edits.is_empty() {
+                println!(
+                    "\nRecent Guard-Rejected Edits ({}):",
+                    st.skipped_edits.len()
+                );
+                for entry in st.skipped_edits.iter().rev().take(10) {
+                    println!(
+                        "  [{}x] ({}) prev={:?} {:?} -> {:?} ({})",
+                        entry.count, entry.lang, entry.prev_word, entry.orig, entry.fixed, entry.reason
+                    );
+                }
+            }
+            Ok(())
+        }
+        "add" => {
+            let Some(&kind) = pos.get(1) else {
+                return Err(CliError::Usage(
+                    "usage: smartkey rules add <fix|context|snippet|word|block|passthrough> ..."
+                        .to_string(),
+                ));
+            };
+            let rest = &pos[2..];
+            let mut store = load_rule_store_mut(&dir, Preset::Balanced)?;
+            let summary = match kind {
+                "fix" | "correction" => {
+                    if rest.len() != 2 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules add fix <typed> <replacement> [--lang en|vi]"
+                                .to_string(),
+                        ));
+                    }
+                    store
+                        .set_user_correction(&lang, rest[0], rest[1])
+                        .map_err(map_store_err)?;
+                    format!(
+                        "Saved correction [{}]: {:?} -> {:?}",
+                        lang.as_str(),
+                        rest[0].trim().to_lowercase(),
+                        rest[1].trim()
+                    )
+                }
+                "context" => {
+                    if rest.len() != 3 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules add context <prev> <typed> <replacement>"
+                                .to_string(),
+                        ));
+                    }
+                    store
+                        .set_user_context_correction(rest[0], rest[1], rest[2])
+                        .map_err(map_store_err)?;
+                    format!(
+                        "Saved context correction: \"{} {}\" -> {:?}",
+                        rest[0].trim().to_lowercase(),
+                        rest[1].trim().to_lowercase(),
+                        rest[2].trim()
+                    )
+                }
+                "snippet" => {
+                    if rest.len() != 2 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules add snippet <trigger> <expansion>".to_string(),
+                        ));
+                    }
+                    store
+                        .set_snippet(rest[0], rest[1])
+                        .map_err(map_store_err)?;
+                    format!("Saved snippet: {:?} -> {:?}", rest[0].trim(), rest[1])
+                }
+                "word" | "personal" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules add word <word> [--lang en|vi]".to_string(),
+                        ));
+                    }
+                    let changed = store
+                        .add_user_personal_word(&lang, rest[0])
+                        .map_err(map_store_err)?;
+                    if changed {
+                        format!(
+                            "Added personal word [{}]: {:?}",
+                            lang.as_str(),
+                            rest[0].trim()
+                        )
+                    } else {
+                        format!(
+                            "Personal word [{}] already present: {:?}",
+                            lang.as_str(),
+                            rest[0].trim()
+                        )
+                    }
+                }
+                "block" | "blocklist" => {
+                    if rest.len() != 2 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules add block <typed> <rejected>".to_string(),
+                        ));
+                    }
+                    let changed = store
+                        .add_user_blocklist_pair(rest[0], rest[1])
+                        .map_err(map_store_err)?;
+                    if changed {
+                        format!(
+                            "Blocked pair: {:?} -> {:?}",
+                            rest[0].trim().to_lowercase(),
+                            rest[1].trim().to_lowercase()
+                        )
+                    } else {
+                        format!(
+                            "Blocklist pair already present: {:?} -> {:?}",
+                            rest[0].trim().to_lowercase(),
+                            rest[1].trim().to_lowercase()
+                        )
+                    }
+                }
+                "passthrough" | "telex" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules add passthrough <ascii_word>".to_string(),
+                        ));
+                    }
+                    let changed = store
+                        .add_user_telex_passthrough(rest[0])
+                        .map_err(map_store_err)?;
+                    if changed {
+                        format!(
+                            "Added Telex passthrough word: {:?}",
+                            rest[0].trim().to_lowercase()
+                        )
+                    } else {
+                        format!(
+                            "Telex passthrough word already present: {:?}",
+                            rest[0].trim().to_lowercase()
+                        )
+                    }
+                }
+                other => {
+                    return Err(CliError::Usage(format!(
+                        "unknown rules add target {other:?} (expected fix, context, snippet, word, block, or passthrough)"
+                    )));
+                }
+            };
+            let _ = notify_fcitx5_reload();
+            println!("{summary}");
+            Ok(())
+        }
+        "remove" | "rm" | "del" | "delete" => {
+            let Some(&kind) = pos.get(1) else {
+                return Err(CliError::Usage(
+                    "usage: smartkey rules remove <fix|context|snippet|word|block|passthrough> ..."
+                        .to_string(),
+                ));
+            };
+            let rest = &pos[2..];
+            let mut store = load_rule_store_mut(&dir, Preset::Balanced)?;
+            let (removed, desc) = match kind {
+                "fix" | "correction" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules remove fix <typed> [--lang en|vi]".to_string(),
+                        ));
+                    }
+                    let r = store
+                        .remove_correction(&lang, rest[0])
+                        .map_err(map_store_err)?;
+                    (
+                        r,
+                        format!(
+                            "correction [{}] {:?}",
+                            lang.as_str(),
+                            rest[0].trim().to_lowercase()
+                        ),
+                    )
+                }
+                "context" => {
+                    if rest.len() != 2 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules remove context <prev> <typed>".to_string(),
+                        ));
+                    }
+                    let r = store
+                        .remove_context_correction(rest[0], rest[1])
+                        .map_err(map_store_err)?;
+                    (
+                        r,
+                        format!(
+                            "context correction \"{} {}\"",
+                            rest[0].trim().to_lowercase(),
+                            rest[1].trim().to_lowercase()
+                        ),
+                    )
+                }
+                "snippet" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules remove snippet <trigger>".to_string(),
+                        ));
+                    }
+                    let r = store.remove_snippet(rest[0]).map_err(map_store_err)?;
+                    (r, format!("snippet {:?}", rest[0].trim()))
+                }
+                "word" | "personal" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules remove word <word> [--lang en|vi]".to_string(),
+                        ));
+                    }
+                    let r = store
+                        .remove_user_personal_word(&lang, rest[0])
+                        .map_err(map_store_err)?;
+                    (
+                        r,
+                        format!(
+                            "personal word [{}] {:?}",
+                            lang.as_str(),
+                            rest[0].trim().to_lowercase()
+                        ),
+                    )
+                }
+                "block" | "blocklist" => {
+                    if rest.len() != 2 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules remove block <typed> <rejected>".to_string(),
+                        ));
+                    }
+                    let r = store
+                        .remove_blocklist_pair(rest[0], rest[1])
+                        .map_err(map_store_err)?;
+                    (
+                        r,
+                        format!(
+                            "blocklist pair {:?} -> {:?}",
+                            rest[0].trim().to_lowercase(),
+                            rest[1].trim().to_lowercase()
+                        ),
+                    )
+                }
+                "passthrough" | "telex" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules remove passthrough <ascii_word>".to_string(),
+                        ));
+                    }
+                    let r = store
+                        .remove_telex_passthrough(rest[0])
+                        .map_err(map_store_err)?;
+                    (
+                        r,
+                        format!(
+                            "Telex passthrough word {:?}",
+                            rest[0].trim().to_lowercase()
+                        ),
+                    )
+                }
+                other => {
+                    return Err(CliError::Usage(format!(
+                        "unknown rules remove target {other:?} (expected fix, context, snippet, word, block, or passthrough)"
+                    )));
+                }
+            };
+            if !removed {
+                return Err(CliError::Runtime(format!("no matching {desc} found")));
+            }
+            let _ = notify_fcitx5_reload();
+            println!("Removed {desc}");
+            Ok(())
+        }
+        other => Err(CliError::Usage(format!(
+            "unknown rules subcommand {other:?} (run `smartkey rules --help` for usage)"
+        ))),
+    }
+}
+
+fn cmd_config(args: &[String]) -> CliResult {
+    let mut dir = default_config_dir();
+    let mut as_json = false;
+    let mut pos: Vec<&str> = Vec::new();
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
                 println!(
-                    "USAGE:\n  smartkey rules [--dir <path>]\n\n\
-                     Show summary of personal dictionary, blocklist, snippets, and learned rules."
+                    "USAGE:\n  \
+                     smartkey config [list] [--json] [--dir <path>]\n  \
+                     smartkey config get <key> [--json] [--dir <path>]\n  \
+                     smartkey config set <key> <value> [--dir <path>]\n\n\
+                     Inspect or update [settings], [plugins], [diagnostics], and [app_profiles] keys in rules.toml."
                 );
                 return Ok(());
             }
@@ -524,65 +1071,87 @@ fn cmd_rules(args: &[String]) -> CliResult {
                     .ok_or_else(|| CliError::Usage("--dir requires a path".to_string()))?;
                 dir = PathBuf::from(p);
             }
-            other => {
+            "--json" => {
+                as_json = true;
+            }
+            other if other.starts_with('-') => {
                 return Err(CliError::Usage(format!(
-                    "unknown flag {other} (usage: smartkey rules [--dir <path>])"
+                    "unknown flag {other} (run `smartkey config --help` for usage)"
                 )));
             }
+            other => pos.push(other),
         }
         i += 1;
     }
 
-    let (store, initialized) = load_rule_store_readonly(&dir, Preset::Balanced)?;
-    let c = store.compiled();
-    let st = store.state();
-    let rules_label = if initialized {
-        dir.join("rules.toml").display().to_string()
-    } else {
-        format!("{} (not initialized yet)", dir.join("rules.toml").display())
-    };
-
-    println!("=== SmartKey Personal Rule Brain ===");
-    println!("Rules File           : {rules_label}");
-    if let Some(parse_err) = store.parse_error() {
-        println!("TOML Syntax Warning  : WRITE-LOCKED ({parse_err})");
-    }
-    println!(
-        "Settings             : enabled={} | dialect={:?} | aggressiveness={:?} | undo_window={}ms",
-        c.enabled, c.scorer_config.dialect, c.scorer_config.aggressiveness, c.undo_window_ms
-    );
-    println!("Personal Dict (en)   : {} words", c.personal_dict.len());
-    println!("Blocklist Pairs      : {} pairs", c.blocklist.len());
-    println!(
-        "Learned Corrections  : {} unigram | {} contextual",
-        c.corrections.len(),
-        c.context_corrections.len()
-    );
-    println!("Snippets             : {} triggers", c.snippets.len());
-    println!(
-        "Telex Passthrough    : {} ASCII words",
-        c.telex_passthrough.len()
-    );
-    println!(
-        "Staging Counters     : {} edits | {} context | {} unknowns | {} trouble words",
-        st.staged_corrections.len(),
-        st.staged_context.len(),
-        st.untouched_unknowns.len(),
-        st.trouble_words.len()
-    );
-    if !st.skipped_edits.is_empty() {
-        println!(
-            "\nRecent Guard-Rejected Edits ({}):",
-            st.skipped_edits.len()
-        );
-        for entry in st.skipped_edits.iter().rev().take(10) {
-            println!(
-                "  [{}x] ({}) prev={:?} {:?} -> {:?} ({})",
-                entry.count, entry.lang, entry.prev_word, entry.orig, entry.fixed, entry.reason
-            );
+    let action = pos.first().copied().unwrap_or("list");
+    match action {
+        "list" | "ls" => {
+            if pos.len() > 1 {
+                return Err(CliError::Usage(format!(
+                    "unexpected argument {:?} (usage: smartkey config list [--json] [--dir <path>])",
+                    pos[1]
+                )));
+            }
+            let (store, _) = load_rule_store_readonly(&dir, Preset::Balanced)?;
+            let items = store.list_settings();
+            if as_json {
+                let map: std::collections::BTreeMap<&str, String> = items.into_iter().collect();
+                println!("{}", serde_json::to_string_pretty(&map).unwrap());
+                return Ok(());
+            }
+            for (k, v) in items {
+                println!("{k} = {v}");
+            }
+            Ok(())
         }
+        "get" => {
+            if pos.len() != 2 {
+                return Err(CliError::Usage(
+                    "usage: smartkey config get <key> [--json] [--dir <path>]".to_string(),
+                ));
+            }
+            let key = pos[1];
+            let (store, _) = load_rule_store_readonly(&dir, Preset::Balanced)?;
+            let canon = RuleStore::normalize_setting_key(key).ok_or_else(|| {
+                CliError::Usage(format!(
+                    "unknown config key {key:?} (run `smartkey config list` to see valid keys)"
+                ))
+            })?;
+            let val = store.get_setting(canon).unwrap_or_default();
+            if as_json {
+                let payload = serde_json::json!({ "key": canon, "value": val });
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                println!("{val}");
+            }
+            Ok(())
+        }
+        "set" => {
+            if pos.len() != 3 {
+                return Err(CliError::Usage(
+                    "usage: smartkey config set <key> <value> [--dir <path>]".to_string(),
+                ));
+            }
+            let mut store = load_rule_store_mut(&dir, Preset::Balanced)?;
+            let (canon, effective) = store
+                .set_setting(pos[1], pos[2])
+                .map_err(map_store_err)?;
+            let reloaded = notify_fcitx5_reload();
+            println!(
+                "Updated {canon} = {effective} ({})",
+                if reloaded {
+                    "Fcitx5 reloaded"
+                } else {
+                    "saved to rules.toml; will apply on next focus change"
+                }
+            );
+            Ok(())
+        }
+        other => Err(CliError::Usage(format!(
+            "unknown config subcommand {other:?} (usage: smartkey config [list|get|set])"
+        ))),
     }
-    Ok(())
 }
 
 fn match_kind_slug(kind: MatchKind) -> &'static str {
@@ -659,10 +1228,212 @@ enum LogFilter {
     UnfixedOnly,
 }
 
+impl LogFilter {
+    fn matches(self, ev: &DiagnosticEvent) -> bool {
+        match self {
+            Self::All => true,
+            Self::FixedOnly => matches!(ev, DiagnosticEvent::AutocorrectApplied { .. }),
+            Self::ManualOnly => matches!(
+                ev,
+                DiagnosticEvent::ManualBackspaceFix { .. } | DiagnosticEvent::BackspaceUndo { .. }
+            ),
+            Self::UnfixedOnly => matches!(ev, DiagnosticEvent::UnfixedUnknown { .. }),
+        }
+    }
+}
+
+fn local_midnight_epoch_ms(now_ms: u64, day_offset: i32) -> u64 {
+    let secs: libc::time_t = (now_ms / 1000) as libc::time_t;
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&secs, &mut tm);
+        tm.tm_hour = 0;
+        tm.tm_min = 0;
+        tm.tm_sec = 0;
+        tm.tm_mday = tm.tm_mday.saturating_add(day_offset);
+        tm.tm_isdst = -1;
+        let midnight = libc::mktime(&mut tm);
+        if midnight < 0 {
+            0
+        } else {
+            (midnight as u64) * 1000
+        }
+    }
+}
+
+fn parse_local_date_midnight_ms(ymd: &str) -> Option<u64> {
+    let mut parts = ymd.trim().split('-');
+    let y_str = parts.next()?;
+    let m_str = parts.next()?;
+    let d_str = parts.next()?;
+    if parts.next().is_some() || y_str.len() != 4 || m_str.len() != 2 || d_str.len() != 2 {
+        return None;
+    }
+    let year: i32 = y_str.parse().ok()?;
+    let month: i32 = m_str.parse().ok()?;
+    let day: i32 = d_str.parse().ok()?;
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        tm.tm_year = year - 1900;
+        tm.tm_mon = month - 1;
+        tm.tm_mday = day;
+        tm.tm_hour = 0;
+        tm.tm_min = 0;
+        tm.tm_sec = 0;
+        tm.tm_isdst = -1;
+        let ts = libc::mktime(&mut tm);
+        if ts < 0
+            || tm.tm_year != year - 1900
+            || tm.tm_mon != month - 1
+            || tm.tm_mday != day
+        {
+            return None;
+        }
+        Some((ts as u64) * 1000)
+    }
+}
+
+fn parse_since_spec(raw: &str, now_ms: u64) -> Result<u64, CliError> {
+    let trimmed = raw.trim();
+    if let Some(ms) = parse_local_date_midnight_ms(trimmed) {
+        return Ok(ms);
+    }
+    if trimmed.len() >= 2 {
+        let (num_part, unit_part) = trimmed.split_at(trimmed.len() - 1);
+        if let Ok(n) = num_part.parse::<u64>() {
+            let mult_ms = match unit_part {
+                "s" | "S" => Some(1_000u64),
+                "m" | "M" => Some(60_000u64),
+                "h" | "H" => Some(3_600_000u64),
+                "d" | "D" => Some(86_400_000u64),
+                "w" | "W" => Some(7 * 86_400_000u64),
+                _ => None,
+            };
+            if let Some(unit) = mult_ms {
+                return Ok(now_ms.saturating_sub(n.saturating_mul(unit)));
+            }
+        }
+    }
+    Err(CliError::Usage(format!(
+        "invalid --since {raw:?} (expected relative duration like 30m, 2h, 7d or date YYYY-MM-DD)"
+    )))
+}
+
+fn format_local_timestamp(ts_ms: u64) -> String {
+    let secs: libc::time_t = (ts_ms / 1000) as libc::time_t;
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&secs, &mut tm);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    }
+}
+
+fn format_diagnostic_event_line(ev: &DiagnosticEvent) -> String {
+    match ev {
+        DiagnosticEvent::AutocorrectApplied {
+            typed,
+            applied,
+            kind,
+            total_count,
+        } => {
+            let tag = format!("[{total_count}x]");
+            format!(
+                "{tag:<6} AUTOCORRECT ({}) {typed:?} -> {applied:?}",
+                match_kind_slug(*kind)
+            )
+        }
+        DiagnosticEvent::BackspaceUndo {
+            typed,
+            rejected,
+            resolution,
+            undo_count,
+        } => {
+            let tag = format!("[{undo_count}x]");
+            format!(
+                "{tag:<6} BACKSPACE_UNDO ({}) {typed:?} -> {rejected:?}",
+                undo_resolution_label(resolution)
+            )
+        }
+        DiagnosticEvent::ManualBackspaceFix {
+            orig,
+            fixed,
+            outcome,
+            attempt_count,
+        } => {
+            let tag = format!("[{attempt_count}x]");
+            format!("{tag:<6} MANUAL_FIX ({outcome}) {orig:?} -> {fixed:?}")
+        }
+        DiagnosticEvent::UnfixedUnknown {
+            word,
+            best_candidate,
+            best_score,
+            threshold,
+            total_count,
+        } => {
+            let tag = format!("[{total_count}x]");
+            if let Some(cand) = best_candidate {
+                format!(
+                    "{tag:<6} UNFIXED {word:?} (closest: {cand:?} score={best_score:.2} < thresh={threshold:.2})"
+                )
+            } else {
+                format!("{tag:<6} UNFIXED {word:?} (no valid candidates)")
+            }
+        }
+        DiagnosticEvent::RealWordDeclined {
+            prev,
+            word,
+            candidate,
+            candidate_score,
+            typed_score,
+        } => format!(
+            "{:<6} REAL_WORD_DECLINED prev={prev:?} {word:?} (candidate: {candidate:?} score={candidate_score:.2} vs typed={typed_score:.2})",
+            "[--]"
+        ),
+        DiagnosticEvent::AppBypass {
+            app,
+            profile,
+            reason,
+        } => format!(
+            "{:<6} APP_BYPASS app={app:?} profile={profile:?} reason={reason:?}",
+            "[--]"
+        ),
+        DiagnosticEvent::RuleLearned {
+            rule,
+            stage,
+            previous,
+        } => format!(
+            "{:<6} RULE_LEARNED ({stage}) {rule} (previous={previous:?})",
+            "[--]"
+        ),
+        DiagnosticEvent::WordUnchanged { word, reason } => format!(
+            "{:<6} WORD_UNCHANGED ({}) {word:?}",
+            "[--]",
+            match_kind_slug(*reason)
+        ),
+    }
+}
+
 fn cmd_log(args: &[String]) -> CliResult {
     let mut dir = default_config_dir();
+    let mut log_dir: Option<PathBuf> = None;
     let mut limit: usize = 50;
     let mut clear = false;
+    let mut as_json = false;
+    let mut today = false;
+    let mut yesterday = false;
+    let mut since_raw: Option<String> = None;
+    let mut grep_pat: Option<String> = None;
     let mut filter = LogFilter::All;
 
     let mut i = 0;
@@ -670,8 +1441,10 @@ fn cmd_log(args: &[String]) -> CliResult {
         match args[i].as_str() {
             "--help" | "-h" => {
                 println!(
-                    "USAGE:\n  smartkey log [fixed|manual|unfixed] [-n|--limit <N>] [--clear] [--dir <path>]\n\n\
+                    "USAGE:\n  \
+                     smartkey log [fixed|manual|unfixed] [--today|--yesterday|--since <spec>] [--grep <substr>] [--json] [-n|--limit <N>] [--clear] [--dir <path>] [--log-dir <path>]\n\n\
                      Inspect autocorrect, backspace-undo, manual-fix, and missed-unknown diagnostic events.\n\
+                     `--since` accepts relative windows (`30m`, `2h`, `7d`) or local dates (`YYYY-MM-DD`).\n\
                      Durable JSONL event logs live in: {}",
                     smartkey_core::default_state_log_dir().display()
                 );
@@ -684,6 +1457,13 @@ fn cmd_log(args: &[String]) -> CliResult {
                     .ok_or_else(|| CliError::Usage("--dir requires a path".to_string()))?;
                 dir = PathBuf::from(p);
             }
+            "--log-dir" => {
+                i += 1;
+                let p = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--log-dir requires a path".to_string()))?;
+                log_dir = Some(PathBuf::from(p));
+            }
             "--limit" | "-n" => {
                 i += 1;
                 let raw = args
@@ -692,6 +1472,29 @@ fn cmd_log(args: &[String]) -> CliResult {
                 limit = raw.parse::<usize>().map_err(|_| {
                     CliError::Usage(format!("invalid --limit {raw:?} (expected integer)"))
                 })?;
+            }
+            "--since" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| {
+                    CliError::Usage("--since requires a duration (e.g. 2h, 7d) or YYYY-MM-DD".to_string())
+                })?;
+                since_raw = Some(raw.clone());
+            }
+            "--grep" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--grep requires a pattern".to_string()))?;
+                grep_pat = Some(raw.to_lowercase());
+            }
+            "--today" => {
+                today = true;
+            }
+            "--yesterday" => {
+                yesterday = true;
+            }
+            "--json" => {
+                as_json = true;
             }
             "--clear" => {
                 clear = true;
@@ -707,24 +1510,140 @@ fn cmd_log(args: &[String]) -> CliResult {
             }
             other => {
                 return Err(CliError::Usage(format!(
-                    "unknown argument {other} (usage: smartkey log [fixed|manual|unfixed] [--limit <N>] [--clear] [--dir <path>])"
+                    "unknown argument {other} (run `smartkey log --help` for usage)"
                 )));
             }
         }
         i += 1;
     }
 
+    let time_flags_count = usize::from(today) + usize::from(yesterday) + usize::from(since_raw.is_some());
+    if time_flags_count > 1 {
+        return Err(CliError::Usage(
+            "--today, --yesterday, and --since are mutually exclusive".to_string(),
+        ));
+    }
+
+    let effective_log_dir = log_dir
+        .clone()
+        .unwrap_or_else(smartkey_core::default_state_log_dir);
     let expected_state_path = dir.join("learner_state.json");
+
     if clear {
-        let mut store = load_rule_store_mut(&dir, Preset::Balanced)?;
-        store
-            .clear_diagnostic_logs()
+        if expected_state_path.exists() || dir.join("rules.toml").exists() {
+            let mut store = load_rule_store_mut(&dir, Preset::Balanced)?;
+            store
+                .clear_diagnostic_logs()
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+        }
+        let removed_jsonl = EventLog::clear_all_files(&effective_log_dir)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
         let _ = notify_fcitx5_reload();
         println!(
-            "Cleared SmartKey diagnostic logs at {}",
-            expected_state_path.display()
+            "Cleared SmartKey diagnostic logs ({} and {removed_jsonl} JSONL day file(s) in {})",
+            expected_state_path.display(),
+            effective_log_dir.display()
         );
+        return Ok(());
+    }
+
+    let query_jsonl = today
+        || yesterday
+        || since_raw.is_some()
+        || grep_pat.is_some()
+        || as_json
+        || log_dir.is_some();
+
+    if query_jsonl {
+        let now_ms = current_epoch_ms();
+        let (start_ms, end_ms) = if today {
+            (Some(local_midnight_epoch_ms(now_ms, 0)), None)
+        } else if yesterday {
+            (
+                Some(local_midnight_epoch_ms(now_ms, -1)),
+                Some(local_midnight_epoch_ms(now_ms, 0)),
+            )
+        } else if let Some(ref raw_since) = since_raw {
+            (Some(parse_since_spec(raw_since, now_ms)?), None)
+        } else {
+            (None, None)
+        };
+
+        let records = EventLog::read_records_in_range(&effective_log_dir, start_ms, end_ms)
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+
+        let matching: Vec<&LoggedDiagnosticRecord> = records
+            .iter()
+            .filter(|rec| filter.matches(&rec.event))
+            .filter(|rec| {
+                let Some(ref pat) = grep_pat else {
+                    return true;
+                };
+                rec.raw_line.to_lowercase().contains(pat)
+                    || format_diagnostic_event_line(&rec.event)
+                        .to_lowercase()
+                        .contains(pat)
+            })
+            .collect();
+
+        // Fallback when bare `smartkey log --json` is called on a machine with ring-buffer events
+        // in `learner_state.json` before any JSONL file was written.
+        if matching.is_empty()
+            && as_json
+            && !today
+            && !yesterday
+            && since_raw.is_none()
+            && grep_pat.is_none()
+            && log_dir.is_none()
+            && expected_state_path.exists()
+        {
+            let (store, _) = load_rule_store_readonly(&dir, Preset::Balanced)?;
+            let ring: Vec<&DiagnosticEvent> = store
+                .state()
+                .recent_events
+                .iter()
+                .filter(|ev| filter.matches(ev))
+                .collect();
+            let start = ring.len().saturating_sub(limit);
+            for ev in &ring[start..] {
+                println!("{}", serde_json::to_string(ev).unwrap());
+            }
+            return Ok(());
+        }
+
+        let total = matching.len();
+        let start = total.saturating_sub(limit);
+        let shown = &matching[start..];
+
+        if as_json {
+            for rec in shown {
+                println!("{}", rec.raw_line);
+            }
+            return Ok(());
+        }
+
+        println!("=== SmartKey Event Log ({:?}) ===", filter);
+        println!("Log Directory        : {}", effective_log_dir.display());
+        println!(
+            "Matching Events      : {} total (showing {}, oldest -> newest)",
+            total,
+            shown.len()
+        );
+        if shown.is_empty() {
+            println!("\n(no matching events in selected window)");
+            return Ok(());
+        }
+        println!();
+        for rec in shown {
+            let ts_str = format_local_timestamp(rec.ts_ms);
+            let app_tag = rec.app.as_deref().unwrap_or("-");
+            println!(
+                "  {ts_str}  ({:<4} {:<14})  {}",
+                rec.lang,
+                app_tag,
+                format_diagnostic_event_line(&rec.event)
+            );
+        }
         return Ok(());
     }
 
@@ -750,6 +1669,7 @@ fn cmd_log(args: &[String]) -> CliResult {
 
     println!("=== SmartKey Diagnostic Log ({:?}) ===", filter);
     println!("State File           : {state_label}");
+    println!("JSONL Event Log Dir  : {}", effective_log_dir.display());
     println!(
         "Autocorrects Applied : {} total ({} unique pairs)",
         total_applied,
@@ -794,15 +1714,7 @@ fn cmd_log(args: &[String]) -> CliResult {
     let matching_events: Vec<&DiagnosticEvent> = st
         .recent_events
         .iter()
-        .filter(|ev| match filter {
-            LogFilter::All => true,
-            LogFilter::FixedOnly => matches!(ev, DiagnosticEvent::AutocorrectApplied { .. }),
-            LogFilter::ManualOnly => matches!(
-                ev,
-                DiagnosticEvent::ManualBackspaceFix { .. } | DiagnosticEvent::BackspaceUndo { .. }
-            ),
-            LogFilter::UnfixedOnly => matches!(ev, DiagnosticEvent::UnfixedUnknown { .. }),
-        })
+        .filter(|ev| filter.matches(ev))
         .collect();
 
     if matching_events.is_empty() {
@@ -819,96 +1731,7 @@ fn cmd_log(args: &[String]) -> CliResult {
         total_events
     );
     for ev in shown {
-        match ev {
-            DiagnosticEvent::AutocorrectApplied {
-                typed,
-                applied,
-                kind,
-                total_count,
-            } => {
-                let tag = format!("[{total_count}x]");
-                println!(
-                    "  {tag:<6} AUTOCORRECT ({}) {typed:?} -> {applied:?}",
-                    match_kind_slug(*kind)
-                );
-            }
-            DiagnosticEvent::BackspaceUndo {
-                typed,
-                rejected,
-                resolution,
-                undo_count,
-            } => {
-                let tag = format!("[{undo_count}x]");
-                println!(
-                    "  {tag:<6} BACKSPACE_UNDO ({}) {typed:?} -> {rejected:?}",
-                    undo_resolution_label(resolution)
-                );
-            }
-            DiagnosticEvent::ManualBackspaceFix {
-                orig,
-                fixed,
-                outcome,
-                attempt_count,
-            } => {
-                let tag = format!("[{attempt_count}x]");
-                println!("  {tag:<6} MANUAL_FIX ({outcome}) {orig:?} -> {fixed:?}");
-            }
-            DiagnosticEvent::UnfixedUnknown {
-                word,
-                best_candidate,
-                best_score,
-                threshold,
-                total_count,
-            } => {
-                let tag = format!("[{total_count}x]");
-                if let Some(cand) = best_candidate {
-                    println!(
-                        "  {tag:<6} UNFIXED {word:?} (closest: {cand:?} score={best_score:.2} < thresh={threshold:.2})"
-                    );
-                } else {
-                    println!("  {tag:<6} UNFIXED {word:?} (no valid candidates)");
-                }
-            }
-            DiagnosticEvent::RealWordDeclined {
-                prev,
-                word,
-                candidate,
-                candidate_score,
-                typed_score,
-            } => {
-                println!(
-                    "  {:<6} REAL_WORD_DECLINED prev={prev:?} {word:?} (candidate: {candidate:?} score={candidate_score:.2} vs typed={typed_score:.2})",
-                    "[--]"
-                );
-            }
-            DiagnosticEvent::AppBypass {
-                app,
-                profile,
-                reason,
-            } => {
-                println!(
-                    "  {:<6} APP_BYPASS app={app:?} profile={profile:?} reason={reason:?}",
-                    "[--]"
-                );
-            }
-            DiagnosticEvent::RuleLearned {
-                rule,
-                stage,
-                previous,
-            } => {
-                println!(
-                    "  {:<6} RULE_LEARNED ({stage}) {rule} (previous={previous:?})",
-                    "[--]"
-                );
-            }
-            DiagnosticEvent::WordUnchanged { word, reason } => {
-                println!(
-                    "  {:<6} WORD_UNCHANGED ({}) {word:?}",
-                    "[--]",
-                    match_kind_slug(*reason)
-                );
-            }
-        }
+        println!("  {}", format_diagnostic_event_line(ev));
     }
 
     Ok(())
@@ -1664,8 +2487,10 @@ COMMANDS:
   disable|off [--dir <path>]                             Disable SmartKey and reload Fcitx5
   toggle [--dir <path>]                                  Toggle SmartKey on/off (ideal for WM keybinds)
   reload                                                 Reload configuration & dictionary packs in Fcitx5
-  log [fixed|manual|unfixed] [-n <N>] [--clear] [--dir]  Show autocorrects, undos & missed unknown words
-  rules [--dir <path>]                                   Show personal dictionary, blocklist & learned rules
+  log [fixed|manual|unfixed] [--today|--yesterday|--since <spec>] [--grep <p>] [--json] [-n <N>] [--clear]
+                                                         Query diagnostic counters & durable JSONL event logs
+  rules [list|add|remove] ... [--json] [--dir <path>]    Inspect or edit personal words, rules, snippets & blocks
+  config [list|get <key>|set <key> <val>] [--json]       Inspect or update settings & diagnostics in rules.toml
   explain [--json] [--lang en|vi] [--prev <w>] [--punct <c>] [--dialect mixed|us|gb] [--sentence-start] [--dir <path>] <token>
                                                          Explain scoring, proper nouns & candidate ranking
   plugin|plugins [list|enable|disable|toggle] [vi-lotus] [--dir <path>]
@@ -1692,6 +2517,7 @@ fn run_cli(args: &[String]) -> CliResult {
         Some("reload") => cmd_reload(&args[1..]),
         Some("init") => cmd_init(&args[1..]),
         Some("rules") => cmd_rules(&args[1..]),
+        Some("config" | "cfg") => cmd_config(&args[1..]),
         Some("log") => cmd_log(&args[1..]),
         Some("explain") => cmd_explain(&args[1..]),
         Some("plugin" | "plugins") => cmd_plugin(&args[1..]),
@@ -1734,6 +2560,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smartkey_core::DiagnosticsConfig;
 
     fn vec_args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_string()).collect()
@@ -1777,13 +2604,13 @@ mod tests {
 
         // Per-command `--help` exits Ok(())
         for sub in [
-            "status", "enable", "reload", "init", "rules", "log", "explain", "plugin", "dict",
-            "repl",
+            "status", "enable", "reload", "init", "rules", "config", "log", "explain", "plugin",
+            "dict", "repl",
         ] {
             assert_eq!(run_cli(&vec_args(&[sub, "--help"])), Ok(()));
         }
 
-        // Read-only `status` / `rules` / `log` must NOT create config directories when missing
+        // Read-only `status` / `rules` / `config` / `log` must NOT create config directories when missing
         let uninit_dir = env::temp_dir().join(format!(
             "smartkey_cli_readonly_{}",
             std::process::id()
@@ -1792,10 +2619,342 @@ mod tests {
         let dir_str = uninit_dir.to_str().unwrap();
         assert_eq!(run_cli(&vec_args(&["status", "--dir", dir_str])), Ok(()));
         assert_eq!(run_cli(&vec_args(&["rules", "--dir", dir_str])), Ok(()));
+        assert_eq!(run_cli(&vec_args(&["config", "--dir", dir_str])), Ok(()));
         assert_eq!(run_cli(&vec_args(&["log", "--dir", dir_str])), Ok(()));
         assert!(
             !uninit_dir.exists(),
             "read-only inspection commands must not create config dir on disk"
         );
+    }
+
+    #[test]
+    fn cli_rules_crud_and_config_preserve_comments_and_respect_parse_lock() {
+        let dir = env::temp_dir().join(format!(
+            "smartkey_cli_crud_{}_{}",
+            std::process::id(),
+            current_epoch_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rules_path = dir.join("rules.toml");
+        fs::write(
+            &rules_path,
+            "# Custom user header comment\n[settings]\nenabled = true\n",
+        )
+        .unwrap();
+        let d = dir.to_str().unwrap();
+
+        // Add & remove across all 6 rule collections
+        assert_eq!(
+            run_cli(&vec_args(&["rules", "add", "fix", "teh", "the", "--dir", d])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules", "add", "context", "in", "teh", "the", "--dir", d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules",
+                "add",
+                "snippet",
+                "addr;",
+                "123 Main St",
+                "--dir",
+                d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules", "add", "word", "FastAPI", "--dir", d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules", "add", "word", "bánh", "--lang", "vi", "--dir", d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules", "add", "block", "form", "from", "--dir", d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules",
+                "add",
+                "passthrough",
+                "was",
+                "--dir",
+                d
+            ])),
+            Ok(())
+        );
+
+        // Config set/get
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "config",
+                "set",
+                "aggressiveness",
+                "conservative",
+                "--dir",
+                d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "config",
+                "set",
+                "diagnostics.keep_days",
+                "30",
+                "--dir",
+                d
+            ])),
+            Ok(())
+        );
+        assert!(matches!(
+            run_cli(&vec_args(&[
+                "config",
+                "set",
+                "aggressiveness",
+                "ultra",
+                "--dir",
+                d
+            ])),
+            Err(CliError::Usage(_))
+        ));
+
+        let (store, _) = load_rule_store_readonly(&dir, Preset::Balanced).unwrap();
+        assert_eq!(
+            store.compiled().corrections.get("teh").map(String::as_str),
+            Some("the")
+        );
+        assert_eq!(
+            store
+                .compiled()
+                .context_corrections
+                .get(&("in".to_string(), "teh".to_string()))
+                .map(String::as_str),
+            Some("the")
+        );
+        assert_eq!(
+            store.compiled().snippets.get("addr;").map(String::as_str),
+            Some("123 Main St")
+        );
+        assert_eq!(
+            store
+                .compiled()
+                .personal_dict_canonical
+                .get("fastapi")
+                .map(String::as_str),
+            Some("FastAPI")
+        );
+        assert!(store.is_lang_only_personal_word("vi", "bánh"));
+        assert!(store
+            .compiled()
+            .blocklist
+            .contains(&("form".to_string(), "from".to_string())));
+        assert!(store.compiled().telex_passthrough.contains("was"));
+        assert_eq!(
+            store.get_setting("aggressiveness").as_deref(),
+            Some("conservative")
+        );
+        assert_eq!(
+            store.get_setting("diagnostics.keep_days").as_deref(),
+            Some("30")
+        );
+
+        let raw_after_adds = fs::read_to_string(&rules_path).unwrap();
+        assert!(
+            raw_after_adds.contains("# Custom user header comment"),
+            "CLI CRUD and config set must preserve user TOML comments"
+        );
+        assert!(
+            !raw_after_adds.contains("# learned 2x"),
+            "explicit CLI rules must not stamp machine-learned provenance comments"
+        );
+
+        // Remove rules and verify missing entry returns Runtime error
+        assert_eq!(
+            run_cli(&vec_args(&["rules", "remove", "fix", "teh", "--dir", d])),
+            Ok(())
+        );
+        assert!(matches!(
+            run_cli(&vec_args(&["rules", "remove", "fix", "teh", "--dir", d])),
+            Err(CliError::Runtime(_))
+        ));
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules", "remove", "context", "in", "teh", "--dir", d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules", "remove", "snippet", "addr;", "--dir", d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules", "remove", "word", "FastAPI", "--dir", d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules", "remove", "block", "form", "from", "--dir", d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules",
+                "remove",
+                "passthrough",
+                "was",
+                "--dir",
+                d
+            ])),
+            Ok(())
+        );
+
+        // Corrupting `rules.toml` must lock writes and fail CLI mutations with Runtime error
+        fs::write(&rules_path, "[settings\nenabled = false\n").unwrap();
+        assert!(matches!(
+            run_cli(&vec_args(&[
+                "rules", "add", "word", "Hyprland", "--dir", d
+            ])),
+            Err(CliError::Runtime(_))
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_log_jsonl_utc_boundary_queries_and_clear() {
+        let base = env::temp_dir().join(format!(
+            "smartkey_cli_jsonl_{}_{}",
+            std::process::id(),
+            current_epoch_ms()
+        ));
+        let cfg_dir = base.join("cfg");
+        let log_dir = base.join("logs");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+
+        let mut elog = EventLog::new();
+        elog.set_dir(Some(log_dir.clone()));
+        elog.set_app(Some("firefox"));
+        let diag = DiagnosticsConfig::default();
+
+        let now = current_epoch_ms();
+        let today_local_midnight = local_midnight_epoch_ms(now, 0);
+        let yesterday_local_midnight = local_midnight_epoch_ms(now, -1);
+
+        // Stamp an event 5 seconds after local midnight today (in UTC+ timezones like +07:00,
+        // this lands in yesterday's UTC `events-YYYY-MM-DD.jsonl` file!).
+        elog.record_at(
+            &diag,
+            "en",
+            &DiagnosticEvent::AutocorrectApplied {
+                typed: "teh".to_string(),
+                applied: "the".to_string(),
+                kind: MatchKind::KnownTypoDict,
+                total_count: 1,
+            },
+            today_local_midnight + 5_000,
+        );
+        // Stamp a second event in yesterday's local window.
+        elog.record_at(
+            &diag,
+            "vi",
+            &DiagnosticEvent::AutocorrectApplied {
+                typed: "nuowcss".to_string(),
+                applied: "nước".to_string(),
+                kind: MatchKind::VietnameseTelexRescue,
+                total_count: 1,
+            },
+            yesterday_local_midnight + 3_600_000,
+        );
+
+        let today_records =
+            EventLog::read_records_in_range(&log_dir, Some(today_local_midnight), None).unwrap();
+        assert_eq!(
+            today_records.len(),
+            1,
+            "--today range must capture events right after local midnight even when stored in prior UTC day file"
+        );
+        assert_eq!(today_records[0].app.as_deref(), Some("firefox"));
+
+        let yesterday_records = EventLog::read_records_in_range(
+            &log_dir,
+            Some(yesterday_local_midnight),
+            Some(today_local_midnight),
+        )
+        .unwrap();
+        assert_eq!(yesterday_records.len(), 1);
+        assert_eq!(yesterday_records[0].lang, "vi");
+
+        let cfg_str = cfg_dir.to_str().unwrap();
+        let log_str = log_dir.to_str().unwrap();
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "log",
+                "--today",
+                "--grep",
+                "teh",
+                "--json",
+                "--dir",
+                cfg_str,
+                "--log-dir",
+                log_str
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "log",
+                "--since",
+                "48h",
+                "--dir",
+                cfg_str,
+                "--log-dir",
+                log_str
+            ])),
+            Ok(())
+        );
+        assert!(matches!(
+            run_cli(&vec_args(&["log", "--today", "--yesterday"])),
+            Err(CliError::Usage(_))
+        ));
+
+        // `--clear` must delete durable `events-*.jsonl` files too!
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "log",
+                "--clear",
+                "--dir",
+                cfg_str,
+                "--log-dir",
+                log_str
+            ])),
+            Ok(())
+        );
+        let remaining = EventLog::read_records_in_range(&log_dir, None, None).unwrap();
+        assert!(
+            remaining.is_empty(),
+            "`smartkey log --clear` must delete durable JSONL event files"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
