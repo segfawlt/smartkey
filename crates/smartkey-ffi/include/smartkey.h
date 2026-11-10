@@ -36,6 +36,7 @@ typedef struct SmartKeySessionHandle SmartKeySessionHandle;
 #define SMARTKEY_PROFILE_BROWSER 1
 #define SMARTKEY_PROFILE_CHAT    2
 #define SMARTKEY_PROFILE_PROSE   3
+#define SMARTKEY_PROFILE_NONE    255
 
 /* Key kinds for `smartkey_session_process_key` */
 #define SMARTKEY_KEY_CHAR           0
@@ -101,6 +102,16 @@ void smartkey_engine_log_app_event(
     const char* reason_utf8
 );
 
+/*
+ * Returns a `SMARTKEY_PROFILE_*` override from `[app_profiles]` in `rules.toml`
+ * (including `unknown_app_policy` when `app_utf8` is `""` or `NULL`), or
+ * `SMARTKEY_PROFILE_NONE` (`255`) when no user override matches.
+ */
+uint8_t smartkey_engine_classify_app_override(
+    const SmartKeyEngineHandle* engine,
+    const char* app_utf8
+);
+
 /* Desktop keystroke stream (`fcitx5-lotus` / X11 / Wayland) */
 bool smartkey_session_process_key(
     SmartKeySessionHandle* session,
@@ -111,7 +122,28 @@ bool smartkey_session_process_key(
     SmartKeyAction* out_action
 );
 
-/* Bilingual `fcitx5-lotus` queries & `telex_passthrough` learning */
+void smartkey_session_reconcile_surrounding(
+    SmartKeySessionHandle* session,
+    SmartKeyEngineHandle* engine,
+    const char* surrounding_utf8,
+    uint32_t cursor_chars,
+    uint64_t now_ms
+);
+
+/* Bilingual `fcitx5-lotus` queries, commit reconciliation & `telex_passthrough` learning */
+void smartkey_session_set_lotus_composing(
+    SmartKeySessionHandle* session,
+    bool composing
+);
+
+bool smartkey_session_on_lotus_commit(
+    SmartKeySessionHandle* session,
+    SmartKeyEngineHandle* engine,
+    uint32_t boundary_codepoint,
+    const char* committed_utf8,
+    uint64_t now_ms,
+    SmartKeyAction* out_action
+);
 bool smartkey_engine_is_vi_lotus_enabled(
     const SmartKeyEngineHandle* engine
 );

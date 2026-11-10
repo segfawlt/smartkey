@@ -74,6 +74,8 @@ struct TraceFile {
 #[derive(Debug, Deserialize)]
 struct TraceCase {
     name: String,
+    #[serde(default)]
+    lang: Option<String>,
     steps: Vec<TraceStep>,
 }
 
@@ -81,6 +83,63 @@ struct TraceCase {
 struct TraceStep {
     keys: String,
     expect_buf: String,
+}
+
+fn feed_lotus_keys(
+    session: &mut SmartKeySession,
+    engine: &mut SmartKeyEngine,
+    client_buf: &mut String,
+    cur_word_keys: &mut String,
+    spec: &str,
+) {
+    let opts = engine.store().lotus_options();
+    for key in parse_key_stream(spec) {
+        match key {
+            KeyInput::Char(ch) if !matches!(ch, ' ' | ',' | '.' | '!' | '?' | ';' | ':') => {
+                cur_word_keys.push(ch);
+                let out = session.process_key(engine, KeyInput::Char(ch), 100);
+                assert_eq!(out.action, SessionAction::PassThrough);
+            }
+            KeyInput::Char(ch) => {
+                if !cur_word_keys.is_empty() {
+                    let sim = smartkey_core::simulate_lotus_word_with_options(cur_word_keys, opts);
+                    cur_word_keys.clear();
+                    if sim.needs_uinput_restore_on_break {
+                        // Real Lotus filters the boundary key, backspaces runic preedit, and commits
+                        // `committed_at_break + ch` via `CommitStringEvent`:
+                        client_buf.push_str(&sim.committed_at_break);
+                        client_buf.push(ch);
+                        let mut committed = sim.committed_at_break.clone();
+                        committed.push(ch);
+                        let out = session.on_lotus_boundary_commit(engine, ch, &committed, 120);
+                        if let SessionAction::Replace {
+                            delete_chars,
+                            insert,
+                        } = &out.action
+                        {
+                            for _ in 0..*delete_chars {
+                                client_buf.pop();
+                            }
+                            client_buf.push_str(insert);
+                        }
+                        continue;
+                    }
+                    if sim.is_composed_vietnamese {
+                        client_buf.push_str(&sim.committed_at_break);
+                    } else {
+                        client_buf.push_str(&sim.preedit_before_break);
+                    }
+                }
+                let out = session.process_key(engine, KeyInput::Char(ch), 120);
+                apply_key_to_buffer(client_buf, KeyInput::Char(ch), &out.action);
+            }
+            other => {
+                cur_word_keys.clear();
+                let out = session.process_key(engine, other, 120);
+                apply_key_to_buffer(client_buf, other, &out.action);
+            }
+        }
+    }
 }
 
 #[test]
@@ -92,10 +151,25 @@ fn golden_learning_traces_pass() {
     for case in &parsed.trace {
         let mut engine = SmartKeyEngine::in_memory_default().expect("bundled engine");
         let mut session = SmartKeySession::new();
+        let is_vi = case.lang.as_deref() == Some("vi");
+        if is_vi {
+            session.set_lang(LangId::vi());
+        }
         let mut buf = String::new();
+        let mut cur_word_keys = String::new();
 
         for (idx, step) in case.steps.iter().enumerate() {
-            feed_keys(&mut session, &mut engine, &mut buf, &step.keys);
+            if is_vi {
+                feed_lotus_keys(
+                    &mut session,
+                    &mut engine,
+                    &mut buf,
+                    &mut cur_word_keys,
+                    &step.keys,
+                );
+            } else {
+                feed_keys(&mut session, &mut engine, &mut buf, &step.keys);
+            }
             assert_eq!(
                 buf,
                 step.expect_buf,

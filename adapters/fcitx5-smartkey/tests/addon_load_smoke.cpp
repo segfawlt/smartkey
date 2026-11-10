@@ -48,6 +48,9 @@ void verifyProfileClassification() {
     assert(classifyProgramName("com.vscodium.codium") == SMARTKEY_PROFILE_BYPASS);
     assert(classifyProgramName("com.sublimetext.three") == SMARTKEY_PROFILE_BYPASS);
     assert(classifyProgramName("com.jetbrains.rustrover") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("com.jetbrains.DataGrip") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("org.jetbrains.PhpStorm") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("com.google.AndroidStudio") == SMARTKEY_PROFILE_BYPASS);
     assert(classifyProgramName("jetbrains-idea") == SMARTKEY_PROFILE_BYPASS);
 
     // Browsers (classic & reverse-DNS) -> BROWSER
@@ -56,6 +59,8 @@ void verifyProfileClassification() {
     assert(classifyProgramName("io.github.zen_browser.zen") == SMARTKEY_PROFILE_BROWSER);
     assert(classifyProgramName("org.mozilla.firefox") == SMARTKEY_PROFILE_BROWSER);
     assert(classifyProgramName("com.brave.Browser") == SMARTKEY_PROFILE_BROWSER);
+    assert(classifyProgramName("com.microsoft.Edge") == SMARTKEY_PROFILE_BROWSER);
+    assert(classifyProgramName("com.opera.Opera") == SMARTKEY_PROFILE_BROWSER);
 
     // Chat apps (classic & reverse-DNS) -> CHAT
     assert(classifyProgramName("org.telegram.desktop") == SMARTKEY_PROFILE_CHAT);
@@ -80,6 +85,35 @@ void verifyProfileClassification() {
     assert(!isSmartKeyBoundaryChar('a'));
     assert(!isSmartKeyBoundaryChar('t'));
     assert(!isSmartKeyBoundaryChar('s'));
+
+    // Telex burst trigger classification & burst state machine
+    using fcitx::smartkey::isTelexBurstTriggerChar;
+    using fcitx::smartkey::LotusBridgeTracker;
+    assert(isTelexBurstTriggerChar('s'));
+    assert(isTelexBurstTriggerChar('w'));
+    assert(isTelexBurstTriggerChar('e'));
+    assert(isTelexBurstTriggerChar('['));
+    assert(!isTelexBurstTriggerChar('t'));
+    assert(!isTelexBurstTriggerChar('n'));
+    assert(!isTelexBurstTriggerChar('g'));
+
+    LotusBridgeTracker st{};
+    assert(!st.isInBurst(1000));
+    st.armBurst(1000);
+    // Must stay armed past Lotus's 200ms `kReplacementAckSlackMs`
+    assert(st.isInBurst(1250));
+    assert(!st.isInBurst(1400));
+    st.rearmBurstEcho(1250);
+    assert(st.isInBurst(1500));
+
+    st.setSuppressPost(true);
+    assert(st.takeSuppressPost());
+    assert(!st.takeSuppressPost());
+
+    st.setBoundary(' ');
+    assert(st.hasPendingBoundary);
+    assert(st.takeBoundary() == ' ');
+    assert(!st.hasPendingBoundary);
 }
 
 } // namespace

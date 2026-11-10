@@ -34,12 +34,16 @@ fn type_sequence(
     let mut actions = Vec::new();
     let mut now_ms = 1_000u64;
 
-    // Simulate how Lotus updates the screen during word typing + how SmartKey's PostInputMethod
-    // replacement acts at the boundary:
+    // Simulate how real `fcitx5-lotus` updates the screen during word typing:
+    // - When `sim.needs_uinput_restore_on_break` is true (`"nuowcss "` -> `"nươc"` on screen,
+    //   `mustFallbackToEnglish()` triggers on break), real Lotus filters the boundary key (`PostInputMethod`
+    //   never runs for the key event!) and instead commits the restored text via `CommitStringEvent`.
+    // - Otherwise Lotus forwards the boundary key to `PostInputMethod`.
     let mut cur_word_keys = String::new();
+    let opts = engine.store().lotus_options();
     for ch in seq.chars() {
         now_ms += 40;
-        let is_boundary = matches!(ch, ' ' | ',' | '.' | '!' | '?');
+        let is_boundary = matches!(ch, ' ' | ',' | '.' | '!' | '?' | ';' | ':');
         if !is_boundary {
             cur_word_keys.push(ch);
             let out = session.process_key(engine, KeyInput::Char(ch), now_ms);
@@ -49,18 +53,51 @@ fn type_sequence(
                 "non-boundary char {ch:?} must never be filtered in PreInputMethod"
             );
             actions.push(out.action);
-        } else {
-            // Right before the boundary key, Lotus's `oldPreBuffer_` has put `preedit_before_break`
-            // on screen (or `committed_at_break` if Lotus composed a valid Vietnamese word):
-            if !cur_word_keys.is_empty() {
-                let sim = smartkey_core::simulate_lotus_word(&cur_word_keys);
+        } else if !cur_word_keys.is_empty() {
+            let sim = smartkey_core::simulate_lotus_word_with_options(&cur_word_keys, opts);
+            cur_word_keys.clear();
+            if sim.needs_uinput_restore_on_break {
+                lotus_screen_buf.push_str(&sim.committed_at_break);
+                lotus_screen_buf.push(ch);
+                // Real Lotus `compareAndSplitU32(oldPreBuffer_, commitStr)` commits only the suffix
+                // after the shared prefix (`"nươc"` vs `"nuowcss "` -> commits `"uowcss "`):
+                let common_prefix = sim
+                    .preedit_before_break
+                    .chars()
+                    .zip(sim.committed_at_break.chars())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a.len_utf8())
+                    .sum::<usize>();
+                let mut diff_added = sim.committed_at_break[common_prefix..].to_string();
+                diff_added.push(ch);
+                let out = session.on_lotus_boundary_commit(engine, ch, &diff_added, now_ms);
+                if let SessionAction::Replace {
+                    delete_chars,
+                    insert,
+                } = &out.action
+                {
+                    assert!(
+                        *delete_chars <= lotus_screen_buf.chars().count(),
+                        "delete_chars={delete_chars} > screen len in {lotus_screen_buf:?}"
+                    );
+                    for _ in 0..*delete_chars {
+                        lotus_screen_buf.pop();
+                    }
+                    lotus_screen_buf.push_str(insert);
+                }
+                actions.push(out.action);
+            } else {
                 if sim.is_composed_vietnamese {
                     lotus_screen_buf.push_str(&sim.committed_at_break);
                 } else {
                     lotus_screen_buf.push_str(&sim.preedit_before_break);
                 }
-                cur_word_keys.clear();
+                let key = KeyInput::Char(ch);
+                let out = session.process_key(engine, key, now_ms);
+                apply_key_to_buffer(&mut lotus_screen_buf, key, &out.action);
+                actions.push(out.action);
             }
+        } else {
             let key = KeyInput::Char(ch);
             let out = session.process_key(engine, key, now_ms);
             apply_key_to_buffer(&mut lotus_screen_buf, key, &out.action);
@@ -250,4 +287,84 @@ fn test_vi_lotus_shorthand_expansion_and_slang_shielding() {
         "ib rep onl uk uhm bt nc khum okela ",
     );
     assert_eq!(buf4, "ib rep onl uk uhm bt nc khum okela ");
+}
+
+#[test]
+fn test_vi_lotus_host_contract_filtered_boundaries_macros_off_mode_and_options() {
+    let (mut engine, mut session) = make_vi_engine_and_session();
+
+    // 1. Filtered break-restore rescue (`nuowcss ` -> runic `"nươc"` -> Lotus filters Space and
+    //    commits `"uowcss "` via CommitStringEvent -> SmartKey deletes 8 chars and commits `"nước "`)
+    //    plus `ddFreeStyle` `đ`-word rescue (`ddwungs ` -> `"đwungs"` stays unfiltered -> `"đứng "`):
+    let (mut buf, _) = type_sequence(&mut session, &mut engine, "nuowcss ruowujj ddwungs ");
+    assert_eq!(buf, "nước rượu đứng ");
+
+    // Trailing dot lookahead across filtered Lotus restore (`nuowcss. ` -> `"nước. "` while `nuowcss.com ` stays untouched):
+    let (buf_dot, _) = type_sequence(&mut session, &mut engine, "nuowcss. nuowcss.com ");
+    assert_eq!(buf_dot, "nước. nuowcss.com ");
+
+    // 2. Lotus macro expansion (`ko` -> user macro `"Kính gửi"`): `CommitStringEvent` text is not
+    //    a suffix of `"ko "`, so SmartKey leaves the macro output untouched instead of corrupting it!
+    for ch in "ko".chars() {
+        session.process_key(&mut engine, KeyInput::Char(ch), 3_000);
+    }
+    let macro_out = session.on_lotus_boundary_commit(&mut engine, ' ', "Kính gửi ", 3_020);
+    assert_eq!(macro_out.action, SessionAction::PassThrough);
+
+    // 3. Lotus `Off`/`Default` mode (`lotus_composing = false`): even when `"of"` is explicitly in
+    //    `telex_passthrough` and `"issue"` has doubled Telex keys, SmartKey knows Lotus did NOT
+    //    compose `"ò"` or `"isue"` on screen, preventing `"oof "` / `"iissue "` corruption!
+    engine.store_mut().add_telex_passthrough("of");
+    session.set_lotus_composing(false);
+    let mut off_buf = String::new();
+    for ch in "of issue teh ".chars() {
+        let key = KeyInput::Char(ch);
+        let out = session.process_key(&mut engine, key, 4_000);
+        apply_key_to_buffer(&mut off_buf, key, &out.action);
+    }
+    assert_eq!(off_buf, "of issue the ");
+    session.set_lotus_composing(true);
+
+    // 4. English-Sentence Momentum Shield + `1x BackSpace` revert back to Vietnamese rune:
+    let (mut mom_buf, _) = type_sequence(&mut session, &mut engine, "it is ");
+    assert_eq!(mom_buf, "it is ");
+    let bs = session.process_key(&mut engine, KeyInput::BackSpace, 4_050);
+    apply_key_to_buffer(&mut mom_buf, KeyInput::BackSpace, &bs.action);
+    assert_eq!(mom_buf, "it í");
+    let _ = session.reset(&mut engine);
+
+    // 5. `W2U=Everywhere` parsed from `lotus.conf`: `"wa "` composes valid Vietnamese `"ưa "`!
+    let opts = smartkey_core::LotusOptions::from_fcitx5_conf_str(
+        "Mode=\"Uinput (Super Smooth)\"\nW2U=Everywhere\nModernStyle=True\n",
+    );
+    assert_eq!(opts.w2u, smartkey_core::W2uMode::Everywhere);
+    engine.store_mut().set_lotus_options(opts);
+    let (w2u_buf, _) = type_sequence(&mut session, &mut engine, "wa ");
+    assert_eq!(w2u_buf, "ưa ");
+
+    // 6. Global English `personal_dict` does NOT block Vietnamese Telex rescue, whereas `[lang.vi]` does:
+    engine
+        .store_mut()
+        .add_personal_word(&LangId::en(), "ttieengs");
+    let (en_pd_buf, _) = type_sequence(&mut session, &mut engine, "ttieengs ");
+    assert_eq!(en_pd_buf, "tiếng ");
+    engine
+        .store_mut()
+        .add_personal_word(&LangId::vi(), "ttieengs");
+    let (vi_pd_buf, _) = type_sequence(&mut session, &mut engine, "ttieengs ");
+    assert_eq!(vi_pd_buf, "ttieengs ");
+
+    // 7. `SurroundingText` mouse-click cursor reconciliation resets stale `en` composing buffer:
+    session.set_lang(LangId::en());
+    let _ = session.reset(&mut engine);
+    for ch in "chag".chars() {
+        session.process_key(&mut engine, KeyInput::Char(ch), 5_000);
+    }
+    // Within 80ms (key-echo lag): ignored
+    session.reconcile_surrounding(&mut engine, "hello world", 5, 5_040);
+    // After 80ms at an unrelated cursor location ("hello| world"): resets stale "chag" buffer!
+    session.reconcile_surrounding(&mut engine, "hello world", 5, 5_200);
+    let sp = session.process_key(&mut engine, KeyInput::Char(' '), 5_220);
+    assert_eq!(sp.action, SessionAction::PassThrough);
+    let _ = &mut buf;
 }

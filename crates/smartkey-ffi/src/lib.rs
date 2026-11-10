@@ -19,6 +19,7 @@ pub const SMARTKEY_PROFILE_BYPASS: u8 = 0;
 pub const SMARTKEY_PROFILE_BROWSER: u8 = 1;
 pub const SMARTKEY_PROFILE_CHAT: u8 = 2;
 pub const SMARTKEY_PROFILE_PROSE: u8 = 3;
+pub const SMARTKEY_PROFILE_NONE: u8 = 255;
 
 pub const SMARTKEY_KEY_CHAR: u8 = 0;
 pub const SMARTKEY_KEY_BACKSPACE: u8 = 1;
@@ -82,6 +83,15 @@ fn decode_profile(profile: u8) -> AppProfile {
         SMARTKEY_PROFILE_BROWSER => AppProfile::Browser,
         SMARTKEY_PROFILE_CHAT => AppProfile::Chat,
         _ => AppProfile::Prose,
+    }
+}
+
+fn encode_profile(profile: AppProfile) -> u8 {
+    match profile {
+        AppProfile::Bypass => SMARTKEY_PROFILE_BYPASS,
+        AppProfile::Browser => SMARTKEY_PROFILE_BROWSER,
+        AppProfile::Chat => SMARTKEY_PROFILE_CHAT,
+        AppProfile::Prose => SMARTKEY_PROFILE_PROSE,
     }
 }
 
@@ -345,6 +355,103 @@ pub unsafe extern "C" fn smartkey_engine_log_app_event(
         let prof = decode_profile(profile);
         eng.store_mut().log_app_bypass(app, prof, reason);
     });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_classify_app_override(
+    engine: *const SmartKeyEngineHandle,
+    app_utf8: *const c_char,
+) -> u8 {
+    with_engine_ref(engine, SMARTKEY_PROFILE_NONE, |eng| {
+        let app = if app_utf8.is_null() {
+            ""
+        } else {
+            CStr::from_ptr(app_utf8).to_str().unwrap_or("")
+        };
+        eng.store()
+            .compiled()
+            .app_profiles
+            .classify_override(app)
+            .map(encode_profile)
+            .unwrap_or(SMARTKEY_PROFILE_NONE)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_session_reconcile_surrounding(
+    session: *mut SmartKeySessionHandle,
+    engine: *mut SmartKeyEngineHandle,
+    surrounding_utf8: *const c_char,
+    cursor_chars: u32,
+    now_ms: u64,
+) {
+    with_session_and_engine_mut(session, engine, (), |sess, eng| {
+        if surrounding_utf8.is_null() {
+            return;
+        }
+        let Ok(text) = CStr::from_ptr(surrounding_utf8).to_str() else {
+            return;
+        };
+        sess.inner
+            .reconcile_surrounding(eng, text, cursor_chars as usize, now_ms);
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_session_set_lotus_composing(
+    session: *mut SmartKeySessionHandle,
+    composing: bool,
+) {
+    with_session_mut(session, (), |sess| {
+        sess.set_lotus_composing(composing);
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_session_on_lotus_commit(
+    session: *mut SmartKeySessionHandle,
+    engine: *mut SmartKeyEngineHandle,
+    boundary_codepoint: u32,
+    committed_utf8: *const c_char,
+    now_ms: u64,
+    out_action: *mut SmartKeyAction,
+) -> bool {
+    if out_action.is_null() {
+        return false;
+    }
+    *out_action = SmartKeyAction::default();
+
+    with_session_and_engine_mut(session, engine, false, |sess, eng| {
+        let Some(boundary_ch) = char::from_u32(boundary_codepoint) else {
+            return false;
+        };
+        let Some(committed) = opt_cstr(committed_utf8) else {
+            return false;
+        };
+        let out = sess
+            .inner
+            .on_lotus_boundary_commit(eng, boundary_ch, committed, now_ms);
+        match out.action {
+            SessionAction::PassThrough => {
+                *out_action = SmartKeyAction::default();
+            }
+            SessionAction::Replace {
+                delete_chars,
+                insert,
+            } => {
+                sess.scratch_insert.clear();
+                sess.scratch_insert.extend_from_slice(insert.as_bytes());
+                sess.scratch_insert.push(0);
+                *out_action = SmartKeyAction {
+                    kind: SMARTKEY_ACTION_REPLACE,
+                    delete_chars: delete_chars as u32,
+                    insert_utf8: sess.scratch_insert.as_ptr() as *const c_char,
+                    insert_byte_len: insert.len() as u32,
+                };
+            }
+        }
+        true
+    })
 }
 
 #[no_mangle]

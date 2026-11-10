@@ -106,3 +106,37 @@ name = "multi_boundary_comma_space_single_backspace_undo"
 steps = [
   { keys = "chagnes, <BS>, ", expect_buf = "chagnes, " },
 ]
+
+[[trace]]
+name = "vi_lotus_uinput_filtered_boundary_rescue_and_undo"
+lang = "vi"
+steps = [
+  { keys = "nuowcss ", expect_buf = "nước " },
+  { keys = "ruowujj ", expect_buf = "nước rượu " },
+  { keys = "ddwungs ", expect_buf = "nước rượu đứng " },
+]
+
+[[trace]]
+name = "vi_lotus_shorthand_undo_pair_block"
+lang = "vi"
+steps = [
+  { keys = "ntn <BS> ", expect_buf = "ntn " },
+  { keys = "ntn ", expect_buf = "ntn ntn " },
+]
+
+[[trace]]
+name = "vi_lotus_telex_passthrough_2x_graduation"
+lang = "vi"
+steps = [
+  { keys = "aurr ", expect_buf = "aur " },
+  { keys = "aurr ", expect_buf = "aur aur " },
+  { keys = "aur ", expect_buf = "aur aur aur " },
+]
+
+[[trace]]
+name = "vi_lotus_english_momentum_shield_preserves_vietnamese_prose"
+lang = "vi"
+steps = [
+  { keys = "it is kind of ", expect_buf = "it is kind of " },
+  { keys = "em owr nhaf ", expect_buf = "it is kind of em ở nhà " },
+]

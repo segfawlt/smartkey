@@ -11,6 +11,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 use crate::event_log::{current_epoch_ms, date_string, DiagnosticsConfig, EventLog, EventLogLevel};
 use crate::scorer::UserRuleView;
 use crate::types::{Aggressiveness, AppProfile, Dialect, LangId, MatchKind, ScorerConfig};
+use crate::vi_telex::LotusOptions;
 
 /// Built-in onboarding presets (`smartkey init --preset ...`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -234,6 +235,53 @@ impl LearnerState {
     }
 }
 
+/// Optional user overrides in `[app_profiles]` (`rules.toml`) for custom Flatpak/Wayland app IDs
+/// and compositors that omit foreign-toplevel metadata (`unknown_app_policy = "prose" | "bypass"`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AppProfileConfig {
+    pub unknown_app_policy: Option<AppProfile>,
+    pub bypass: BTreeSet<String>,
+    pub browser: BTreeSet<String>,
+    pub chat: BTreeSet<String>,
+    pub prose: BTreeSet<String>,
+}
+
+impl AppProfileConfig {
+    fn matches_set(prog: &str, set: &BTreeSet<String>) -> bool {
+        if set.contains(prog) {
+            return true;
+        }
+        if prog.contains('.') {
+            for seg in prog.split('.').skip(1) {
+                if seg.len() >= 3 && set.contains(seg) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn classify_override(&self, normalized_app: &str) -> Option<AppProfile> {
+        let app = normalized_app.trim().to_ascii_lowercase();
+        if app.is_empty() {
+            return self.unknown_app_policy;
+        }
+        if Self::matches_set(&app, &self.bypass) {
+            return Some(AppProfile::Bypass);
+        }
+        if Self::matches_set(&app, &self.browser) {
+            return Some(AppProfile::Browser);
+        }
+        if Self::matches_set(&app, &self.chat) {
+            return Some(AppProfile::Chat);
+        }
+        if Self::matches_set(&app, &self.prose) {
+            return Some(AppProfile::Prose);
+        }
+        None
+    }
+}
+
 /// Parsed in-memory fast lookup mirrors synchronized with `toml_edit::DocumentMut`.
 #[derive(Debug, Clone, Default)]
 pub struct CompiledRules {
@@ -242,6 +290,7 @@ pub struct CompiledRules {
     pub undo_window_ms: u64,
     pub scorer_config: ScorerConfig,
     pub diagnostics: DiagnosticsConfig,
+    pub app_profiles: AppProfileConfig,
     pub personal_dict: BTreeSet<String>,
     pub personal_dict_canonical: BTreeMap<String, String>,
     pub lang_personal_dict: BTreeMap<String, BTreeSet<String>>,
@@ -457,8 +506,11 @@ fn salvage_safety_flags_from_broken_toml(raw: &str, compiled: &mut CompiledRules
 pub struct RuleStore {
     rules_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
+    lotus_conf_path: Option<PathBuf>,
     last_rules_stamp: Option<FileStamp>,
     last_state_stamp: Option<FileStamp>,
+    last_lotus_conf_stamp: Option<FileStamp>,
+    lotus_options: LotusOptions,
     parse_locked: bool,
     parse_error: Option<String>,
     doc: DocumentMut,
@@ -479,8 +531,11 @@ impl RuleStore {
         Self {
             rules_path: None,
             state_path: None,
+            lotus_conf_path: None,
             last_rules_stamp: None,
             last_state_stamp: None,
+            last_lotus_conf_stamp: None,
+            lotus_options: LotusOptions::default(),
             parse_locked: false,
             parse_error: None,
             doc,
@@ -501,8 +556,11 @@ impl RuleStore {
         Ok(Self {
             rules_path: None,
             state_path: None,
+            lotus_conf_path: None,
             last_rules_stamp: None,
             last_state_stamp: None,
+            last_lotus_conf_stamp: None,
+            lotus_options: LotusOptions::default(),
             parse_locked: false,
             parse_error: None,
             doc,
@@ -563,11 +621,30 @@ impl RuleStore {
         };
         let last_state_stamp = FileStamp::of(&state_path);
 
+        // Discover sibling `$XDG_CONFIG_HOME/fcitx5/conf/lotus.conf` relative to `rules_path`
+        // (`$XDG_CONFIG_HOME/smartkey/rules.toml`) without reading `$HOME` implicitly.
+        let lotus_conf_path = rules_path
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|cfg_root| cfg_root.join("fcitx5/conf/lotus.conf"));
+        let (lotus_options, last_lotus_conf_stamp) = match lotus_conf_path.as_deref() {
+            Some(lp) if lp.exists() => {
+                let opts = fs::read_to_string(lp)
+                    .map(|s| LotusOptions::from_fcitx5_conf_str(&s))
+                    .unwrap_or_default();
+                (opts, FileStamp::of(lp))
+            }
+            _ => (LotusOptions::default(), None),
+        };
+
         Ok(Self {
             rules_path: Some(rules_path),
             state_path: Some(state_path),
+            lotus_conf_path,
             last_rules_stamp,
             last_state_stamp,
+            last_lotus_conf_stamp,
+            lotus_options,
             parse_locked,
             parse_error,
             doc,
@@ -578,6 +655,14 @@ impl RuleStore {
             session_shielded_words: BTreeSet::new(),
             session_blocked_pairs: BTreeSet::new(),
         })
+    }
+
+    pub fn lotus_options(&self) -> LotusOptions {
+        self.lotus_options
+    }
+
+    pub fn set_lotus_options(&mut self, opts: LotusOptions) {
+        self.lotus_options = opts;
     }
 
     pub fn is_parse_locked(&self) -> bool {
@@ -665,11 +750,27 @@ impl RuleStore {
             .insert((typed_lower.to_string(), rejected_lower.to_string()));
     }
 
-    /// Reloads `rules.toml` and `learner_state.json` from disk if modified externally
-    /// (e.g. user edited `rules.toml`, Syncthing synced, or `smartkey log --clear` ran).
+    /// Reloads `rules.toml` and `learner_state.json` (plus sibling `lotus.conf`) from disk if modified externally.
     pub fn reload_if_modified(&mut self) {
         self.sync_external_edits_before_write();
         self.sync_external_state_before_write();
+        self.sync_external_lotus_conf();
+    }
+
+    fn sync_external_lotus_conf(&mut self) {
+        let Some(lp) = self.lotus_conf_path.as_ref() else {
+            return;
+        };
+        let cur = FileStamp::of(lp);
+        if cur != self.last_lotus_conf_stamp {
+            self.lotus_options = match cur {
+                Some(_) => fs::read_to_string(lp)
+                    .map(|s| LotusOptions::from_fcitx5_conf_str(&s))
+                    .unwrap_or_default(),
+                None => LotusOptions::default(),
+            };
+            self.last_lotus_conf_stamp = cur;
+        }
     }
 
     pub fn state_path(&self) -> Option<&Path> {
@@ -1117,6 +1218,19 @@ impl RuleStore {
         }
     }
 
+    /// Returns true if `lower_word` is explicitly stored in `[lang.<id>].personal_dict`
+    /// (without falling through to global English `personal_dict`), preventing English homographs
+    /// from blocking Vietnamese Telex typo rescue unless explicitly added under `[lang.vi]`.
+    pub fn is_lang_only_personal_word(&self, lang: &str, lower_word: &str) -> bool {
+        if self.session_shielded_words.contains(lower_word) {
+            return true;
+        }
+        self.compiled
+            .lang_personal_dict
+            .get(lang)
+            .is_some_and(|s| s.contains(lower_word))
+    }
+
     /// Returns true if `lower_word` is explicitly stored in `personal_dict` (excluding session shields).
     pub fn is_explicit_personal_word(&self, lang: &LangId, lower_word: &str) -> bool {
         if lang.as_str() != "en"
@@ -1526,6 +1640,35 @@ impl RuleStore {
             if let Some(b) = diag.get("annotate_rules").and_then(Item::as_bool) {
                 out.diagnostics.annotate_rules = b;
             }
+        }
+
+        if let Some(apps) = doc.get("app_profiles").and_then(Item::as_table) {
+            if let Some(pol) = apps.get("unknown_app_policy").and_then(Item::as_str) {
+                out.app_profiles.unknown_app_policy = match pol.trim().to_ascii_lowercase().as_str()
+                {
+                    "bypass" | "off" | "disable" => Some(AppProfile::Bypass),
+                    "browser" => Some(AppProfile::Browser),
+                    "chat" => Some(AppProfile::Chat),
+                    "prose" | "default" => Some(AppProfile::Prose),
+                    _ => None,
+                };
+            }
+            let load_set = |key: &str, dst: &mut BTreeSet<String>| {
+                if let Some(arr) = apps.get(key).and_then(Item::as_array) {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            let norm = s.trim().to_ascii_lowercase();
+                            if !norm.is_empty() {
+                                dst.insert(norm);
+                            }
+                        }
+                    }
+                }
+            };
+            load_set("bypass", &mut out.app_profiles.bypass);
+            load_set("browser", &mut out.app_profiles.browser);
+            load_set("chat", &mut out.app_profiles.chat);
+            load_set("prose", &mut out.app_profiles.prose);
         }
 
         if let Some(arr) = doc.get("personal_dict").and_then(Item::as_array) {

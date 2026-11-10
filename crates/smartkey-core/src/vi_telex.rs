@@ -824,10 +824,23 @@ fn is_tone_free(composition: &[Transformation], target_id: usize) -> bool {
     })
 }
 
+fn find_last_appending_vowel_id(composition: &[Transformation]) -> Option<usize> {
+    let last_app = composition
+        .iter()
+        .rev()
+        .find(|t| t.rule.effect_type == EffectType::Appending)?;
+    if is_vowel(last_app.rule.effect_on) {
+        Some(last_app.id)
+    } else {
+        None
+    }
+}
+
 fn find_target(
     composition: &[Transformation],
     rules: &[Rule],
     std_style: bool,
+    free_marking: bool,
     next_id: usize,
 ) -> Option<(usize, Rule)> {
     let cur_str = flatten(composition, FlattenMode::VIETNAMESE);
@@ -835,10 +848,16 @@ fn find_target(
         let EffectType::ToneTransformation(tone) = rule.effect_type else {
             continue;
         };
-        if !has_valid_tone(composition, tone) {
-            continue;
-        }
-        let Some(target_id) = find_tone_target_id(composition, std_style) else {
+        let target_opt = if free_marking {
+            if has_valid_tone(composition, tone) {
+                find_tone_target_id(composition, std_style)
+            } else {
+                None
+            }
+        } else {
+            find_last_appending_vowel_id(composition)
+        };
+        let Some(target_id) = target_opt else {
             continue;
         };
         let mut with_eff = composition.to_vec();
@@ -898,20 +917,127 @@ pub struct LotusSimulation {
     pub is_composed_vietnamese: bool,
 }
 
+/// Lotus `W2U` (`w -> ư`) behavior configured in `~/.config/fcitx5/conf/lotus.conf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum W2uMode {
+    Disabled,
+    #[default]
+    NonStart,
+    Everywhere,
+}
+
+/// Effective `fcitx5-lotus` engine options mirrored by `LotusSimEngine`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LotusOptions {
+    pub auto_non_vn_restore: bool,
+    pub dd_free_style: bool,
+    pub spell_check_with_dicts: bool,
+    pub modern_style: bool,
+    pub free_marking: bool,
+    pub w2u: W2uMode,
+    pub bracket_transform: bool,
+}
+
+impl Default for LotusOptions {
+    fn default() -> Self {
+        Self {
+            auto_non_vn_restore: true,
+            dd_free_style: true,
+            spell_check_with_dicts: true,
+            modern_style: true,
+            free_marking: true,
+            w2u: W2uMode::NonStart,
+            bracket_transform: false,
+        }
+    }
+}
+
+impl LotusOptions {
+    /// Parses `fcitx5-lotus`'s INI config (`~/.config/fcitx5/conf/lotus.conf`), falling back to
+    /// upstream `fcitx5-lotus` 6.x defaults for any omitted or commented-out keys.
+    pub fn from_fcitx5_conf_str(raw: &str) -> Self {
+        let mut opts = Self::default();
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+                continue;
+            }
+            let Some((k, v)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let key = k.trim();
+            let val = v.trim().trim_matches('"');
+            let parse_bool = |s: &str| -> Option<bool> {
+                match s.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => Some(true),
+                    "false" | "0" | "no" | "off" => Some(false),
+                    _ => None,
+                }
+            };
+            match key {
+                "AutoNonVnRestore" => {
+                    if let Some(b) = parse_bool(val) {
+                        opts.auto_non_vn_restore = b;
+                    }
+                }
+                "DdFreeStyle" => {
+                    if let Some(b) = parse_bool(val) {
+                        opts.dd_free_style = b;
+                    }
+                }
+                "SpellCheck" => {
+                    if let Some(b) = parse_bool(val) {
+                        opts.spell_check_with_dicts = b;
+                    }
+                }
+                "ModernStyle" => {
+                    if let Some(b) = parse_bool(val) {
+                        opts.modern_style = b;
+                    }
+                }
+                "FreeMarking" => {
+                    if let Some(b) = parse_bool(val) {
+                        opts.free_marking = b;
+                    }
+                }
+                "W2U" => {
+                    opts.w2u = match val.to_ascii_lowercase().as_str() {
+                        "disabled" | "false" | "off" | "none" => W2uMode::Disabled,
+                        "everywhere" | "always" | "true" => W2uMode::Everywhere,
+                        _ => W2uMode::NonStart,
+                    };
+                }
+                "BracketTransform" => {
+                    opts.bracket_transform = !matches!(
+                        val.to_ascii_lowercase().as_str(),
+                        "disabled" | "false" | "off" | "none"
+                    );
+                }
+                _ => {}
+            }
+        }
+        opts
+    }
+}
+
 struct LotusSimEngine {
     composition: Vec<Transformation>,
     next_id: usize,
-    std_style: bool,
+    opts: LotusOptions,
 }
 
 impl LotusSimEngine {
-    fn new() -> Self {
+    fn with_options(opts: LotusOptions) -> Self {
         Self {
             composition: Vec::new(),
             next_id: 1,
-            // Lotus `ModernStyle=True` default -> `StdToneStyle=false`.
-            std_style: false,
+            opts,
         }
+    }
+
+    #[inline]
+    fn std_style(&self) -> bool {
+        !self.opts.modern_style
     }
 
     fn alloc_id(&mut self) -> usize {
@@ -937,15 +1063,22 @@ impl LotusSimEngine {
     fn generate_undo_transformations(&mut self, rules: &[Rule]) -> Vec<Transformation> {
         let mut out = Vec::new();
         let cur_str = flatten(&self.composition, FlattenMode::VIETNAMESE_TONELESS_LOWER);
+        let std_style = self.std_style();
+        let free_marking = self.opts.free_marking;
 
         for &rule in rules {
             match rule.effect_type {
                 EffectType::ToneTransformation(tone) => {
-                    if !has_valid_tone(&self.composition, tone) {
-                        continue;
-                    }
-                    let Some(target_id) = find_tone_target_id(&self.composition, self.std_style)
-                    else {
+                    let target_opt = if free_marking {
+                        if has_valid_tone(&self.composition, tone) {
+                            find_tone_target_id(&self.composition, std_style)
+                        } else {
+                            None
+                        }
+                    } else {
+                        find_last_appending_vowel_id(&self.composition)
+                    };
+                    let Some(target_id) = target_opt else {
                         continue;
                     };
                     out.push(Transformation {
@@ -1011,7 +1144,7 @@ impl LotusSimEngine {
         else {
             return Vec::new();
         };
-        let new_target = find_tone_target_id(comp, self.std_style);
+        let new_target = find_tone_target_id(comp, self.std_style());
         if last_tone.target != new_target {
             let mut out = Vec::with_capacity(2);
             out.push(Transformation {
@@ -1039,10 +1172,19 @@ impl LotusSimEngine {
     }
 
     fn apply_uow_shortcut(&mut self, comp: &[Transformation]) -> Option<Transformation> {
+        if self.opts.w2u == W2uMode::Disabled {
+            return None;
+        }
         let str_toneless = flatten(comp, FlattenMode::VIETNAMESE_TONELESS_LOWER);
         if matches_uoh_tail(&str_toneless) {
             let rules = applicable_rules('w');
-            if let Some((target_id, mut rule)) = find_target(comp, &rules, self.std_style, self.next_id) {
+            if let Some((target_id, mut rule)) = find_target(
+                comp,
+                &rules,
+                self.std_style(),
+                self.opts.free_marking,
+                self.next_id,
+            ) {
                 rule.key = '\0';
                 return Some(Transformation {
                     id: self.alloc_id(),
@@ -1058,15 +1200,68 @@ impl LotusSimEngine {
     fn process_key(&mut self, ch: char, english_mode: bool) {
         let lower_key = ch.to_ascii_lowercase();
         let is_upper_case = ch.is_uppercase();
+        let is_bracket_key = self.opts.bracket_transform && matches!(ch, '[' | ']' | '{' | '}');
 
-        if english_mode || !lower_key.is_ascii_alphabetic() {
+        if english_mode || (!lower_key.is_ascii_alphabetic() && !is_bracket_key) {
             let app = self.make_appending(lower_key, is_upper_case);
             self.composition.push(app);
             return;
         }
 
-        let rules = applicable_rules(lower_key);
+        if is_bracket_key {
+            if let Some(last) = self.composition.last() {
+                let open_stroke = matches!(ch, '[' | '{');
+                let close_stroke = matches!(ch, ']' | '}');
+                let open_match = open_stroke
+                    && matches!(last.rule.key, '[' | '{')
+                    && matches!(last.rule.result, 'ơ' | 'Ơ');
+                let close_match = close_stroke
+                    && matches!(last.rule.key, ']' | '}')
+                    && matches!(last.rule.result, 'ư' | 'Ư');
+                if open_match || close_match {
+                    let last_id = last.id;
+                    let undo = Transformation {
+                        id: self.alloc_id(),
+                        target: Some(last_id),
+                        rule: Rule {
+                            key: '\0',
+                            effect_type: EffectType::MarkTransformation(Mark::Raw),
+                            effect_on: '\0',
+                            result: '\0',
+                        },
+                        is_upper_case: false,
+                    };
+                    self.composition.push(undo);
+                    return;
+                }
+            }
+            let (mapped, upper) = match ch {
+                '[' => ('ơ', false),
+                '{' => ('ơ', true),
+                ']' => ('ư', false),
+                '}' => ('ư', true),
+                _ => unreachable!(),
+            };
+            let mut app = self.make_appending(ch, upper);
+            app.rule.result = mapped;
+            app.rule.effect_on = mapped;
+            let mut refresh_src = self.composition.clone();
+            refresh_src.push(app.clone());
+            let refreshed = self.refresh_last_tone_target(&refresh_src);
+            self.composition.push(app);
+            self.composition.extend(refreshed);
+            return;
+        }
+
+        let rules = if self.opts.w2u == W2uMode::Disabled && lower_key == 'w' {
+            // Even with W2U disabled, `w` still acts as Horn mark transformation in Telex (`ow -> ơ`, `uw -> ư`, `aw -> ă`)!
+            applicable_rules(lower_key)
+        } else {
+            applicable_rules(lower_key)
+        };
         let mut transformations: Vec<Transformation> = Vec::new();
+        let std_style = self.std_style();
+        let free_marking = self.opts.free_marking;
 
         // Double typing `w + w -> w` when `w` produced `ư`.
         if let Some(last) = self.composition.last() {
@@ -1090,9 +1285,13 @@ impl LotusSimEngine {
         }
 
         if transformations.is_empty() {
-            if let Some((target_id, rule)) =
-                find_target(&self.composition, &rules, self.std_style, self.next_id)
-            {
+            if let Some((target_id, rule)) = find_target(
+                &self.composition,
+                &rules,
+                std_style,
+                free_marking,
+                self.next_id,
+            ) {
                 let trans = Transformation {
                     id: self.alloc_id(),
                     target: Some(target_id),
@@ -1104,9 +1303,13 @@ impl LotusSimEngine {
                     let mut new_comp = self.composition.clone();
                     new_comp.extend(transformations.iter().cloned());
                     if !is_valid_composition(&new_comp, true) {
-                        if let Some((v_target, mut v_rule)) =
-                            find_target(&new_comp, &rules, self.std_style, self.next_id)
-                        {
+                        if let Some((v_target, mut v_rule)) = find_target(
+                            &new_comp,
+                            &rules,
+                            std_style,
+                            free_marking,
+                            self.next_id,
+                        ) {
                             v_rule.key = '\0';
                             transformations.push(Transformation {
                                 id: self.alloc_id(),
@@ -1142,9 +1345,13 @@ impl LotusSimEngine {
                         };
                         let mut with_eff = self.composition.clone();
                         with_eff.push(clear_eff.clone());
-                        if let Some((new_target, new_rule)) =
-                            find_target(&with_eff, &rules, self.std_style, self.next_id)
-                        {
+                        if let Some((new_target, new_rule)) = find_target(
+                            &with_eff,
+                            &rules,
+                            std_style,
+                            free_marking,
+                            self.next_id,
+                        ) {
                             if new_target != v0_id {
                                 transformations.push(clear_eff);
                                 transformations.push(Transformation {
@@ -1172,8 +1379,12 @@ impl LotusSimEngine {
 
         if transformations.is_empty() {
             let mut app = self.make_appending(lower_key, is_upper_case);
-            // W2U non-start / everywhere support (`w -> ư`).
-            if lower_key == 'w' && !self.composition.is_empty() {
+            let can_apply_w2u = match self.opts.w2u {
+                W2uMode::Disabled => false,
+                W2uMode::NonStart => !self.composition.is_empty(),
+                W2uMode::Everywhere => true,
+            };
+            if can_apply_w2u && lower_key == 'w' {
                 app.rule.result = 'ư';
                 app.rule.effect_on = 'ư';
             }
@@ -1195,12 +1406,15 @@ impl LotusSimEngine {
     }
 
     fn should_fallback_to_english(&self, check_vn_rune: bool) -> bool {
+        if !self.opts.auto_non_vn_restore {
+            return false;
+        }
         let vn_seq = flatten(&self.composition, FlattenMode::VIETNAMESE_LOWER);
         if vn_seq.is_empty() {
             return false;
         }
-        // `ddFreeStyle = true` default in Lotus:
-        if !has_any_vietnamese_vowel(&vn_seq)
+        if self.opts.dd_free_style
+            && !has_any_vietnamese_vowel(&vn_seq)
             && (vn_seq.ends_with('d') || vn_seq.contains('đ'))
         {
             return false;
@@ -1208,18 +1422,28 @@ impl LotusSimEngine {
         if check_vn_rune && !has_any_vietnamese_rune(&vn_seq) {
             return false;
         }
-        if has_vietnamese_dict_prefix(&vn_seq) {
+        if self.opts.spell_check_with_dicts && has_vietnamese_dict_prefix(&vn_seq) {
             return false;
         }
         !is_valid_composition(&self.composition, false)
     }
 
     fn must_fallback_to_english(&self) -> bool {
+        if !self.opts.auto_non_vn_restore {
+            return false;
+        }
         let vn_seq = flatten(&self.composition, FlattenMode::VIETNAMESE_LOWER);
         if vn_seq.is_empty() {
             return false;
         }
-        !is_vietnamese_dict_word(&vn_seq)
+        // `key_processor.cpp:488`: `dd` is preserved even in non-dictionary sequences when `ddFreeStyle` is on!
+        if self.opts.dd_free_style && vn_seq.contains('đ') {
+            return false;
+        }
+        if self.opts.spell_check_with_dicts {
+            return !is_vietnamese_dict_word(&vn_seq);
+        }
+        !is_valid_composition(&self.composition, true)
     }
 
     fn preedit_string(&self) -> String {
@@ -1231,9 +1455,14 @@ impl LotusSimEngine {
     }
 }
 
-/// Simulates typing `raw_keys` in `fcitx5-lotus` and returns the exact preedit and word-break state.
+/// Simulates typing `raw_keys` in `fcitx5-lotus` using default Lotus options.
 pub fn simulate_lotus_word(raw_keys: &str) -> LotusSimulation {
-    let mut eng = LotusSimEngine::new();
+    simulate_lotus_word_with_options(raw_keys, LotusOptions::default())
+}
+
+/// Simulates typing `raw_keys` in `fcitx5-lotus` under explicit `LotusOptions`.
+pub fn simulate_lotus_word_with_options(raw_keys: &str, opts: LotusOptions) -> LotusSimulation {
+    let mut eng = LotusSimEngine::with_options(opts);
     for ch in raw_keys.chars() {
         let english_mode = eng.should_fallback_to_english(false);
         eng.process_key(ch, english_mode);
@@ -1332,11 +1561,12 @@ fn try_candidate_repair(
     repaired_lower: &str,
     raw_typed: &str,
     screen_chars: usize,
+    opts: LotusOptions,
 ) -> Option<TelexRescue> {
     if repaired_lower.len() < 2 {
         return None;
     }
-    let sim = simulate_lotus_word(repaired_lower);
+    let sim = simulate_lotus_word_with_options(repaired_lower, opts);
     // Confidence guard:
     // 1. Must be a complete valid word in `vietnamese.cm.dict`.
     // 2. Must carry at least one Vietnamese diacritic or tone mark (`ă, â, đ, ê, ô, ơ, ư` or tones)
@@ -1401,8 +1631,13 @@ fn collapse_telex_chatter(lower: &str) -> String {
 }
 
 /// Attempts to rescue a broken Vietnamese Telex word (`ttieengs`, `tieeengs`, `tieengss`, `hnuxng`, `dddi`)
-/// that Lotus rejected to raw ASCII.
+/// under default Lotus options.
 pub fn rescue_telex_typo(raw_keys: &str) -> Option<TelexRescue> {
+    rescue_telex_typo_with_options(raw_keys, LotusOptions::default())
+}
+
+/// Attempts to rescue a broken Vietnamese Telex word under explicit `LotusOptions`.
+pub fn rescue_telex_typo_with_options(raw_keys: &str, opts: LotusOptions) -> Option<TelexRescue> {
     if raw_keys.len() < 2 || raw_keys.len() > 16 || !raw_keys.is_ascii() {
         return None;
     }
@@ -1410,7 +1645,7 @@ pub fn rescue_telex_typo(raw_keys: &str) -> Option<TelexRescue> {
         return None;
     }
 
-    let orig_sim = simulate_lotus_word(raw_keys);
+    let orig_sim = simulate_lotus_word_with_options(raw_keys, opts);
     // If Lotus already composed this into a valid Vietnamese word, no rescue is needed.
     if orig_sim.is_valid_vietnamese {
         return None;
@@ -1430,7 +1665,7 @@ pub fn rescue_telex_typo(raw_keys: &str) -> Option<TelexRescue> {
             let mut cand = String::with_capacity(n - 1);
             cand.push_str(&lower[..i]);
             cand.push_str(&lower[i + 1..]);
-            if let Some(rescued) = try_candidate_repair(&cand, raw_keys, screen_chars) {
+            if let Some(rescued) = try_candidate_repair(&cand, raw_keys, screen_chars, opts) {
                 return Some(rescued);
             }
         }
@@ -1443,7 +1678,7 @@ pub fn rescue_telex_typo(raw_keys: &str) -> Option<TelexRescue> {
             let mut cand = String::with_capacity(n - 1);
             cand.push_str(&lower[..i]);
             cand.push_str(&lower[i + 1..]);
-            if let Some(rescued) = try_candidate_repair(&cand, raw_keys, screen_chars) {
+            if let Some(rescued) = try_candidate_repair(&cand, raw_keys, screen_chars, opts) {
                 return Some(rescued);
             }
         }
@@ -1452,7 +1687,7 @@ pub fn rescue_telex_typo(raw_keys: &str) -> Option<TelexRescue> {
     // 3. Multi-chatter collapse (`ttieeengs -> tieengs`, `ttieengss -> tieengs`):
     let collapsed = collapse_telex_chatter(&lower);
     if collapsed != lower {
-        if let Some(rescued) = try_candidate_repair(&collapsed, raw_keys, screen_chars) {
+        if let Some(rescued) = try_candidate_repair(&collapsed, raw_keys, screen_chars, opts) {
             return Some(rescued);
         }
     }
@@ -1467,7 +1702,7 @@ pub fn rescue_telex_typo(raw_keys: &str) -> Option<TelexRescue> {
             let mut swapped = bytes.to_vec();
             swapped.swap(i, i + 1);
             if let Ok(cand) = std::str::from_utf8(&swapped) {
-                if let Some(rescued) = try_candidate_repair(cand, raw_keys, screen_chars) {
+                if let Some(rescued) = try_candidate_repair(cand, raw_keys, screen_chars, opts) {
                     return Some(rescued);
                 }
             }
