@@ -665,6 +665,82 @@ impl RuleStore {
         self.lotus_options = opts;
     }
 
+    /// Read-only loader for inspection commands (`status`, `rules`, `log`, `explain`):
+    /// never creates directories, never initializes `rules.toml`, and never writes quarantine files.
+    /// Returns `(store, initialized_on_disk)`.
+    pub fn load_readonly_or_default(
+        rules_path: PathBuf,
+        state_path: PathBuf,
+        preset: Preset,
+    ) -> io::Result<(Self, bool)> {
+        let rules_exists = rules_path.exists();
+        let (doc, parse_locked, parse_error, raw_opt) = if rules_exists {
+            let raw = fs::read_to_string(&rules_path)?;
+            match raw.parse::<DocumentMut>() {
+                Ok(d) => (d, false, None, None),
+                Err(err) => {
+                    let fallback: DocumentMut = preset.initial_toml().parse().unwrap();
+                    (fallback, true, Some(err.to_string()), Some(raw))
+                }
+            }
+        } else {
+            let d: DocumentMut = preset.initial_toml().parse().unwrap();
+            (d, false, None, None)
+        };
+
+        let mut compiled = Self::extract_compiled(&doc);
+        if let Some(raw) = &raw_opt {
+            salvage_safety_flags_from_broken_toml(raw, &mut compiled);
+        }
+
+        let state: LearnerState = if state_path.exists() {
+            fs::read_to_string(&state_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        } else {
+            LearnerState::default()
+        };
+
+        let lotus_conf_path = rules_path
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|cfg_root| cfg_root.join("fcitx5/conf/lotus.conf"));
+        let (lotus_options, last_lotus_conf_stamp) = match lotus_conf_path.as_deref() {
+            Some(lp) if lp.exists() => {
+                let opts = fs::read_to_string(lp)
+                    .map(|s| LotusOptions::from_fcitx5_conf_str(&s))
+                    .unwrap_or_default();
+                (opts, FileStamp::of(lp))
+            }
+            _ => (LotusOptions::default(), None),
+        };
+
+        let store = Self {
+            rules_path: if rules_exists { Some(rules_path.clone()) } else { None },
+            state_path: if state_path.exists() {
+                Some(state_path.clone())
+            } else {
+                None
+            },
+            lotus_conf_path,
+            last_rules_stamp: FileStamp::of(&rules_path),
+            last_state_stamp: FileStamp::of(&state_path),
+            last_lotus_conf_stamp,
+            lotus_options,
+            parse_locked,
+            parse_error,
+            doc,
+            compiled,
+            state,
+            active_lang: LangId::en(),
+            event_log: EventLog::new(),
+            session_shielded_words: BTreeSet::new(),
+            session_blocked_pairs: BTreeSet::new(),
+        };
+        Ok((store, rules_exists))
+    }
+
     pub fn is_parse_locked(&self) -> bool {
         self.parse_locked
     }

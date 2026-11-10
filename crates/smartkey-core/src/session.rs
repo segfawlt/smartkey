@@ -9,7 +9,7 @@ use crate::lexicon::EnglishLexicon;
 use crate::scorer::{EnglishScorer, EvalContext, LanguageScorer, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::{
-    Aggressiveness, AppProfile, Candidate, EvalOutcome, Explanation, InputOrigin, LangId, MatchKind,
+    AppProfile, Candidate, EvalOutcome, Explanation, InputOrigin, LangId, MatchKind,
 };
 
 /// Shared process-wide engine owning the zero-copy Layer 1 scorer and comment-preserving `RuleStore`.
@@ -2005,11 +2005,9 @@ impl SmartKeySession {
                                 engine.store.scorer_config(),
                                 &engine.store,
                             );
-                            let thresh = match engine.store.scorer_config().aggressiveness {
-                                Aggressiveness::Conservative => 0.24,
-                                Aggressiveness::Balanced => 0.14,
-                                Aggressiveness::Aggressive => 0.06,
-                            };
+                            let (thresh, _) = crate::scorer::EnglishScorer::thresholds(
+                                engine.store.scorer_config().aggressiveness,
+                            );
                             let (cand, score) = match explanation.top_candidates.first() {
                                 Some(c) => (Some(c.replacement.clone()), c.score),
                                 None => (None, 0.0),

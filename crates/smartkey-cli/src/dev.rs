@@ -237,13 +237,46 @@ fn cmd_eval() -> Result<(), String> {
     Ok(())
 }
 
+const GIT_VERSION: &str = env!("SMARTKEY_GIT_VERSION");
+
+fn print_dev_help() {
+    println!(
+        "\
+smartkey-dev {} ({GIT_VERSION}) — Maintainer corpus & dictionary build tools
+
+USAGE:
+  smartkey-dev <COMMAND>
+
+COMMANDS:
+  eval            Run golden must-fix / must-not-touch corpus gate & latency benchmark
+  build-lexicon   Compile raw dictionary & bigram sources into en_lexicon.skdict
+
+OPTIONS:
+  -h, --help      Show this help message
+  -V, --version   Show version information",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let res = match args.first().map(String::as_str) {
-        Some("build-lexicon") => cmd_build_lexicon(),
-        Some("eval") => cmd_eval(),
-        _ => {
-            eprintln!("Usage: smartkey-dev <eval | build-lexicon>");
+        Some("build-lexicon") if args.len() == 1 => cmd_build_lexicon(),
+        Some("eval") if args.len() == 1 => cmd_eval(),
+        Some("--help" | "-h" | "help") => {
+            print_dev_help();
+            Ok(())
+        }
+        Some("--version" | "-V") => {
+            println!("smartkey-dev {} ({GIT_VERSION})", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some(other) => {
+            eprintln!("error: unexpected argument {other:?} (usage: smartkey-dev <eval | build-lexicon>)");
+            std::process::exit(2);
+        }
+        None => {
+            print_dev_help();
             std::process::exit(2);
         }
     };

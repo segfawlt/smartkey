@@ -239,10 +239,11 @@ impl EnglishScorer {
                 return;
             }
             let bg = self.lexicon.bigram_score(&prev_lower, cand_lower);
-            if bg >= 0.50 && (bg - typed_bg) >= 0.35 {
-                if best.as_ref().is_none_or(|(_, best_bg)| bg > *best_bg) {
-                    best = Some((cand_lower.to_string(), bg));
-                }
+            if bg >= 0.50
+                && (bg - typed_bg) >= 0.35
+                && best.as_ref().is_none_or(|(_, best_bg)| bg > *best_bg)
+            {
+                best = Some((cand_lower.to_string(), bg));
             }
         };
 
@@ -266,7 +267,7 @@ impl EnglishScorer {
         best.map(|(cand, cand_bg)| (cand, cand_bg, typed_bg))
     }
 
-    fn thresholds(aggr: Aggressiveness) -> (f32, f32) {
+    pub const fn thresholds(aggr: Aggressiveness) -> (f32, f32) {
         match aggr {
             Aggressiveness::Conservative => (0.24, 0.09),
             Aggressiveness::Balanced => (0.14, 0.05),
