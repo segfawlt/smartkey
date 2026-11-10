@@ -52,6 +52,48 @@ impl Default for DiagnosticsConfig {
     }
 }
 
+/// Resolves the user's home directory without C bindings: checks `$HOME` first, then on Unix
+/// matches the effective UID of `/proc/self` against `/etc/passwd` so processes started with an
+/// unset `$HOME` never diverge on `cwd`-relative `.smartkey` paths.
+pub fn resolve_home_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() && home.to_string_lossy().trim() != "" {
+            return Some(PathBuf::from(home));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = fs::metadata("/proc/self") {
+            let uid = meta.uid();
+            if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
+                for line in passwd.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let mut fields = line.split(':');
+                    let _name = fields.next();
+                    let _pw = fields.next();
+                    let Some(uid_str) = fields.next() else {
+                        continue;
+                    };
+                    let _gid = fields.next();
+                    let _gecos = fields.next();
+                    let Some(dir_str) = fields.next() else {
+                        continue;
+                    };
+                    if uid_str.parse::<u32>().ok() == Some(uid) && !dir_str.trim().is_empty() {
+                        return Some(PathBuf::from(dir_str));
+                    }
+                }
+            }
+            return Some(std::env::temp_dir().join(format!("smartkey-uid-{uid}")));
+        }
+    }
+    None
+}
+
 /// Resolves `$XDG_STATE_HOME/smartkey/logs` (defaulting to `~/.local/state/smartkey/logs`).
 pub fn default_state_log_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
@@ -60,13 +102,10 @@ pub fn default_state_log_dir() -> PathBuf {
             return PathBuf::from(trimmed).join("smartkey/logs");
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        let trimmed = home.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join(".local/state/smartkey/logs");
-        }
+    if let Some(home) = resolve_home_dir() {
+        return home.join(".local/state/smartkey/logs");
     }
-    PathBuf::from(".smartkey/logs")
+    std::env::temp_dir().join("smartkey/logs")
 }
 
 /// Returns current wall-clock time in milliseconds since `UNIX_EPOCH`.

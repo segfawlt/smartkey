@@ -552,10 +552,12 @@ impl SmartKeySession {
     }
 
     /// Flushes any confirmed untouched unknown word before resetting session state,
-    /// and hot-reloads `rules.toml` / `learner_state.json` if modified externally.
+    /// after hot-reloading `rules.toml` / `learner_state.json` if modified externally
+    /// so external CLI edits (e.g. `smartkey log --clear`, `smartkey toggle`) are never clobbered.
     pub fn reset(&mut self, engine: &mut SmartKeyEngine) -> Vec<LearnEvent> {
         engine.store.set_active_lang(self.lang.clone());
         engine.store.set_current_app(self.app.as_deref());
+        engine.store.reload_if_modified();
         let mut events = Vec::new();
         if let Mode::EditingRestored {
             ref raw_typed,
@@ -568,7 +570,6 @@ impl SmartKeySession {
             }
         }
         self.flush_pending_unknown(engine, &mut events);
-        engine.store.reload_if_modified();
         self.reset_state_only();
         events
     }

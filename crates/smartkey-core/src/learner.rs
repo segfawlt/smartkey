@@ -168,6 +168,7 @@ pub fn record_undo_keep_verbatim(
     store.add_session_word_shield(&typed_lower);
     store.add_session_pair_block(&typed_lower, &rejected_lower);
     store.add_permanent_block(&typed_lower, &rejected_lower);
+    store.sync_state_before_write();
 
     let key = format!("{}:{}->{}", lang.as_str(), typed_lower, rejected_lower);
     let cnt = {
@@ -347,6 +348,10 @@ fn record_manual_edit_inner(
     } else {
         lang.clone()
     };
+
+    // Sync any external edits to `rules.toml` / `learner_state.json` BEFORE mutating in-memory
+    // staging maps or flushing state so concurrent CLI commands are never clobbered.
+    store.reload_if_modified();
 
     // Length & Delta-Span Check (`XXYYY -> XXZZZZ` suffix/idea rewrite rejection)
     if orig_chars.len().abs_diff(fixed_chars.len()) > 2 {
@@ -633,6 +638,8 @@ pub fn record_untouched_unknown(
         return LearnEvent::None;
     }
 
+    store.reload_if_modified();
+
     // Never pollute `personal_dict` with expressive stretches (`soooo`, `trờiiii`)
     if is_expressive_stretch(&lower, |w| {
         store.is_personal_word(w) || lexicon.is_some_and(|l| l.contains_any_english(w))
@@ -703,6 +710,7 @@ pub fn record_telex_passthrough_repair(store: &mut RuleStore, raw_ascii: &str) -
     if lower.len() < 2 || !lower.is_ascii() {
         return LearnEvent::None;
     }
+    store.sync_state_before_write();
     let count = {
         let e = store
             .state_mut()

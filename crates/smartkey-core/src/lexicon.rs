@@ -536,24 +536,9 @@ pub fn resolve_dict_path(lang: &str) -> Option<std::path::PathBuf> {
             }
         }
     }
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.trim().is_empty() {
-            let p = std::path::PathBuf::from(xdg)
-                .join("smartkey/dicts")
-                .join(format!("{lang}.skdict"));
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    } else if let Ok(home) = std::env::var("HOME") {
-        if !home.trim().is_empty() {
-            let p = std::path::PathBuf::from(home)
-                .join(".local/share/smartkey/dicts")
-                .join(format!("{lang}.skdict"));
-            if p.exists() {
-                return Some(p);
-            }
-        }
+    let user_pack = default_user_dict_dir().join(format!("{lang}.skdict"));
+    if user_pack.exists() {
+        return Some(user_pack);
     }
     for sys in [
         "/usr/local/share/smartkey/dicts",
@@ -573,12 +558,10 @@ pub fn default_user_dict_dir() -> std::path::PathBuf {
             return std::path::PathBuf::from(xdg).join("smartkey/dicts");
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.trim().is_empty() {
-            return std::path::PathBuf::from(home).join(".local/share/smartkey/dicts");
-        }
+    if let Some(home) = crate::event_log::resolve_home_dir() {
+        return home.join(".local/share/smartkey/dicts");
     }
-    std::path::PathBuf::from(".smartkey/dicts")
+    std::env::temp_dir().join("smartkey/dicts")
 }
 
 /// Compiles raw AOSP `en_US.combined`, `en_GB.combined`, `dev_terms.txt`, `slang.txt`,

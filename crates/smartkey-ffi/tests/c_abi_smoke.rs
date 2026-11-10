@@ -32,6 +32,21 @@ fn ffi_null_and_keystroke_roundtrip_safe() {
 
         let eng = smartkey_engine_new(ptr::null(), ptr::null(), SMARTKEY_PRESET_BALANCED);
         assert!(!eng.is_null());
+
+        // Non-NULL empty or invalid UTF-8 paths must fail (`NULL`), never silently degrade to in-memory
+        let empty_path = CString::new("").unwrap();
+        assert!(
+            smartkey_engine_new(empty_path.as_ptr(), ptr::null(), SMARTKEY_PRESET_BALANCED)
+                .is_null()
+        );
+        let bad_utf8: [u8; 3] = [0xff, 0xfe, 0x00];
+        assert!(smartkey_engine_new(
+            bad_utf8.as_ptr() as *const _,
+            ptr::null(),
+            SMARTKEY_PRESET_BALANCED
+        )
+        .is_null());
+
         let sess = smartkey_session_new();
         assert!(!sess.is_null());
 

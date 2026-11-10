@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -253,14 +254,213 @@ pub struct CompiledRules {
     pub snippets: BTreeMap<String, String>,
 }
 
+static TMP_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// High-resolution file identity stamp used to detect external writes across processes,
+/// coarse-mtime filesystems, and mtime-preserving sync tools (e.g. Syncthing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    mtime: Option<SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Self {
+                mtime: meta.modified().ok(),
+                len: meta.len(),
+                ino: meta.ino(),
+                ctime: meta.ctime(),
+                ctime_nsec: meta.ctime_nsec(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Some(Self {
+                mtime: meta.modified().ok(),
+                len: meta.len(),
+            })
+        }
+    }
+}
+
+/// Writes `bytes` to `path` atomically via a unique per-process/per-call dotfile temp path,
+/// flushing file data (`sync_all`) before `rename` and syncing the parent directory afterwards.
+pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent_dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent_dir)?;
+
+    let base = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("smartkey");
+    let pid = std::process::id();
+
+    let mut last_err = None;
+    let mut opened = None;
+    for _ in 0..16 {
+        let nonce = TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent_dir.join(format!(".{base}.tmp.{pid}.{nonce}"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                opened = Some((candidate, f));
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let Some((tmp_path, mut file)) = opened else {
+        return Err(last_err.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::AlreadyExists, "failed to allocate temp file")
+        }));
+    };
+
+    if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    if let Ok(dir_file) = fs::File::open(parent_dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
+/// Preserves a corrupt `rules.toml` or `learner_state.json` snapshot as `<file>.corrupt-<epoch_ms>`
+/// (deduplicated by exact byte contents so repeated loads while an editor has a syntax error never
+/// spam backup files). When `remove_original` is true, moves the corrupt file out of the way.
+fn quarantine_corrupt_file(path: &Path, raw_bytes: &[u8], remove_original: bool) -> Option<PathBuf> {
+    let parent_dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base = path.file_name()?.to_str()?;
+    let prefix = format!("{base}.corrupt-");
+
+    if let Ok(entries) = fs::read_dir(parent_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with(&prefix) {
+                    if let Ok(existing) = fs::read(entry.path()) {
+                        if existing == raw_bytes {
+                            if remove_original {
+                                let _ = fs::remove_file(path);
+                            }
+                            return Some(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let ts = current_epoch_ms();
+    let nonce = TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let mut quarantine_path = parent_dir.join(format!("{base}.corrupt-{ts}"));
+    if quarantine_path.exists() {
+        quarantine_path = parent_dir.join(format!("{base}.corrupt-{ts}-{nonce}"));
+    }
+
+    if remove_original {
+        if fs::rename(path, &quarantine_path).is_ok() {
+            return Some(quarantine_path);
+        }
+        if atomic_write_bytes(&quarantine_path, raw_bytes).is_ok() {
+            let _ = fs::remove_file(path);
+            return Some(quarantine_path);
+        }
+        None
+    } else if atomic_write_bytes(&quarantine_path, raw_bytes).is_ok() {
+        Some(quarantine_path)
+    } else {
+        None
+    }
+}
+
+/// Best-effort line scanner for broken `rules.toml` files so an explicit `enabled = false` or
+/// `vi_lotus = false` is never silently overridden back to `true` when the user makes a TOML typo.
+fn salvage_safety_flags_from_broken_toml(raw: &str, compiled: &mut CompiledRules) {
+    let mut section = String::new();
+    for raw_line in raw.lines() {
+        let mut in_quotes = false;
+        let mut comment_idx = None;
+        for (idx, ch) in raw_line.char_indices() {
+            if ch == '"' {
+                in_quotes = !in_quotes;
+            } else if ch == '#' && !in_quotes {
+                comment_idx = Some(idx);
+                break;
+            }
+        }
+        let line = match comment_idx {
+            Some(i) => raw_line[..i].trim(),
+            None => raw_line.trim(),
+        };
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') && !line.starts_with("[[") {
+            section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim().trim_matches('"').trim_matches('\'');
+        let val = v.trim();
+        if (section == "settings" || section.is_empty()) && key == "enabled" {
+            if val == "false" {
+                compiled.enabled = false;
+            } else if val == "true" {
+                compiled.enabled = true;
+            }
+        } else if section == "plugins" && (key == "vi_lotus" || key == "vi-lotus") {
+            if val == "false" {
+                compiled.vi_lotus_enabled = false;
+            } else if val == "true" {
+                compiled.vi_lotus_enabled = true;
+            }
+        }
+    }
+}
+
 /// Comment-preserving `rules.toml` + `learner_state.json` store.
 /// Never reads `$HOME` implicitly; paths are always injected by the host or kept in-memory.
 pub struct RuleStore {
     rules_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
-    last_mtime: Option<SystemTime>,
-    last_state_mtime: Option<SystemTime>,
+    last_rules_stamp: Option<FileStamp>,
+    last_state_stamp: Option<FileStamp>,
     parse_locked: bool,
+    parse_error: Option<String>,
     doc: DocumentMut,
     compiled: CompiledRules,
     state: LearnerState,
@@ -279,9 +479,10 @@ impl RuleStore {
         Self {
             rules_path: None,
             state_path: None,
-            last_mtime: None,
-            last_state_mtime: None,
+            last_rules_stamp: None,
+            last_state_stamp: None,
             parse_locked: false,
+            parse_error: None,
             doc,
             compiled,
             state: LearnerState::default(),
@@ -300,9 +501,10 @@ impl RuleStore {
         Ok(Self {
             rules_path: None,
             state_path: None,
-            last_mtime: None,
-            last_state_mtime: None,
+            last_rules_stamp: None,
+            last_state_stamp: None,
             parse_locked: false,
+            parse_error: None,
             doc,
             compiled,
             state: LearnerState::default(),
@@ -321,41 +523,53 @@ impl RuleStore {
         let raw_toml = if rules_path.exists() {
             fs::read_to_string(&rules_path)?
         } else {
-            if let Some(parent) = rules_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
             let init = preset.initial_toml();
-            fs::write(&rules_path, &init)?;
+            atomic_write_bytes(&rules_path, init.as_bytes())?;
             init
         };
 
-        let last_mtime = fs::metadata(&rules_path).and_then(|m| m.modified()).ok();
-        let (doc, parse_locked) = match raw_toml.parse::<DocumentMut>() {
-            Ok(d) => (d, false),
-            Err(_) => {
-                // User has a temporary syntax error in their editor: do NOT clobber their file!
+        let last_rules_stamp = FileStamp::of(&rules_path);
+        let (doc, parse_locked, parse_error) = match raw_toml.parse::<DocumentMut>() {
+            Ok(d) => (d, false, None),
+            Err(err) => {
+                // Keep user's broken `rules.toml` untouched in their editor AND save a deduplicated
+                // `.corrupt-<epoch>` backup snapshot for recovery.
+                let _ = quarantine_corrupt_file(&rules_path, raw_toml.as_bytes(), false);
                 let fallback: DocumentMut = preset.initial_toml().parse().unwrap();
-                (fallback, true)
+                (fallback, true, Some(err.to_string()))
             }
         };
 
-        let last_state_mtime = fs::metadata(&state_path).and_then(|m| m.modified()).ok();
+        let mut compiled = Self::extract_compiled(&doc);
+        if parse_locked {
+            salvage_safety_flags_from_broken_toml(&raw_toml, &mut compiled);
+        }
+
         let state: LearnerState = if state_path.exists() {
-            fs::read_to_string(&state_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default()
+            match fs::read(&state_path) {
+                Ok(raw_bytes) if !raw_bytes.iter().all(|b| b.is_ascii_whitespace()) => {
+                    match serde_json::from_slice::<LearnerState>(&raw_bytes) {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            let _ = quarantine_corrupt_file(&state_path, &raw_bytes, true);
+                            LearnerState::default()
+                        }
+                    }
+                }
+                _ => LearnerState::default(),
+            }
         } else {
             LearnerState::default()
         };
+        let last_state_stamp = FileStamp::of(&state_path);
 
-        let compiled = Self::extract_compiled(&doc);
         Ok(Self {
             rules_path: Some(rules_path),
             state_path: Some(state_path),
-            last_mtime,
-            last_state_mtime,
+            last_rules_stamp,
+            last_state_stamp,
             parse_locked,
+            parse_error,
             doc,
             compiled,
             state,
@@ -364,6 +578,14 @@ impl RuleStore {
             session_shielded_words: BTreeSet::new(),
             session_blocked_pairs: BTreeSet::new(),
         })
+    }
+
+    pub fn is_parse_locked(&self) -> bool {
+        self.parse_locked
+    }
+
+    pub fn parse_error(&self) -> Option<&str> {
+        self.parse_error.as_deref()
     }
 
     pub fn set_log_dir(&mut self, dir: Option<PathBuf>) {
@@ -456,53 +678,85 @@ impl RuleStore {
 
     /// Reloads `rules.toml` from disk if modified externally (e.g. Syncthing or user editor) before writing.
     fn sync_external_edits_before_write(&mut self) {
-        let Some(path) = self.rules_path.as_ref() else {
+        let Some(path) = self.rules_path.as_ref().cloned() else {
             return;
         };
-        let current_mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
-        if current_mtime != self.last_mtime {
-            if let Ok(raw) = fs::read_to_string(path) {
+        let current_stamp = FileStamp::of(&path);
+        if current_stamp != self.last_rules_stamp {
+            if let Ok(raw) = fs::read_to_string(&path) {
                 match raw.parse::<DocumentMut>() {
                     Ok(fresh_doc) => {
                         self.doc = fresh_doc;
                         self.compiled = Self::extract_compiled(&self.doc);
                         self.parse_locked = false;
-                        self.last_mtime = current_mtime;
+                        self.parse_error = None;
+                        self.last_rules_stamp = current_stamp;
                     }
-                    Err(_) => {
+                    Err(err) => {
+                        let _ = quarantine_corrupt_file(&path, raw.as_bytes(), false);
+                        salvage_safety_flags_from_broken_toml(&raw, &mut self.compiled);
                         self.parse_locked = true;
+                        self.parse_error = Some(err.to_string());
+                        self.last_rules_stamp = current_stamp;
                     }
                 }
             }
         }
     }
 
+    pub(crate) fn sync_state_before_write(&mut self) {
+        self.sync_external_state_before_write();
+    }
+
     fn sync_external_state_before_write(&mut self) {
-        let Some(path) = self.state_path.as_ref() else {
+        let Some(path) = self.state_path.as_ref().cloned() else {
             return;
         };
-        let current_mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
-        if current_mtime != self.last_state_mtime {
-            if let Some(fresh_state) = fs::read_to_string(path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<LearnerState>(&s).ok())
-            {
-                self.state = fresh_state;
-                self.last_state_mtime = current_mtime;
+        let current_stamp = FileStamp::of(&path);
+        if current_stamp != self.last_state_stamp {
+            match fs::read(&path) {
+                Ok(raw_bytes) if !raw_bytes.iter().all(|b| b.is_ascii_whitespace()) => {
+                    match serde_json::from_slice::<LearnerState>(&raw_bytes) {
+                        Ok(fresh_state) => {
+                            self.state = fresh_state;
+                            self.last_state_stamp = current_stamp;
+                        }
+                        Err(_) => {
+                            let _ = quarantine_corrupt_file(&path, &raw_bytes, true);
+                            self.last_state_stamp = FileStamp::of(&path);
+                        }
+                    }
+                }
+                Ok(_) => {
+                    self.last_state_stamp = current_stamp;
+                }
+                Err(_) if current_stamp.is_none() => {
+                    // External deletion of `learner_state.json`: reset in-memory state cleanly.
+                    self.state = LearnerState::default();
+                    self.last_state_stamp = None;
+                }
+                Err(_) => {}
             }
         }
     }
 
     pub fn flush_rules(&mut self) -> io::Result<()> {
         if self.parse_locked {
-            return Ok(());
+            let detail = self
+                .parse_error
+                .as_deref()
+                .unwrap_or("unparseable TOML");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "rules.toml has a syntax error and is write-locked to prevent data loss ({detail})"
+                ),
+            ));
         }
-        if let Some(path) = self.rules_path.as_ref() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(path, self.doc.to_string())?;
-            self.last_mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+        if let Some(path) = self.rules_path.as_ref().cloned() {
+            let rendered = self.doc.to_string();
+            atomic_write_bytes(&path, rendered.as_bytes())?;
+            self.last_rules_stamp = FileStamp::of(&path);
         }
         Ok(())
     }
@@ -510,6 +764,9 @@ impl RuleStore {
     /// Updates `[settings].enabled` in `rules.toml` while preserving all comments.
     pub fn set_enabled(&mut self, enabled: bool) -> io::Result<()> {
         self.sync_external_edits_before_write();
+        if self.parse_locked {
+            return self.flush_rules();
+        }
         self.compiled.enabled = enabled;
         let settings = self
             .doc
@@ -542,6 +799,9 @@ impl RuleStore {
             return Ok(false);
         };
         self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
         if key == "vi_lotus" {
             self.compiled.vi_lotus_enabled = enabled;
         }
@@ -558,14 +818,9 @@ impl RuleStore {
 
     pub fn flush_state(&mut self) -> io::Result<()> {
         if let Some(path) = self.state_path.as_ref().cloned() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
             let json = serde_json::to_string_pretty(&self.state).map_err(io::Error::other)?;
-            let tmp_path = path.with_extension("json.tmp");
-            fs::write(&tmp_path, json)?;
-            fs::rename(&tmp_path, &path)?;
-            self.last_state_mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+            atomic_write_bytes(&path, json.as_bytes())?;
+            self.last_state_stamp = FileStamp::of(&path);
         }
         Ok(())
     }
@@ -1010,6 +1265,7 @@ impl RuleStore {
     /// a mistaken `personal_dict` entry — automatic "un-dictionary").
     pub fn remove_personal_word(&mut self, lang: &LangId, word_lower: &str) -> bool {
         self.sync_external_edits_before_write();
+        self.sync_external_state_before_write();
         let word_l = word_lower.trim().to_lowercase();
         self.clear_undo_shield(lang, &word_l);
         let removed = if lang.as_str() == "en" {
@@ -1471,5 +1727,154 @@ impl UserRuleView for RuleStore {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{KeyInput, SmartKeyEngine, SmartKeySession};
+
+    fn temp_store_dir(tag: &str) -> PathBuf {
+        let nonce = TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "smartkey_store_test_{tag}_{}_{nonce}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn atomic_writes_leave_no_tmp_files_and_quarantine_corrupt_state() {
+        let dir = temp_store_dir("atomic_quarantine");
+        let rules_path = dir.join("rules.toml");
+        let state_path = dir.join("learner_state.json");
+
+        let mut store =
+            RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
+                .unwrap();
+        store.add_correction(&LangId::en(), "fomr", "from");
+        store.log_autocorrect_applied("fomr", "from", MatchKind::UserCorrectionRule);
+
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
+
+        // Write truncated JSON to `learner_state.json` -> reload quarantines it instead of silent loss
+        let broken_json = b"{\"staged_corrections\": {\"en:fomr->from\": ";
+        fs::write(&state_path, broken_json).unwrap();
+
+        let reloaded =
+            RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
+                .unwrap();
+        assert!(reloaded.state().applied_counts.is_empty());
+
+        let quarantined: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.starts_with("learner_state.json.corrupt-"))
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(fs::read(&quarantined[0]).unwrap(), broken_json);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broken_rules_toml_preserves_disabled_flags_and_surfaces_parse_lock_error() {
+        let dir = temp_store_dir("parse_locked");
+        let rules_path = dir.join("rules.toml");
+        let state_path = dir.join("learner_state.json");
+
+        let broken_toml = "\
+version = 1
+[settings]
+enabled = false
+[plugins]
+vi_lotus = false
+[corrections
+fomr = \"from\"
+";
+        fs::write(&rules_path, broken_toml).unwrap();
+
+        let mut store =
+            RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
+                .unwrap();
+        assert!(store.is_parse_locked());
+        assert!(store.parse_error().is_some());
+        assert!(
+            !store.compiled().enabled,
+            "broken rules.toml with enabled = false must NOT silently re-enable SmartKey"
+        );
+        assert!(
+            !store.compiled().vi_lotus_enabled,
+            "broken rules.toml with vi_lotus = false must NOT silently re-enable vi_lotus"
+        );
+
+        // Mutating setters must return InvalidData error instead of claiming success while no-oping
+        let err = store.set_enabled(true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(&rules_path).unwrap(),
+            broken_toml,
+            "user's broken rules.toml must remain untouched in place"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_reset_and_learner_sync_external_edits_before_flushing() {
+        let dir = temp_store_dir("sync_ordering");
+        let rules_path = dir.join("rules.toml");
+        let state_path = dir.join("learner_state.json");
+
+        let store_addon =
+            RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
+                .unwrap();
+        let mut engine = SmartKeyEngine::new_bundled(store_addon).unwrap();
+        let mut session = SmartKeySession::new();
+
+        // Addon types an unknown word ("qwfp ") and applies a fix so `applied_counts` is populated
+        for ch in "teh qwfp ".chars() {
+            session.process_key(&mut engine, KeyInput::Char(ch), 100);
+        }
+        assert_eq!(
+            engine.store().state().applied_counts.get("teh->the"),
+            Some(&1)
+        );
+
+        // Simulate CLI running `smartkey disable` + `smartkey log --clear` in another process
+        let mut store_cli =
+            RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
+                .unwrap();
+        store_cli.set_enabled(false).unwrap();
+        store_cli.clear_diagnostic_logs().unwrap();
+
+        // Focus loss triggers `session.reset(&mut engine)`: must reload external edits BEFORE
+        // flushing `pending_unknown`, so `applied_counts` stays cleared and `enabled` becomes false!
+        let _ = session.reset(&mut engine);
+        assert!(!engine.store().compiled().enabled);
+        assert!(
+            engine.store().state().applied_counts.is_empty(),
+            "session.reset must not clobber external CLI log --clear"
+        );
+
+        let on_disk: LearnerState =
+            serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert!(on_disk.applied_counts.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

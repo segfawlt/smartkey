@@ -14,6 +14,15 @@
 extern "C" {
 #endif
 
+/*
+ * Threading & error contract:
+ *   - `SmartKeyEngineHandle` and `SmartKeySessionHandle` are single-threaded
+ *     handles designed to be driven on the host input-method event loop. Do not
+ *     share handles concurrently across threads without external synchronization.
+ *   - Passing `NULL` for `rules_path_utf8` explicitly constructs an in-memory
+ *     engine; passing a non-NULL empty or invalid UTF-8 path fails and returns
+ *     `NULL`.
+ */
 typedef struct SmartKeyEngineHandle SmartKeyEngineHandle;
 typedef struct SmartKeySessionHandle SmartKeySessionHandle;
 
