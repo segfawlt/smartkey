@@ -1,6 +1,6 @@
 # Maintainer: segfawlt <segfawlt@users.noreply.github.com>
 pkgname=fcitx5-smartkey
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Privacy-first on-device PC English autocorrect and backspace learner for Fcitx5 (includes smartkey & smartkeyctl)"
 arch=('x86_64' 'aarch64')
