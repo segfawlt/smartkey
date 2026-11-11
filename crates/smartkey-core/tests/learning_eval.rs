@@ -740,8 +740,14 @@ fn test_diagnostics_config_and_jsonl_event_log() {
     store.log_app_bypass("kitty", smartkey_core::AppProfile::Bypass, "class_match");
 
     // Stale log file should be pruned on first write; unrelated file preserved
-    assert!(!stale_log.exists(), "stale events-2020-01-01.jsonl should be pruned");
-    assert!(unrelated_file.exists(), "non-event files must not be deleted");
+    assert!(
+        !stale_log.exists(),
+        "stale events-2020-01-01.jsonl should be pruned"
+    );
+    assert!(
+        unrelated_file.exists(),
+        "non-event files must not be deleted"
+    );
 
     let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
     let mut session = SmartKeySession::new();
@@ -779,9 +785,9 @@ fn test_diagnostics_config_and_jsonl_event_log() {
         && v["app"] == "kitty"
         && v["profile"] == "bypass"
         && v["reason"] == "class_match"));
-    assert!(lines.iter().any(|v| v["event"] == "word_unchanged"
-        && v["word"] == "sent"
-        && v["app"] == "kitty"));
+    assert!(lines
+        .iter()
+        .any(|v| v["event"] == "word_unchanged" && v["word"] == "sent" && v["app"] == "kitty"));
     assert!(lines.iter().any(|v| v["event"] == "real_word_declined"
         && v["prev"] == "sent"
         && v["word"] == "form"
@@ -792,13 +798,18 @@ fn test_diagnostics_config_and_jsonl_event_log() {
         && v["applied"] == "the"));
 
     // Verify learner_state.json recent_events only contains the 4 core variants (not bloated by WordUnchanged/RealWordDeclined)
-    assert!(engine.store().state().recent_events.iter().all(|ev| !matches!(
-        ev,
-        DiagnosticEvent::WordUnchanged { .. }
-            | DiagnosticEvent::RealWordDeclined { .. }
-            | DiagnosticEvent::AppBypass { .. }
-            | DiagnosticEvent::RuleLearned { .. }
-    )));
+    assert!(engine
+        .store()
+        .state()
+        .recent_events
+        .iter()
+        .all(|ev| !matches!(
+            ev,
+            DiagnosticEvent::WordUnchanged { .. }
+                | DiagnosticEvent::RealWordDeclined { .. }
+                | DiagnosticEvent::AppBypass { .. }
+                | DiagnosticEvent::RuleLearned { .. }
+        )));
 
     let _ = fs::remove_dir_all(&tmp_dir);
 }
@@ -898,11 +909,19 @@ fn test_unknown_target_2x_promotion_step5_personal_dict_and_2x_undictionary() {
         } if orig == "protmpcord" && fixed == "promptcord"
     )));
     assert!(
-        !engine.store().compiled().personal_dict.contains("promptcord"),
+        !engine
+            .store()
+            .compiled()
+            .personal_dict
+            .contains("promptcord"),
         "1x manual fix must not promote unknown target to personal_dict yet"
     );
     assert!(
-        !engine.store().compiled().corrections.contains_key("protmpcord"),
+        !engine
+            .store()
+            .compiled()
+            .corrections
+            .contains_key("protmpcord"),
         "1x manual fix must not graduate correction yet"
     );
 
@@ -920,7 +939,11 @@ fn test_unknown_target_2x_promotion_step5_personal_dict_and_2x_undictionary() {
         LearnEvent::GraduatedCorrection { orig, fixed, .. }
             if orig == "protmpcord" && fixed == "promptcord"
     )));
-    assert!(engine.store().compiled().personal_dict.contains("promptcord"));
+    assert!(engine
+        .store()
+        .compiled()
+        .personal_dict
+        .contains("promptcord"));
     assert_eq!(
         engine
             .store()
@@ -946,9 +969,18 @@ fn test_unknown_target_2x_promotion_step5_personal_dict_and_2x_undictionary() {
 
     // Key-bounce extension `zyxqwert -> zyxqwertt` is rejected
     buf.clear();
-    let evs_bounce = feed_keys(&mut session, &mut engine, &mut buf, "zyxqwert <CBS>zyxqwertt ");
+    let evs_bounce = feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "zyxqwert <CBS>zyxqwertt ",
+    );
     assert!(evs_bounce.contains(&LearnEvent::Ignored(SkipReason::TargetNotValidWord)));
-    assert!(!engine.store().compiled().personal_dict.contains("zyxqwertt"));
+    assert!(!engine
+        .store()
+        .compiled()
+        .personal_dict
+        .contains("zyxqwertt"));
 
     // 5. Automatic 2x "Un-dictionary":
     // Suppose `promptcord` in `personal_dict` was itself a mistake and the user fixes `promptcord -> promptcard` 2x:
@@ -960,7 +992,11 @@ fn test_unknown_target_2x_promotion_step5_personal_dict_and_2x_undictionary() {
         "promptcord <CBS>promptcard ",
     );
     // After 1x, `promptcord` is still in `personal_dict`
-    assert!(engine.store().compiled().personal_dict.contains("promptcord"));
+    assert!(engine
+        .store()
+        .compiled()
+        .personal_dict
+        .contains("promptcord"));
 
     buf.clear();
     feed_keys(
@@ -972,10 +1008,18 @@ fn test_unknown_target_2x_promotion_step5_personal_dict_and_2x_undictionary() {
     // After 2x, `promptcord` is automatically un-dictionaried and replaced by `promptcard`,
     // and `promptcord -> promptcard` graduates to `[corrections]`!
     assert!(
-        !engine.store().compiled().personal_dict.contains("promptcord"),
+        !engine
+            .store()
+            .compiled()
+            .personal_dict
+            .contains("promptcord"),
         "2x manual fix away from a personal_dict word must un-dictionary it"
     );
-    assert!(engine.store().compiled().personal_dict.contains("promptcard"));
+    assert!(engine
+        .store()
+        .compiled()
+        .personal_dict
+        .contains("promptcard"));
     assert_eq!(
         engine
             .store()
@@ -1045,7 +1089,12 @@ fn test_undo_recovery_purges_bad_learned_correction_and_guard_vi_ascii_telex() {
         .store_mut()
         .add_correction(&LangId::en(), "fomr", "forn");
     assert_eq!(
-        engine.store().compiled().corrections.get("fomr").map(String::as_str),
+        engine
+            .store()
+            .compiled()
+            .corrections
+            .get("fomr")
+            .map(String::as_str),
         Some("forn")
     );
 
@@ -1149,14 +1198,16 @@ fn test_canonical_casing_learning_and_typo_repair() {
         &mut buf,
         "pytroch Pytroch pytorch hypland Hypland hyprland ",
     );
-    assert_eq!(
-        buf,
-        "PyTorch PyTorch PyTorch Hyprland Hyprland Hyprland "
-    );
+    assert_eq!(buf, "PyTorch PyTorch PyTorch Hyprland Hyprland Hyprland ");
 
     // 4. CapsLock inversion ("cHAGNES") and sentence-start late-shift ("cHagnes") repair typos to "Changes"
     buf.clear();
-    feed_keys(&mut session, &mut engine, &mut buf, "<ENTER>cHagnes cHAGNES ");
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "<ENTER>cHagnes cHAGNES ",
+    );
     assert_eq!(buf, "\nChanges Changes ");
 }
 
@@ -1170,7 +1221,11 @@ fn test_untouched_unknowns_cleanup_on_manual_fix_backspace_and_demotion() {
     // 1. Immediate backspace cancels tentative unfixed_unknown counter
     feed_keys(&mut session, &mut engine, &mut buf, "zellij <CBS>nvim ");
     assert!(
-        !engine.store().state().untouched_unknowns.contains_key("zellij"),
+        !engine
+            .store()
+            .state()
+            .untouched_unknowns
+            .contains_key("zellij"),
         "immediate Ctrl+BackSpace must cancel tentative untouched_unknowns entry"
     );
 
@@ -1228,6 +1283,193 @@ fn test_untouched_unknowns_cleanup_on_manual_fix_backspace_and_demotion() {
     session.set_lang(LangId::vi());
     buf.clear();
     feed_keys(&mut session, &mut engine, &mut buf, "anh em hai ba <ENTER>");
-    assert!(!engine.store().state().untouched_unknowns.contains_key("anh"));
-    assert!(!engine.store().state().untouched_unknowns.contains_key("vi:anh"));
+    assert!(!engine
+        .store()
+        .state()
+        .untouched_unknowns
+        .contains_key("anh"));
+    assert!(!engine
+        .store()
+        .state()
+        .untouched_unknowns
+        .contains_key("vi:anh"));
+}
+
+// --- 2x evidence for blocking curated unconditional contractions ---
+
+fn contraction_tmp_paths(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let dir = std::env::temp_dir().join(format!(
+        "smartkey_contraction_{tag}_{}_{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    (
+        dir.clone(),
+        dir.join("rules.toml"),
+        dir.join("learner_state.json"),
+    )
+}
+
+fn contraction_engine(rules: &Path, state: &Path) -> SmartKeyEngine {
+    let store = RuleStore::load_or_init(rules.to_path_buf(), state.to_path_buf(), Preset::Balanced)
+        .unwrap();
+    SmartKeyEngine::new_bundled(store).unwrap()
+}
+
+fn reject_count(engine: &SmartKeyEngine) -> u32 {
+    engine
+        .store()
+        .state()
+        .staged_contraction_rejects
+        .get("en:dont->don't")
+        .copied()
+        .unwrap_or(0)
+}
+
+#[test]
+fn contraction_predicate_matches_only_curated_pairs() {
+    use smartkey_core::scorer::is_unconditional_contraction_pair as p;
+    assert!(p("dont", "don't"));
+    assert!(p("im", "I'm"));
+    assert!(p("im", "i'm"));
+    assert!(!p("alot", "a lot"));
+    assert!(!p("dont", "doesn't"));
+}
+
+#[test]
+fn contraction_undo_keep_needs_2x_across_sessions_to_block() {
+    let (dir, rules, state) = contraction_tmp_paths("undo_keep");
+
+    // Session 1: 1x undo-keep stages only.
+    {
+        let mut engine = contraction_engine(&rules, &state);
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "dont <BS> ");
+        assert_eq!(buf, "dont ");
+        assert!(evs.contains(&LearnEvent::ShieldedWordSession {
+            word: "dont".to_string()
+        }));
+        assert_eq!(reject_count(&engine), 1);
+        assert!(
+            engine.store().state().staged_undo_keep.is_empty(),
+            "1x must not persist an undo-keep key (it acts as a cross-session shield)"
+        );
+        assert!(!engine
+            .store()
+            .compiled()
+            .blocklist
+            .contains(&("dont".to_string(), "don't".to_string())));
+    }
+
+    // Session 2: rule still fires; 2nd undo-keep blocks and graduates in lockstep.
+    {
+        let mut engine = contraction_engine(&rules, &state);
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+        feed_keys(&mut session, &mut engine, &mut buf, "dont ");
+        assert_eq!(
+            buf, "don't ",
+            "1x accident must not silence the curated rule"
+        );
+
+        buf.clear();
+        let mut session = SmartKeySession::new();
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "dont <BS> ");
+        assert_eq!(buf, "dont ");
+        assert_eq!(reject_count(&engine), 2);
+        assert!(engine
+            .store()
+            .compiled()
+            .blocklist
+            .contains(&("dont".to_string(), "don't".to_string())));
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, LearnEvent::GraduatedUndoKeep { .. })),
+            "contraction rejection must not promote the raw form into personal_dict: {evs:?}"
+        );
+        assert!(!engine.store().compiled().personal_dict.contains("dont"));
+    }
+
+    // Session 3: blocked.
+    {
+        let mut engine = contraction_engine(&rules, &state);
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+        feed_keys(&mut session, &mut engine, &mut buf, "dont ");
+        assert_eq!(buf, "dont ");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contraction_edit_to_third_word_blocks_only_at_2x() {
+    let (dir, rules, state) = contraction_tmp_paths("third");
+    for round in 1..=2u32 {
+        let mut engine = contraction_engine(&rules, &state);
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "dont <BS><BS><BS>nut ");
+        let blocked_ev = evs.iter().any(
+            |e| matches!(e, LearnEvent::BlockedPairPermanent { typed, .. } if typed == "dont"),
+        );
+        assert_eq!(reject_count(&engine), round, "{evs:?}");
+        assert_eq!(
+            engine
+                .store()
+                .compiled()
+                .blocklist
+                .contains(&("dont".to_string(), "don't".to_string())),
+            round == 2
+        );
+        assert_eq!(blocked_ev, round == 2, "{evs:?}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contraction_manual_fix_graduation_clears_stale_block() {
+    let (dir, rules, state) = contraction_tmp_paths("deadlock");
+    {
+        let mut engine = contraction_engine(&rules, &state);
+        engine.store_mut().add_permanent_block("dont", "don't");
+        assert!(engine
+            .store()
+            .compiled()
+            .blocklist
+            .contains(&("dont".to_string(), "don't".to_string())));
+    }
+    for _ in 0..2 {
+        let mut engine = contraction_engine(&rules, &state);
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "dont <CBS>don't ");
+        assert_eq!(buf, "don't ", "{evs:?}");
+    }
+    let mut engine = contraction_engine(&rules, &state);
+    assert!(!engine
+        .store()
+        .compiled()
+        .blocklist
+        .contains(&("dont".to_string(), "don't".to_string())));
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+    feed_keys(&mut session, &mut engine, &mut buf, "dont ");
+    assert_eq!(buf, "don't ");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_contraction_undo_keep_still_blocks_at_1x() {
+    let (dir, rules, state) = contraction_tmp_paths("alot");
+    let mut engine = contraction_engine(&rules, &state);
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+    feed_keys(&mut session, &mut engine, &mut buf, "alot <BS> ");
+    assert!(engine.store().is_pair_blocked("alot", "a lot"));
+    assert!(engine.store().state().staged_contraction_rejects.is_empty());
+    let _ = fs::remove_dir_all(&dir);
 }

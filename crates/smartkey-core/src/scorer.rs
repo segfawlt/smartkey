@@ -136,6 +136,16 @@ const UNCONDITIONAL_CONTRACTIONS: &[(&str, &str)] = &[
     ("mustve", "must've"),
 ];
 
+/// True when `(typed_lower, expanded_lower)` is one of the curated unconditional contraction
+/// pairs above (`dont -> don't`). These are near-100% corrections — the typed form is never a
+/// valid English word — so a single accidental rejection must not permanently block them
+/// (see `learner::reject_pair_permanently` for the `2x` evidence requirement).
+pub fn is_unconditional_contraction_pair(typed_lower: &str, expanded_lower: &str) -> bool {
+    UNCONDITIONAL_CONTRACTIONS.iter().any(|&(raw, expanded)| {
+        raw == typed_lower && expanded.to_lowercase() == expanded_lower.to_lowercase()
+    })
+}
+
 /// Transposed apostrophe slips (`do'nt -> don't`, `does'nt -> doesn't`).
 const TRANSPOSED_APOSTROPHES: &[(&str, &str)] = &[
     ("do'nt", "don't"),
@@ -752,7 +762,8 @@ impl EnglishScorer {
             // Proper Noun auto-capitalization (english -> English, monday -> Monday)
             if config.fix_proper_nouns && !shift_slip_fixed {
                 if let Some(proper) = self.lexicon.lookup_proper_noun(&core_lower) {
-                    if core != proper && !rules.is_pair_blocked(&core_lower, &proper.to_lowercase()) {
+                    if core != proper && !rules.is_pair_blocked(&core_lower, &proper.to_lowercase())
+                    {
                         let rep = wrap(proper);
                         if rep != token {
                             return (

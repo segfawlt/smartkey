@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::casing::is_expressive_stretch;
 use crate::keyboard::damerau_levenshtein_chars;
 use crate::lexicon::EnglishLexicon;
-use crate::scorer::UserRuleView;
+use crate::scorer::{is_unconditional_contraction_pair, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::LangId;
 
@@ -149,9 +149,67 @@ fn is_prose_word_token(s: &str) -> bool {
             .all(|c| c.is_alphabetic() || c == '\'' || c == '’')
 }
 
+/// Rejects the `(typed, rejected)` autocorrect pair. Curated unconditional-contraction pairs
+/// (`dont -> don't`) are staged first: the permanent block — which also erases a matching
+/// learned correction — only lands on the `2x` rejection across sessions, matching the `2x`
+/// evidence the manual-fix learner needs. One accidental BackSpace must never permanently
+/// silence a near-100% curated rule. Every other pair keeps the immediate `1x` permanent block.
+/// Returns `true` when the pair is (now) permanently blocked.
+fn reject_pair_permanently(
+    store: &mut RuleStore,
+    lang: &LangId,
+    typed_lower: &str,
+    rejected_lower: &str,
+) -> bool {
+    if is_unconditional_contraction_pair(typed_lower, rejected_lower) {
+        let key = format!("{}:{}->{}", lang.as_str(), typed_lower, rejected_lower);
+        store.sync_state_before_write();
+        let cnt = {
+            let e = store
+                .state_mut()
+                .staged_contraction_rejects
+                .entry(key)
+                .or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        };
+        let _ = store.flush_state();
+        if cnt < 2 {
+            return false;
+        }
+    }
+    store.add_permanent_block(typed_lower, rejected_lower);
+    true
+}
+
+/// Clears every rejection trace for `(typed, fixed)` after a manual fix graduated: the permanent
+/// blocklist pair and the staged contraction-rejection counter. Repeated deliberate fixes must
+/// always outrank earlier — possibly accidental — rejections; without this, a stale block both
+/// shadows the graduated correction in the scorer and makes the next `add_permanent_block`
+/// erase it again, deadlocking recovery by typing.
+fn clear_pair_rejection(store: &mut RuleStore, lang: &LangId, typed_lower: &str, fixed: &str) {
+    let _ = store.remove_blocklist_pair(typed_lower, fixed);
+    let key = format!(
+        "{}:{}->{}",
+        lang.as_str(),
+        typed_lower,
+        fixed.to_lowercase()
+    );
+    let state = store.state_mut();
+    if state.staged_contraction_rejects.remove(&key).is_some()
+        || is_unconditional_contraction_pair(typed_lower, &fixed.to_lowercase())
+    {
+        // The 2x-blocked path leaves a persisted undo-keep key that `is_undo_shielded` reads as a
+        // cross-session shield; graduation must lift it too.
+        state.staged_undo_keep.remove(&key);
+    }
+}
+
 /// Row 2: `Undo + Keep Verbatim` (`"hok " -> "hot " -> BS -> Space`).
-/// - `1x`: Immediately blocks `(typed, rejected)` in `blocklist` on disk AND shields `typed_lower` in-session
-///   so the user never has to backspace the same unwanted replacement twice.
+/// - `1x`: Immediately blocks `(typed, rejected)` in `blocklist` on disk AND shields `typed_lower`
+///   in-session so the user never has to backspace the same unwanted replacement twice — EXCEPT
+///   curated contraction pairs (`"dont" -> "don't"`), which only stage the rejection (see
+///   `reject_pair_permanently`); the session shield already covers the rest of the session.
 /// - `2x`: Permanently promotes `typed` to `personal_dict` in `rules.toml`.
 pub fn record_undo_keep_verbatim(
     store: &mut RuleStore,
@@ -167,7 +225,13 @@ pub fn record_undo_keep_verbatim(
 
     store.add_session_word_shield(&typed_lower);
     store.add_session_pair_block(&typed_lower, &rejected_lower);
-    store.add_permanent_block(&typed_lower, &rejected_lower);
+    if !reject_pair_permanently(store, lang, &typed_lower, &rejected_lower) {
+        // `1x` rejection of a curated contraction pair: session shield only, nothing permanent.
+        // Must return BEFORE touching `staged_undo_keep`: `RuleStore::is_undo_shielded` treats any
+        // persisted `staged_undo_keep` key for the word as a cross-session shield, which would
+        // silence the curated rule on the very next session and defeat the `2x` requirement.
+        return LearnEvent::ShieldedWordSession { word: typed_lower };
+    }
     store.sync_state_before_write();
 
     let key = format!("{}:{}->{}", lang.as_str(), typed_lower, rejected_lower);
@@ -201,6 +265,7 @@ pub fn record_undo_keep_verbatim(
 /// - If `final == rejected`: `Self-Confirm Cancel` (proves BackSpace was an accident!).
 /// - If `final == raw_typed`: delegates to `record_undo_keep_verbatim` (`1x` session shield, `2x` permanent).
 /// - If `final` is a 3rd word (`fomr -> foam -> BS -> form`): `1x` immediate permanent `blocklist(fomr, foam)`
+///   (curated contraction pairs stage at `2x` instead, see `reject_pair_permanently`)
 ///   plus routes `(fomr -> form)` through the `2x` guarded manual-edit learner.
 pub fn resolve_restored_edit(
     store: &mut RuleStore,
@@ -249,9 +314,12 @@ pub fn resolve_restored_edit(
     ) {
         return vec![edit_ev];
     }
-    store.add_permanent_block(&raw_lower, &rej_lower);
-    let rej_in_lexicon = lang.as_str() == "en"
-        && lexicon.is_some_and(|l| l.contains_any_english(&rej_lower));
+    // Curated contraction pairs stage their rejection (`2x` -> permanent); other pairs keep the
+    // immediate `1x` block. Editing to a 3rd word (`"dont" -> "don't" -> BS -> "donut "`) is weak
+    // evidence against the contraction — it may simply have been a different intended word.
+    let pair_blocked = reject_pair_permanently(store, lang, &raw_lower, &rej_lower);
+    let rej_in_lexicon =
+        lang.as_str() == "en" && lexicon.is_some_and(|l| l.contains_any_english(&rej_lower));
     if !rej_in_lexicon && store.is_explicit_personal_word(lang, &rej_lower) {
         let demote_key = format!("demote:{}:{}", lang.as_str(), rej_lower);
         let cnt = {
@@ -268,13 +336,17 @@ pub fn resolve_restored_edit(
         }
         let _ = store.flush_state();
     }
-    vec![
-        LearnEvent::BlockedPairPermanent {
-            typed: raw_lower,
-            rejected: rej_lower,
-        },
-        edit_ev,
-    ]
+    let mut events = vec![edit_ev];
+    if pair_blocked {
+        events.insert(
+            0,
+            LearnEvent::BlockedPairPermanent {
+                typed: raw_lower,
+                rejected: rej_lower,
+            },
+        );
+    }
+    events
 }
 
 /// Row 4 & Row 6: Evaluates a manual edit (`orig -> fixed`) through `Delta-Span Check` + Guards 1–3,
@@ -496,9 +568,15 @@ fn record_manual_edit_inner(
         let has_internal_upper = fixed_trimmed.chars().skip(1).any(char::is_uppercase);
         let has_intentional_title = fixed_trimmed.chars().next().is_some_and(char::is_uppercase)
             && (target_is_novel_unknown
-                || orig_raw.trim().chars().next().is_some_and(char::is_lowercase)
-                || lexicon.is_some_and(|l| l.lookup_word(&fixed_lower).is_some_and(|m| m.is_tech())));
-        let target_to_save = if target_has_non_ascii || has_internal_upper || has_intentional_title {
+                || orig_raw
+                    .trim()
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_lowercase)
+                || lexicon
+                    .is_some_and(|l| l.lookup_word(&fixed_lower).is_some_and(|m| m.is_tech())));
+        let target_to_save = if target_has_non_ascii || has_internal_upper || has_intentional_title
+        {
             fixed_trimmed.to_string()
         } else {
             fixed_lower.clone()
@@ -550,6 +628,9 @@ fn record_manual_edit_inner(
                 );
             }
             store.add_correction(&effective_lang, &orig_lower, &target_to_save);
+            // Graduation is strictly stronger evidence than any earlier rejection of the same
+            // pair — clear its blocklist entry so the new rule actually fires.
+            clear_pair_rejection(store, &effective_lang, &orig_lower, &target_to_save);
             let _ = store.flush_state();
             return LearnEvent::GraduatedCorrection {
                 lang: effective_lang.0,
@@ -607,6 +688,9 @@ fn record_manual_edit_inner(
     };
     if count >= 2 {
         store.add_context_correction(&prev_lower, &orig_lower, &fixed_lower);
+        // Same as the plain graduation above: a stale rejection of this pair must not shadow
+        // the newly graduated context correction.
+        clear_pair_rejection(store, &effective_lang, &orig_lower, &fixed_lower);
         let _ = store.flush_state();
         LearnEvent::GraduatedContextCorrection {
             prev: prev_lower,

@@ -180,6 +180,10 @@ pub struct LearnerState {
     pub staged_corrections: BTreeMap<String, u32>,
     pub staged_context: BTreeMap<String, u32>,
     pub staged_undo_keep: BTreeMap<String, u32>,
+    /// Staged rejections of curated unconditional-contraction pairs (`dont -> don't`).
+    /// The permanent blocklist write only lands on the `2x` rejection (across sessions);
+    /// a single accidental BackSpace must never silence a curated rule.
+    pub staged_contraction_rejects: BTreeMap<String, u32>,
     pub untouched_unknowns: BTreeMap<String, u32>,
     pub staged_telex_passthrough: BTreeMap<String, u32>,
     pub trouble_words: BTreeMap<String, u32>,
@@ -406,7 +410,11 @@ pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Preserves a corrupt `rules.toml` or `learner_state.json` snapshot as `<file>.corrupt-<epoch_ms>`
 /// (deduplicated by exact byte contents so repeated loads while an editor has a syntax error never
 /// spam backup files). When `remove_original` is true, moves the corrupt file out of the way.
-fn quarantine_corrupt_file(path: &Path, raw_bytes: &[u8], remove_original: bool) -> Option<PathBuf> {
+fn quarantine_corrupt_file(
+    path: &Path,
+    raw_bytes: &[u8],
+    remove_original: bool,
+) -> Option<PathBuf> {
     let parent_dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -717,7 +725,11 @@ impl RuleStore {
         };
 
         let store = Self {
-            rules_path: if rules_exists { Some(rules_path.clone()) } else { None },
+            rules_path: if rules_exists {
+                Some(rules_path.clone())
+            } else {
+                None
+            },
             state_path: if state_path.exists() {
                 Some(state_path.clone())
             } else {
@@ -771,11 +783,8 @@ impl RuleStore {
 
     pub fn record_event_only(&mut self, ev: &DiagnosticEvent) {
         if self.compiled.diagnostics.event_log {
-            self.event_log.record(
-                &self.compiled.diagnostics,
-                self.active_lang.as_str(),
-                ev,
-            );
+            self.event_log
+                .record(&self.compiled.diagnostics, self.active_lang.as_str(), ev);
         }
     }
 
@@ -919,10 +928,7 @@ impl RuleStore {
 
     pub fn flush_rules(&mut self) -> io::Result<()> {
         if self.parse_locked {
-            let detail = self
-                .parse_error
-                .as_deref()
-                .unwrap_or("unparseable TOML");
+            let detail = self.parse_error.as_deref().unwrap_or("unparseable TOML");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -1123,7 +1129,11 @@ impl RuleStore {
             return;
         }
         let total_count = {
-            let e = self.state.untouched_unknowns.entry(word_l.clone()).or_insert(0);
+            let e = self
+                .state
+                .untouched_unknowns
+                .entry(word_l.clone())
+                .or_insert(0);
             *e = e.saturating_add(1);
             *e
         };
@@ -1242,12 +1252,9 @@ impl RuleStore {
         self.sync_external_edits_before_write();
         let mut modified = false;
 
-        if self
-            .compiled
-            .corrections
-            .get(typed_lower)
-            .is_some_and(|t| t.eq_ignore_ascii_case(rejected_lower) || t.to_lowercase() == rejected_lower)
-        {
+        if self.compiled.corrections.get(typed_lower).is_some_and(|t| {
+            t.eq_ignore_ascii_case(rejected_lower) || t.to_lowercase() == rejected_lower
+        }) {
             self.compiled.corrections.remove(typed_lower);
             if let Some(tbl) = self.doc.get_mut("corrections").and_then(Item::as_table_mut) {
                 tbl.remove(typed_lower);
@@ -1348,7 +1355,11 @@ impl RuleStore {
                     self.compiled
                         .personal_dict_canonical
                         .insert(word_lower.clone(), word_trimmed.to_string());
-                    if let Some(arr) = self.doc.get_mut("personal_dict").and_then(Item::as_array_mut) {
+                    if let Some(arr) = self
+                        .doc
+                        .get_mut("personal_dict")
+                        .and_then(Item::as_array_mut)
+                    {
                         for item in arr.iter_mut() {
                             if item
                                 .as_str()
@@ -1462,16 +1473,25 @@ impl RuleStore {
             self.compiled.personal_dict_canonical.remove(&word_l);
             let did_remove = self.compiled.personal_dict.remove(&word_l);
             if did_remove {
-                if let Some(arr) = self.doc.get_mut("personal_dict").and_then(Item::as_array_mut) {
+                if let Some(arr) = self
+                    .doc
+                    .get_mut("personal_dict")
+                    .and_then(Item::as_array_mut)
+                {
                     arr.retain(|v| {
-                        !v.as_str()
-                            .is_some_and(|s| s.eq_ignore_ascii_case(&word_l) || s.to_lowercase() == word_l)
+                        !v.as_str().is_some_and(|s| {
+                            s.eq_ignore_ascii_case(&word_l) || s.to_lowercase() == word_l
+                        })
                     });
                 }
             }
             did_remove
         } else {
-            if let Some(m) = self.compiled.lang_personal_dict_canonical.get_mut(lang.as_str()) {
+            if let Some(m) = self
+                .compiled
+                .lang_personal_dict_canonical
+                .get_mut(lang.as_str())
+            {
                 m.remove(&word_l);
             }
             let did_remove = self
@@ -1490,8 +1510,9 @@ impl RuleStore {
                     .and_then(Item::as_array_mut)
                 {
                     arr.retain(|v| {
-                        !v.as_str()
-                            .is_some_and(|s| s.eq_ignore_ascii_case(&word_l) || s.to_lowercase() == word_l)
+                        !v.as_str().is_some_and(|s| {
+                            s.eq_ignore_ascii_case(&word_l) || s.to_lowercase() == word_l
+                        })
                     });
                 }
             }
@@ -2192,7 +2213,11 @@ impl RuleStore {
     }
 
     /// Updates `key` in `rules.toml` (preserving comments), recompiles settings, and returns `(canonical_key, canonical_value)`.
-    pub fn set_setting(&mut self, key: &str, raw_value: &str) -> io::Result<(&'static str, String)> {
+    pub fn set_setting(
+        &mut self,
+        key: &str,
+        raw_value: &str,
+    ) -> io::Result<(&'static str, String)> {
         let Some(canon) = Self::normalize_setting_key(key) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2257,7 +2282,9 @@ impl RuleStore {
                 let ms: i64 = raw_value.trim().parse().map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("invalid undo_window_ms {raw_value:?} (expected integer 100..=60000)"),
+                        format!(
+                            "invalid undo_window_ms {raw_value:?} (expected integer 100..=60000)"
+                        ),
                     )
                 })?;
                 if !(100..=60_000).contains(&ms) {
@@ -2293,9 +2320,7 @@ impl RuleStore {
             "settings.expand_shorthand" => {
                 TomlPatch::Bool("settings", "expand_shorthand", parse_bool(raw_value)?)
             }
-            "plugins.vi_lotus" => {
-                TomlPatch::Bool("plugins", "vi_lotus", parse_bool(raw_value)?)
-            }
+            "plugins.vi_lotus" => TomlPatch::Bool("plugins", "vi_lotus", parse_bool(raw_value)?),
             "diagnostics.event_log" => {
                 TomlPatch::Bool("diagnostics", "event_log", parse_bool(raw_value)?)
             }
@@ -2318,7 +2343,9 @@ impl RuleStore {
                 let days: i64 = raw_value.trim().parse().map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("invalid diagnostics.keep_days {raw_value:?} (expected integer >= 0)"),
+                        format!(
+                            "invalid diagnostics.keep_days {raw_value:?} (expected integer >= 0)"
+                        ),
                     )
                 })?;
                 if !(0..=3650).contains(&days) {
@@ -2341,7 +2368,9 @@ impl RuleStore {
                 if !(0.0..=1.0).contains(&band) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("diagnostics.near_miss_band {band} out of range (expected 0.0..=1.0)"),
+                        format!(
+                            "diagnostics.near_miss_band {band} out of range (expected 0.0..=1.0)"
+                        ),
                     ));
                 }
                 TomlPatch::Float("diagnostics", "near_miss_band", band)
@@ -2568,7 +2597,8 @@ impl RuleStore {
                     let lower = trimmed.to_lowercase();
                     if !lower.is_empty() {
                         out.personal_dict.insert(lower.clone());
-                        out.personal_dict_canonical.insert(lower, trimmed.to_string());
+                        out.personal_dict_canonical
+                            .insert(lower, trimmed.to_string());
                     }
                 }
             }
