@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::casing::is_expressive_stretch;
 use crate::keyboard::damerau_levenshtein_chars;
 use crate::lexicon::EnglishLexicon;
-use crate::scorer::{is_unconditional_contraction_pair, UserRuleView};
+use crate::scorer::{is_staged_rejection_pair, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::LangId;
 
@@ -155,7 +155,7 @@ fn is_prose_word_token(s: &str) -> bool {
 const CONTRACTION_REJECT_STALE_AFTER_ACCEPTS: u32 = 10;
 
 /// Rejects the `(typed, rejected)` autocorrect pair. Curated unconditional-contraction pairs
-/// (`dont -> don't`) are staged first: the permanent block — which also erases a matching
+/// (`dont -> don't`) and case-only proper-noun pairs (`english -> English`) are staged first: the permanent block — which also erases a matching
 /// learned correction — only lands on the `2x` rejection across sessions, matching the `2x`
 /// evidence the manual-fix learner needs. One accidental BackSpace must never permanently
 /// silence a near-100% curated rule. Every other pair keeps the immediate `1x` permanent block.
@@ -166,7 +166,7 @@ fn reject_pair_permanently(
     typed_lower: &str,
     rejected_lower: &str,
 ) -> bool {
-    if is_unconditional_contraction_pair(typed_lower, rejected_lower) {
+    if is_staged_rejection_pair(typed_lower, rejected_lower) {
         let key = format!("{}:{}->{}", lang.as_str(), typed_lower, rejected_lower);
         store.sync_state_before_write();
         let applied_now = store
@@ -217,7 +217,7 @@ fn clear_pair_rejection(store: &mut RuleStore, lang: &LangId, typed_lower: &str,
     let state = store.state_mut();
     state.staged_contraction_reject_applied_at.remove(&key);
     if state.staged_contraction_rejects.remove(&key).is_some()
-        || is_unconditional_contraction_pair(typed_lower, &fixed.to_lowercase())
+        || is_staged_rejection_pair(typed_lower, &fixed.to_lowercase())
     {
         // The 2x-blocked path leaves a persisted undo-keep key that `is_undo_shielded` reads as a
         // cross-session shield; graduation must lift it too.
@@ -243,6 +243,10 @@ pub fn record_undo_keep_verbatim(
         return LearnEvent::None;
     }
 
+    if store.is_pinned(&typed_lower) {
+        // Pinned words never learn against their curated capitalization, accident or not.
+        return LearnEvent::None;
+    }
     store.add_session_word_shield(&typed_lower);
     store.add_session_pair_block(&typed_lower, &rejected_lower);
     if !reject_pair_permanently(store, lang, &typed_lower, &rejected_lower) {
@@ -300,14 +304,28 @@ pub fn resolve_restored_edit(
     let rej_lower = rejected.to_lowercase();
     let fin_lower = final_committed.to_lowercase();
 
+    // Case-only corrections (`polish -> Polish`) compare equal once lowercased, so Row 3 would
+    // swallow a deliberate keep-verbatim. Compare exact case for those pairs.
+    let case_only = raw_lower == rej_lower;
+    let final_is_rejected = if case_only {
+        final_committed == rejected
+    } else {
+        fin_lower == rej_lower
+    };
+    let final_is_raw = if case_only {
+        final_committed == raw_typed
+    } else {
+        fin_lower == raw_lower
+    };
+
     // Row 3: Accidental BackSpace (`"chagnes " -> "changes " -> BS -> "changes "`)
-    if fin_lower == rej_lower {
+    if final_is_rejected {
         store.resolve_pending_undo_log(raw_typed, rejected, UndoResolution::SelfConfirmCancelled);
         return vec![LearnEvent::SelfConfirmCancelled];
     }
 
     // Row 2: Kept verbatim (`"hok " -> "hot " -> BS -> "hok "`)
-    if fin_lower == raw_lower {
+    if final_is_raw {
         store.resolve_pending_undo_log(raw_typed, rejected, UndoResolution::KeptVerbatim);
         return vec![record_undo_keep_verbatim(store, lang, raw_typed, rejected)];
     }

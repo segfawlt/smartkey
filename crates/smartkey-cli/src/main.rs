@@ -518,7 +518,12 @@ fn parse_lang_arg(raw: &str) -> Result<LangId, CliError> {
     match raw.trim() {
         "en" | "en_US" | "en_GB" => Ok(LangId::en()),
         "vi" | "vi-lotus" | "vi_lotus" | "lotus" => Ok(LangId::vi()),
-        other if !other.is_empty() && other.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') => {
+        other
+            if !other.is_empty()
+                && other
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+        {
             Ok(LangId(other.to_string()))
         }
         other => Err(CliError::Usage(format!(
@@ -535,7 +540,8 @@ struct RulesJson {
     personal_dict: Vec<String>,
     lang_personal_dict: std::collections::BTreeMap<String, Vec<String>>,
     corrections: std::collections::BTreeMap<String, String>,
-    lang_corrections: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    lang_corrections:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     context_corrections: std::collections::BTreeMap<String, String>,
     snippets: std::collections::BTreeMap<String, String>,
     blocklist: Vec<(String, String)>,
@@ -746,7 +752,11 @@ fn cmd_rules(args: &[String]) -> CliResult {
                                 .unwrap_or(w.as_str())
                         })
                         .collect();
-                    println!("\nPersonal Words [en] ({}): {}", words.len(), words.join(", "));
+                    println!(
+                        "\nPersonal Words [en] ({}): {}",
+                        words.len(),
+                        words.join(", ")
+                    );
                 }
                 for (lk, set) in &c.lang_personal_dict {
                     if !set.is_empty() {
@@ -760,7 +770,11 @@ fn cmd_rules(args: &[String]) -> CliResult {
                                     .unwrap_or(w.as_str())
                             })
                             .collect();
-                        println!("\nPersonal Words [{lk}] ({}): {}", words.len(), words.join(", "));
+                        println!(
+                            "\nPersonal Words [{lk}] ({}): {}",
+                            words.len(),
+                            words.join(", ")
+                        );
                     }
                 }
                 if !c.blocklist.is_empty() {
@@ -769,9 +783,17 @@ fn cmd_rules(args: &[String]) -> CliResult {
                         println!("  typed={t:?} rejected={r:?}");
                     }
                 }
+                if !c.pinned.is_empty() {
+                    let words: Vec<&str> = c.pinned.iter().map(String::as_str).collect();
+                    println!("\nPinned ({}): {}", words.len(), words.join(", "));
+                }
                 if !c.telex_passthrough.is_empty() {
                     let words: Vec<&str> = c.telex_passthrough.iter().map(String::as_str).collect();
-                    println!("\nTelex Passthrough ({}): {}", words.len(), words.join(", "));
+                    println!(
+                        "\nTelex Passthrough ({}): {}",
+                        words.len(),
+                        words.join(", ")
+                    );
                 }
             } else if !st.skipped_edits.is_empty() {
                 println!(
@@ -781,7 +803,12 @@ fn cmd_rules(args: &[String]) -> CliResult {
                 for entry in st.skipped_edits.iter().rev().take(10) {
                     println!(
                         "  [{}x] ({}) prev={:?} {:?} -> {:?} ({})",
-                        entry.count, entry.lang, entry.prev_word, entry.orig, entry.fixed, entry.reason
+                        entry.count,
+                        entry.lang,
+                        entry.prev_word,
+                        entry.orig,
+                        entry.fixed,
+                        entry.reason
                     );
                 }
             }
@@ -837,9 +864,7 @@ fn cmd_rules(args: &[String]) -> CliResult {
                             "usage: smartkey rules add snippet <trigger> <expansion>".to_string(),
                         ));
                     }
-                    store
-                        .set_snippet(rest[0], rest[1])
-                        .map_err(map_store_err)?;
+                    store.set_snippet(rest[0], rest[1]).map_err(map_store_err)?;
                     format!("Saved snippet: {:?} -> {:?}", rest[0].trim(), rest[1])
                 }
                 "word" | "personal" => {
@@ -886,6 +911,22 @@ fn cmd_rules(args: &[String]) -> CliResult {
                             rest[0].trim().to_lowercase(),
                             rest[1].trim().to_lowercase()
                         )
+                    }
+                }
+                "pin" | "pinned" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules add pin <word>".to_string(),
+                        ));
+                    }
+                    let changed = store.add_user_pinned_word(rest[0]).map_err(map_store_err)?;
+                    if changed {
+                        format!(
+                            "Pinned {:?}: its curated capitalization always applies",
+                            rest[0].trim().to_lowercase()
+                        )
+                    } else {
+                        format!("Already pinned: {:?}", rest[0].trim().to_lowercase())
                     }
                 }
                 "passthrough" | "telex" => {
@@ -1010,6 +1051,20 @@ fn cmd_rules(args: &[String]) -> CliResult {
                         ),
                     )
                 }
+                "pin" | "pinned" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Usage(
+                            "usage: smartkey rules remove pin <word>".to_string(),
+                        ));
+                    }
+                    let r = store
+                        .remove_user_pinned_word(rest[0])
+                        .map_err(map_store_err)?;
+                    (
+                        r,
+                        format!("pinned word {:?}", rest[0].trim().to_lowercase()),
+                    )
+                }
                 "passthrough" | "telex" => {
                     if rest.len() != 1 {
                         return Err(CliError::Usage(
@@ -1021,10 +1076,7 @@ fn cmd_rules(args: &[String]) -> CliResult {
                         .map_err(map_store_err)?;
                     (
                         r,
-                        format!(
-                            "Telex passthrough word {:?}",
-                            rest[0].trim().to_lowercase()
-                        ),
+                        format!("Telex passthrough word {:?}", rest[0].trim().to_lowercase()),
                     )
                 }
                 other => {
@@ -1134,9 +1186,7 @@ fn cmd_config(args: &[String]) -> CliResult {
                 ));
             }
             let mut store = load_rule_store_mut(&dir, Preset::Balanced)?;
-            let (canon, effective) = store
-                .set_setting(pos[1], pos[2])
-                .map_err(map_store_err)?;
+            let (canon, effective) = store.set_setting(pos[1], pos[2]).map_err(map_store_err)?;
             let reloaded = notify_fcitx5_reload();
             println!(
                 "Updated {canon} = {effective} ({})",
@@ -1285,11 +1335,7 @@ fn parse_local_date_midnight_ms(ymd: &str) -> Option<u64> {
         tm.tm_sec = 0;
         tm.tm_isdst = -1;
         let ts = libc::mktime(&mut tm);
-        if ts < 0
-            || tm.tm_year != year - 1900
-            || tm.tm_mon != month - 1
-            || tm.tm_mday != day
-        {
+        if ts < 0 || tm.tm_year != year - 1900 || tm.tm_mon != month - 1 || tm.tm_mday != day {
             return None;
         }
         Some((ts as u64) * 1000)
@@ -1476,7 +1522,9 @@ fn cmd_log(args: &[String]) -> CliResult {
             "--since" => {
                 i += 1;
                 let raw = args.get(i).ok_or_else(|| {
-                    CliError::Usage("--since requires a duration (e.g. 2h, 7d) or YYYY-MM-DD".to_string())
+                    CliError::Usage(
+                        "--since requires a duration (e.g. 2h, 7d) or YYYY-MM-DD".to_string(),
+                    )
                 })?;
                 since_raw = Some(raw.clone());
             }
@@ -1517,7 +1565,8 @@ fn cmd_log(args: &[String]) -> CliResult {
         i += 1;
     }
 
-    let time_flags_count = usize::from(today) + usize::from(yesterday) + usize::from(since_raw.is_some());
+    let time_flags_count =
+        usize::from(today) + usize::from(yesterday) + usize::from(since_raw.is_some());
     if time_flags_count > 1 {
         return Err(CliError::Usage(
             "--today, --yesterday, and --since are mutually exclusive".to_string(),
@@ -1796,9 +1845,9 @@ fn cmd_explain(args: &[String]) -> CliResult {
                     .get(i)
                     .ok_or_else(|| CliError::Usage("--punct requires a character".to_string()))?;
                 let mut chars = raw.chars();
-                let ch = chars
-                    .next()
-                    .ok_or_else(|| CliError::Usage("--punct requires a non-empty character".to_string()))?;
+                let ch = chars.next().ok_or_else(|| {
+                    CliError::Usage("--punct requires a non-empty character".to_string())
+                })?;
                 if chars.next().is_some() {
                     return Err(CliError::Usage(format!(
                         "--punct expects a single character, got {raw:?}"
@@ -1815,9 +1864,9 @@ fn cmd_explain(args: &[String]) -> CliResult {
             }
             "--lang" | "-l" => {
                 i += 1;
-                let raw = args.get(i).ok_or_else(|| {
-                    CliError::Usage("--lang requires an id (en|vi)".to_string())
-                })?;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--lang requires an id (en|vi)".to_string()))?;
                 lang = match raw.as_str() {
                     "vi" | "vi-lotus" | "vi_lotus" | "lotus" => LangId::vi(),
                     "en" | "en_US" | "en_GB" => LangId::en(),
@@ -1949,7 +1998,9 @@ fn validate_and_install_skdict(staged_path: &Path, target_path: &Path) -> Result
     let bytes = fs::read(staged_path).map_err(|e| CliError::Runtime(e.to_string()))?;
     if let Err(err) = smartkey_core::EnglishLexicon::from_owned_bytes(bytes) {
         let _ = fs::remove_file(staged_path);
-        return Err(CliError::Runtime(format!("invalid dictionary format: {err}")));
+        return Err(CliError::Runtime(format!(
+            "invalid dictionary format: {err}"
+        )));
     }
     fs::rename(staged_path, target_path).map_err(|e| {
         let _ = fs::remove_file(staged_path);
@@ -2333,9 +2384,9 @@ fn cmd_repl(args: &[String]) -> CliResult {
             }
             "--lang" | "-l" => {
                 i += 1;
-                let raw = args.get(i).ok_or_else(|| {
-                    CliError::Usage("--lang requires an id (en|vi)".to_string())
-                })?;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--lang requires an id (en|vi)".to_string()))?;
                 lang = match raw.as_str() {
                     "vi" | "vi-lotus" | "vi_lotus" | "lotus" => LangId::vi(),
                     other => LangId(other.to_string()),
@@ -2611,10 +2662,8 @@ mod tests {
         }
 
         // Read-only `status` / `rules` / `config` / `log` must NOT create config directories when missing
-        let uninit_dir = env::temp_dir().join(format!(
-            "smartkey_cli_readonly_{}",
-            std::process::id()
-        ));
+        let uninit_dir =
+            env::temp_dir().join(format!("smartkey_cli_readonly_{}", std::process::id()));
         let _ = fs::remove_dir_all(&uninit_dir);
         let dir_str = uninit_dir.to_str().unwrap();
         assert_eq!(run_cli(&vec_args(&["status", "--dir", dir_str])), Ok(()));
@@ -2646,7 +2695,9 @@ mod tests {
 
         // Add & remove across all 6 rule collections
         assert_eq!(
-            run_cli(&vec_args(&["rules", "add", "fix", "teh", "the", "--dir", d])),
+            run_cli(&vec_args(&[
+                "rules", "add", "fix", "teh", "the", "--dir", d
+            ])),
             Ok(())
         );
         assert_eq!(
@@ -2668,9 +2719,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            run_cli(&vec_args(&[
-                "rules", "add", "word", "FastAPI", "--dir", d
-            ])),
+            run_cli(&vec_args(&["rules", "add", "word", "FastAPI", "--dir", d])),
             Ok(())
         );
         assert_eq!(
@@ -2830,9 +2879,7 @@ mod tests {
         // Corrupting `rules.toml` must lock writes and fail CLI mutations with Runtime error
         fs::write(&rules_path, "[settings\nenabled = false\n").unwrap();
         assert!(matches!(
-            run_cli(&vec_args(&[
-                "rules", "add", "word", "Hyprland", "--dir", d
-            ])),
+            run_cli(&vec_args(&["rules", "add", "word", "Hyprland", "--dir", d])),
             Err(CliError::Runtime(_))
         ));
 

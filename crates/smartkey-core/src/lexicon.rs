@@ -564,6 +564,81 @@ pub fn default_user_dict_dir() -> std::path::PathBuf {
     std::env::temp_dir().join("smartkey/dicts")
 }
 
+/// Minimum frequency margin (AOSP `f=` units) by which the capitalized form must beat an
+/// attested lowercase form for a proper-noun entry to be accepted. Measured on the English pack:
+/// real homographs (`polish` 34, `march` 26, `turkey` 20, `mars` 49) fall below it; legitimate
+/// entries whose lowercase form is only noise (`dutch` 64, `august` 74, `england` 100) clear it.
+pub const PROPER_NOUN_MIN_CASE_GAP: i32 = 60;
+
+/// Result of [`lint_proper_nouns`]: `errors` must fail the build, `warnings` need human review.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProperNounLint {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Build-time homograph check for `proper_nouns.tsv`. AOSP word lists keep `Polish` and `polish`
+/// as separate entries, so an entry whose lowercase form is attested with a frequency close to
+/// (or above) the capitalized form is a different word sense (`polish` the verb), and capitalizing
+/// it unconditionally is a false positive. The lowercase signal is language-independent: any pack
+/// built from a case-sensitive AOSP/HeliBoard list can run the same check.
+pub fn lint_proper_nouns(wordlists: &[&str], proper_nouns_tsv: &str) -> ProperNounLint {
+    // raw (case-sensitive) form -> best frequency across lists
+    let mut freq: BTreeMap<String, i32> = BTreeMap::new();
+    for content in wordlists {
+        for line in content.lines() {
+            let Some(rest) = line.trim().strip_prefix("word=") else {
+                continue;
+            };
+            let mut raw = "";
+            let mut f: i32 = 0;
+            let mut skip = false;
+            for part in rest.split(',') {
+                if raw.is_empty() && !part.contains('=') {
+                    raw = part;
+                } else if let Some(v) = part.strip_prefix("f=") {
+                    f = v.parse().unwrap_or(0);
+                } else if part == "not_a_word=true" || part == "possibly_offensive=true" {
+                    skip = true;
+                }
+            }
+            if raw.is_empty() || skip || f == 0 {
+                continue;
+            }
+            let e = freq.entry(raw.to_string()).or_insert(0);
+            *e = (*e).max(f);
+        }
+    }
+
+    let mut out = ProperNounLint::default();
+    for line in proper_nouns_tsv.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((lower, proper)) = line.split_once('\t') else {
+            continue;
+        };
+        let (lower, proper) = (lower.trim(), proper.trim());
+        let Some(&lower_f) = freq.get(lower) else {
+            continue;
+        };
+        let proper_f = freq.get(proper).copied().unwrap_or(0);
+        let gap = proper_f - lower_f;
+        let msg = format!(
+            "{lower:?} -> {proper:?}: lowercase form is also a word (f={lower_f}) vs capitalized f={proper_f} (gap {gap})"
+        );
+        if gap < PROPER_NOUN_MIN_CASE_GAP {
+            out.errors.push(format!(
+                "{msg}; likely homograph, remove it (need gap >= {PROPER_NOUN_MIN_CASE_GAP})"
+            ));
+        } else {
+            out.warnings.push(format!("{msg}; review manually"));
+        }
+    }
+    out
+}
+
 /// Compiles raw AOSP `en_US.combined`, `en_GB.combined`, `dev_terms.txt`, `slang.txt`,
 /// `proper_nouns.tsv`, `typos_words.csv`, `british_to_american.json`, and `count_2w.txt` into a compact `.skdict` binary image.
 #[allow(clippy::too_many_arguments)]
@@ -1069,4 +1144,60 @@ fn serialize_skdict(
     }
 
     out
+}
+
+#[cfg(test)]
+mod proper_noun_lint_tests {
+    use super::{lint_proper_nouns, PROPER_NOUN_MIN_CASE_GAP};
+
+    const WORDLIST: &str = "\
+dictionary=main:en_us,locale=en_US
+ word=polish,f=92,flags=,originalFreq=92
+ word=Polish,f=126,flags=,originalFreq=126
+ word=august,f=71,flags=,originalFreq=71
+ word=August,f=145,flags=,originalFreq=145
+ word=English,f=144,flags=,originalFreq=144
+ word=Monday,f=111,flags=,originalFreq=111
+ word=junk,f=50,not_a_word=true
+";
+
+    #[test]
+    fn homograph_is_an_error_clear_gap_is_a_warning_unattested_lowercase_passes() {
+        let tsv = "# header\npolish\tPolish\naugust\tAugust\nenglish\tEnglish\nmonday\tMonday\n";
+        let lint = lint_proper_nouns(&[WORDLIST], tsv);
+        assert_eq!(lint.errors.len(), 1, "{lint:?}");
+        assert!(lint.errors[0].contains("\"polish\""), "{lint:?}");
+        assert_eq!(lint.warnings.len(), 1, "{lint:?}");
+        assert!(lint.warnings[0].contains("\"august\""), "{lint:?}");
+    }
+
+    #[test]
+    fn lowercase_form_more_frequent_than_capitalized_is_an_error() {
+        let wl = " word=will,f=165\n word=Will,f=113\n";
+        let lint = lint_proper_nouns(&[wl], "will\tWill\n");
+        assert_eq!(lint.errors.len(), 1, "{lint:?}");
+    }
+
+    #[test]
+    fn shipped_proper_nouns_pass_the_lint() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let (Ok(us), Ok(gb), Ok(tsv)) = (
+            std::fs::read_to_string(root.join("data/sources/en_US.combined")),
+            std::fs::read_to_string(root.join("data/sources/en_GB.combined")),
+            std::fs::read_to_string(root.join("data/proper_nouns.tsv")),
+        ) else {
+            eprintln!("skipping: run scripts/fetch_sources.sh for the AOSP word lists");
+            return;
+        };
+        let lint = lint_proper_nouns(&[&us, &gb], &tsv);
+        assert!(
+            lint.errors.is_empty(),
+            "gap < {PROPER_NOUN_MIN_CASE_GAP}: {:?}",
+            lint.errors
+        );
+    }
 }

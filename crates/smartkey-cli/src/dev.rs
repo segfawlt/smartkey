@@ -57,6 +57,17 @@ fn cmd_build_lexicon() -> Result<(), String> {
     let uk_json = read_req(&src_dir.join("british_to_american.json"))?;
     let count_2w = read_req(&src_dir.join("count_2w.txt"))?;
 
+    let lint = smartkey_core::lexicon::lint_proper_nouns(&[&en_us, &en_gb], &proper_nouns);
+    for w in &lint.warnings {
+        println!("warning: proper_nouns.tsv {w}");
+    }
+    if !lint.errors.is_empty() {
+        return Err(format!(
+            "proper_nouns.tsv homograph lint failed:\n  {}",
+            lint.errors.join("\n  ")
+        ));
+    }
+
     println!("Compiling FST lexicon, 96k known smashes, proper nouns, dialect map & bigrams...");
     let image = compile_skdict_from_sources(
         &en_us,
@@ -272,7 +283,9 @@ fn main() {
             Ok(())
         }
         Some(other) => {
-            eprintln!("error: unexpected argument {other:?} (usage: smartkey-dev <eval | build-lexicon>)");
+            eprintln!(
+                "error: unexpected argument {other:?} (usage: smartkey-dev <eval | build-lexicon>)"
+            );
             std::process::exit(2);
         }
         None => {

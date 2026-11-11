@@ -39,6 +39,12 @@ pub trait UserRuleView {
         let _ = (typed_lower, candidate_lower);
         false
     }
+    /// True when the user pinned `lower_word` (`pinned = [...]` in `rules.toml`): its curated
+    /// capitalization (`english -> English`) always applies, ignoring blocked pairs and undo shields.
+    fn is_pinned(&self, lower_word: &str) -> bool {
+        let _ = lower_word;
+        false
+    }
     fn trouble_word_boost(&self, candidate_lower: &str) -> f32 {
         let _ = candidate_lower;
         0.0
@@ -144,6 +150,14 @@ pub fn is_unconditional_contraction_pair(typed_lower: &str, expanded_lower: &str
     UNCONDITIONAL_CONTRACTIONS.iter().any(|&(raw, expanded)| {
         raw == typed_lower && expanded.to_lowercase() == expanded_lower.to_lowercase()
     })
+}
+
+/// Pairs whose permanent block needs `2x` rejection evidence instead of an immediate `1x` block:
+/// curated contractions (`dont -> don't`) and case-only corrections (`polish -> Polish`; after
+/// lowercasing both sides are equal). Both come from curated lists, so one accidental BackSpace
+/// must not permanently disable them (see `learner::reject_pair_permanently`).
+pub fn is_staged_rejection_pair(typed_lower: &str, rejected_lower: &str) -> bool {
+    typed_lower == rejected_lower || is_unconditional_contraction_pair(typed_lower, rejected_lower)
 }
 
 /// Transposed apostrophe slips (`do'nt -> don't`, `does'nt -> doesn't`).
@@ -762,7 +776,9 @@ impl EnglishScorer {
             // Proper Noun auto-capitalization (english -> English, monday -> Monday)
             if config.fix_proper_nouns && !shift_slip_fixed {
                 if let Some(proper) = self.lexicon.lookup_proper_noun(&core_lower) {
-                    if core != proper && !rules.is_pair_blocked(&core_lower, &proper.to_lowercase())
+                    if core != proper
+                        && (rules.is_pinned(&core_lower)
+                            || !rules.is_pair_blocked(&core_lower, &proper.to_lowercase()))
                     {
                         let rep = wrap(proper);
                         if rep != token {

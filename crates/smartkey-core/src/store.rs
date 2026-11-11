@@ -303,6 +303,8 @@ pub struct CompiledRules {
     pub lang_personal_dict: BTreeMap<String, BTreeSet<String>>,
     pub lang_personal_dict_canonical: BTreeMap<String, BTreeMap<String, String>>,
     pub telex_passthrough: BTreeSet<String>,
+    /// Words whose curated capitalization (`english -> English`) always applies; never blocked.
+    pub pinned: BTreeSet<String>,
     pub blocklist: BTreeSet<(String, String)>,
     pub corrections: BTreeMap<String, String>,
     pub lang_corrections: BTreeMap<String, BTreeMap<String, String>>,
@@ -2054,6 +2056,64 @@ impl RuleStore {
         Ok(removed)
     }
 
+    /// True when `word` is pinned: its curated capitalization always applies.
+    pub fn is_pinned(&self, lower_word: &str) -> bool {
+        self.compiled.pinned.contains(lower_word)
+    }
+
+    /// Pins `word` (`pinned = [...]` in `rules.toml`) and lifts any block on its capitalization
+    /// pair, so `english -> English` always applies again.
+    pub fn add_user_pinned_word(&mut self, word: &str) -> io::Result<bool> {
+        let word_l = word.trim().to_lowercase();
+        if word_l.is_empty() || word_l.chars().any(char::is_whitespace) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned entry must be a single non-empty word",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        if !self.compiled.pinned.insert(word_l.clone()) {
+            return Ok(false);
+        }
+        if !self.doc.contains_key("pinned") {
+            self.doc["pinned"] = Item::Value(Value::Array(Array::new()));
+        }
+        if let Some(arr) = self.doc["pinned"].as_array_mut() {
+            arr.push(word_l.as_str());
+        }
+        self.flush_rules()?;
+        Ok(true)
+    }
+
+    /// Removes `word` from `pinned`.
+    pub fn remove_user_pinned_word(&mut self, word: &str) -> io::Result<bool> {
+        let word_l = word.trim().to_lowercase();
+        if word_l.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned entry must be non-empty",
+            ));
+        }
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+        let removed = self.compiled.pinned.remove(&word_l);
+        if let Some(arr) = self.doc.get_mut("pinned").and_then(Item::as_array_mut) {
+            arr.retain(|v| {
+                !v.as_str()
+                    .is_some_and(|s| s.trim().to_lowercase() == word_l)
+            });
+        }
+        if removed {
+            self.flush_rules()?;
+        }
+        Ok(removed)
+    }
+
     /// Adds an ASCII word to `telex_passthrough`, propagating write errors.
     pub fn add_user_telex_passthrough(&mut self, raw_ascii: &str) -> io::Result<bool> {
         let word_l = raw_ascii.trim().to_lowercase();
@@ -2615,6 +2675,17 @@ impl RuleStore {
             }
         }
 
+        if let Some(arr) = doc.get("pinned").and_then(Item::as_array) {
+            for val in arr {
+                if let Some(s) = val.as_str() {
+                    let lower = s.trim().to_lowercase();
+                    if !lower.is_empty() {
+                        out.pinned.insert(lower);
+                    }
+                }
+            }
+        }
+
         if let Some(arr) = doc.get("blocklist").and_then(Item::as_array) {
             for val in arr {
                 if let Some(tbl) = val.as_inline_table() {
@@ -2773,6 +2844,10 @@ impl UserRuleView for RuleStore {
     fn is_pair_blocked(&self, typed_lower: &str, candidate_lower: &str) -> bool {
         let key = (typed_lower.to_string(), candidate_lower.to_string());
         self.session_blocked_pairs.contains(&key) || self.compiled.blocklist.contains(&key)
+    }
+
+    fn is_pinned(&self, lower_word: &str) -> bool {
+        self.compiled.pinned.contains(lower_word)
     }
 
     fn trouble_word_boost(&self, candidate_lower: &str) -> f32 {

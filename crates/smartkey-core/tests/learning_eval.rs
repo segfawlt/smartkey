@@ -1522,3 +1522,108 @@ fn contraction_rejections_close_together_still_block() {
     assert!(contraction_blocked(&engine));
     let _ = fs::remove_dir_all(&dir);
 }
+
+// --- Case-only (proper noun) corrections: 2x rejection evidence, pin override ---
+
+fn case_pair_blocked(engine: &SmartKeyEngine) -> bool {
+    engine
+        .store()
+        .compiled()
+        .blocklist
+        .contains(&("english".to_string(), "english".to_string()))
+}
+
+#[test]
+fn case_only_undo_keep_needs_2x_across_sessions_to_block() {
+    let (dir, rules, state) = contraction_tmp_paths("case_only");
+
+    // Session 1: 1x deliberate keep-verbatim stages only; it is not mistaken for an accident.
+    {
+        let mut engine = contraction_engine(&rules, &state);
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "english <BS> ");
+        assert_eq!(buf, "english ");
+        assert!(
+            !evs.contains(&LearnEvent::SelfConfirmCancelled),
+            "case-only keep-verbatim must not be read as an accidental BackSpace: {evs:?}"
+        );
+        assert!(!case_pair_blocked(&engine));
+    }
+
+    // Session 2: the curated rule still fires after one rejection; the 2nd rejection blocks.
+    {
+        let mut engine = contraction_engine(&rules, &state);
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+        feed_keys(&mut session, &mut engine, &mut buf, "english ");
+        assert_eq!(
+            buf, "English ",
+            "1x rejection must not disable the curated rule"
+        );
+
+        buf.clear();
+        let mut session = SmartKeySession::new();
+        feed_keys(&mut session, &mut engine, &mut buf, "english <BS> ");
+        assert_eq!(buf, "english ");
+        assert!(case_pair_blocked(&engine));
+    }
+
+    // Session 3: blocked.
+    {
+        let mut engine = contraction_engine(&rules, &state);
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+        feed_keys(&mut session, &mut engine, &mut buf, "english ");
+        assert_eq!(buf, "english ");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pinned_word_ignores_rejections_and_existing_blocks() {
+    let (dir, rules, state) = contraction_tmp_paths("pinned");
+    let mut engine = contraction_engine(&rules, &state);
+    engine.store_mut().add_user_pinned_word("English").unwrap();
+    engine
+        .store_mut()
+        .add_user_blocklist_pair("english", "english")
+        .unwrap();
+    assert!(case_pair_blocked(&engine));
+
+    for _ in 0..3 {
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+        feed_keys(&mut session, &mut engine, &mut buf, "english <BS> ");
+        assert_eq!(buf, "english ");
+        let mut session = SmartKeySession::new();
+        buf.clear();
+        feed_keys(&mut session, &mut engine, &mut buf, "english ");
+        assert_eq!(buf, "English ", "pinned word must always capitalize");
+    }
+
+    // Survives a reload from disk, and unpinning restores the block.
+    let mut engine = contraction_engine(&rules, &state);
+    assert!(engine.store().is_pinned("english"));
+    assert!(engine
+        .store_mut()
+        .remove_user_pinned_word("english")
+        .unwrap());
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+    feed_keys(&mut session, &mut engine, &mut buf, "english ");
+    assert_eq!(buf, "english ");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn polish_homograph_is_left_alone() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+    feed_keys(&mut session, &mut engine, &mut buf, "polish the code ");
+    assert_eq!(buf, "polish the code ");
+    feed_keys(&mut session, &mut engine, &mut buf, "Polish ");
+    assert_eq!(buf, "polish the code Polish ");
+}
