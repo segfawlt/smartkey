@@ -1,6 +1,6 @@
 # Handoff: 2x evidence for blocking curated contractions
 
-Status: **COMPLETE — implemented, tested (`contraction_*` tests in `learning_eval.rs`), full workspace `cargo test` + clippy green. Only open decision §5.1 (evidence decay) remains.** Branch `main` at `e988b2a`, up to date with `origin/main`.
+Status: **COMPLETE — implemented, tested (`contraction_*` tests in `learning_eval.rs`), full workspace `cargo test` + clippy green. Evidence decay (§5.1) implemented too — see §9.** Branch `main` at `e988b2a`, up to date with `origin/main`.
 Uncommitted diff: `crates/smartkey-core/src/{learner.rs,scorer.rs,store.rs}` (+89/−12).
 Also uncommitted but unrelated and pre-existing: local deletion of `.github/workflows/ci.yml`
 (decide separately; do not silently commit it with this work).
@@ -180,3 +180,15 @@ the 2x requirement. The early return stays (now commented in code). Side effect:
 rejections never promote the raw form into `personal_dict`. `clear_pair_rejection` additionally
 removes the pair's `staged_undo_keep` key on graduation so the leftover 2x key cannot shield it.
 `ci.yml` no longer shows as deleted in `git status` (§5.2 moot).
+
+## 9. Evidence decay (done)
+
+Chosen design (user delegated the call): a staged contraction rejection goes stale after
+`CONTRACTION_REJECT_STALE_AFTER_ACCEPTS = 10` accepted corrections of the same pair. Resetting on
+"applied" cannot work — every rejection is preceded by an application — so
+`LearnerState.staged_contraction_reject_applied_at` snapshots `applied_counts["dont->don't"]` at each
+rejection; the next rejection computes `applied_now - snapshot - 1` (minus the application that
+triggered it). A cleared `applied_counts` keeps the evidence. Self-typed `don't` deliberately does
+NOT count (it does not exercise the `dont` rule, and there is no single commit hook for known
+words). Users wanting a literal `dont` can run `smartkey rules add block dont "don't"` or
+`smartkey rules add word dont`; documented in `architecture-and-plan.md`.

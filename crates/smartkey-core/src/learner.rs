@@ -149,6 +149,11 @@ fn is_prose_word_token(s: &str) -> bool {
             .all(|c| c.is_alphabetic() || c == '\'' || c == '’')
 }
 
+/// A staged contraction rejection goes stale once this many corrections of the same pair were
+/// accepted (not undone) after it: two stray BackSpaces months apart must not add up to a block,
+/// while a user who really wants the raw form rejects it again within a few applications.
+const CONTRACTION_REJECT_STALE_AFTER_ACCEPTS: u32 = 10;
+
 /// Rejects the `(typed, rejected)` autocorrect pair. Curated unconditional-contraction pairs
 /// (`dont -> don't`) are staged first: the permanent block — which also erases a matching
 /// learned correction — only lands on the `2x` rejection across sessions, matching the `2x`
@@ -164,12 +169,26 @@ fn reject_pair_permanently(
     if is_unconditional_contraction_pair(typed_lower, rejected_lower) {
         let key = format!("{}:{}->{}", lang.as_str(), typed_lower, rejected_lower);
         store.sync_state_before_write();
+        let applied_now = store
+            .state()
+            .applied_counts
+            .get(&format!("{typed_lower}->{rejected_lower}"))
+            .copied()
+            .unwrap_or(0);
+        let state = store.state_mut();
+        // Evidence decay: the application that triggered this rejection is not an acceptance,
+        // so subtract it. A cleared `applied_counts` (now < snapshot) keeps the evidence.
+        if let Some(&snapshot) = state.staged_contraction_reject_applied_at.get(&key) {
+            let accepted = applied_now.saturating_sub(snapshot).saturating_sub(1);
+            if accepted >= CONTRACTION_REJECT_STALE_AFTER_ACCEPTS {
+                state.staged_contraction_rejects.remove(&key);
+            }
+        }
+        state
+            .staged_contraction_reject_applied_at
+            .insert(key.clone(), applied_now);
         let cnt = {
-            let e = store
-                .state_mut()
-                .staged_contraction_rejects
-                .entry(key)
-                .or_insert(0);
+            let e = state.staged_contraction_rejects.entry(key).or_insert(0);
             *e = e.saturating_add(1);
             *e
         };
@@ -196,6 +215,7 @@ fn clear_pair_rejection(store: &mut RuleStore, lang: &LangId, typed_lower: &str,
         fixed.to_lowercase()
     );
     let state = store.state_mut();
+    state.staged_contraction_reject_applied_at.remove(&key);
     if state.staged_contraction_rejects.remove(&key).is_some()
         || is_unconditional_contraction_pair(typed_lower, &fixed.to_lowercase())
     {

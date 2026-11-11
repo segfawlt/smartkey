@@ -184,6 +184,9 @@ pub struct LearnerState {
     /// The permanent blocklist write only lands on the `2x` rejection (across sessions);
     /// a single accidental BackSpace must never silence a curated rule.
     pub staged_contraction_rejects: BTreeMap<String, u32>,
+    /// `applied_counts` snapshot taken at the last staged contraction rejection, so the next
+    /// rejection can tell how many corrections were accepted in between (evidence decay).
+    pub staged_contraction_reject_applied_at: BTreeMap<String, u32>,
     pub untouched_unknowns: BTreeMap<String, u32>,
     pub staged_telex_passthrough: BTreeMap<String, u32>,
     pub trouble_words: BTreeMap<String, u32>,

@@ -1473,3 +1473,52 @@ fn non_contraction_undo_keep_still_blocks_at_1x() {
     assert!(engine.store().state().staged_contraction_rejects.is_empty());
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn contraction_blocked(engine: &SmartKeyEngine) -> bool {
+    engine
+        .store()
+        .compiled()
+        .blocklist
+        .contains(&("dont".to_string(), "don't".to_string()))
+}
+
+/// Runs one session that types `keys` against a freshly loaded store.
+fn contraction_session(rules: &Path, state: &Path, keys: &str) -> (SmartKeyEngine, String) {
+    let mut engine = contraction_engine(rules, state);
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+    feed_keys(&mut session, &mut engine, &mut buf, keys);
+    (engine, buf)
+}
+
+#[test]
+fn contraction_rejection_goes_stale_after_many_accepted_corrections() {
+    let (dir, rules, state) = contraction_tmp_paths("decay");
+
+    // Rejection 1, then 12 corrections accepted, then rejection 2: the old rejection is stale.
+    let (engine, _) = contraction_session(&rules, &state, "dont <BS> ");
+    assert_eq!(reject_count(&engine), 1);
+    let (_, buf) = contraction_session(&rules, &state, &"dont ".repeat(12));
+    assert_eq!(buf, "don't ".repeat(12));
+    let (engine, _) = contraction_session(&rules, &state, "dont <BS> ");
+    assert_eq!(reject_count(&engine), 1, "stale evidence must restart at 1");
+    assert!(!contraction_blocked(&engine));
+
+    // A rejection soon after the previous one still accumulates to a block.
+    let (engine, _) = contraction_session(&rules, &state, "dont <BS> ");
+    assert_eq!(reject_count(&engine), 2);
+    assert!(contraction_blocked(&engine));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contraction_rejections_close_together_still_block() {
+    let (dir, rules, state) = contraction_tmp_paths("close");
+    contraction_session(&rules, &state, "dont <BS> ");
+    // 3 accepted corrections is below the staleness threshold.
+    contraction_session(&rules, &state, &"dont ".repeat(3));
+    let (engine, _) = contraction_session(&rules, &state, "dont <BS> ");
+    assert_eq!(reject_count(&engine), 2);
+    assert!(contraction_blocked(&engine));
+    let _ = fs::remove_dir_all(&dir);
+}
