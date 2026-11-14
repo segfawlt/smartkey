@@ -153,6 +153,21 @@ inline bool isTelexBurstTriggerChar(uint32_t cp) {
            cp == 'z';
 }
 
+/// Returns true for key events synthesized by `fcitx5-lotus`'s Wayland virtual keyboard
+/// (`LotusWlrVirtualKeyboard`): either non-boundary non-ASCII Unicode runes (precomposed
+/// Vietnamese characters) or ASCII letters / space emitted on number-row keycodes `10..21`
+/// (`kTextKeys[0..11] + 8` in `lotus-wlr-virtual-keyboard.cpp`).
+inline bool isSyntheticVkKey(uint32_t keycode, uint32_t cp) {
+    if (cp >= 0x80 && !isSmartKeyBoundaryChar(cp)) {
+        return true;
+    }
+    if (keycode >= 10 && keycode <= 21) {
+        return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') ||
+               cp == ' ';
+    }
+    return false;
+}
+
 /// Pure state machine tracking `fcitx5-lotus` uinput replacement bursts, synthetic echo suppression,
 /// and pending filtered word-break boundaries (`CommitStringEvent` deferred evaluation).
 struct LotusBridgeTracker {
@@ -166,6 +181,8 @@ struct LotusBridgeTracker {
     bool suppressPostKey = false;
     bool sawLotusActivityInWord = false;
     bool selfCommitting = false;
+    std::vector<uint32_t> pendingPostBoundaryChars;
+    std::string vkBoundaryCommitUtf8;
 
     void armBurst(uint64_t nowMs) {
         burstDeadlineMs = nowMs + kBurstInitialWindowMs;
@@ -189,6 +206,7 @@ struct LotusBridgeTracker {
         pendingBoundaryCp = cp;
         hasPendingBoundary = true;
     }
+    uint32_t boundaryCp() const { return pendingBoundaryCp; }
     uint32_t takeBoundary() {
         const uint32_t cp = pendingBoundaryCp;
         pendingBoundaryCp = 0;
@@ -198,13 +216,37 @@ struct LotusBridgeTracker {
     void clearBoundary() {
         pendingBoundaryCp = 0;
         hasPendingBoundary = false;
+        pendingPostBoundaryChars.clear();
+        vkBoundaryCommitUtf8.clear();
     }
 
     void markActivity() { sawLotusActivityInWord = true; }
+    bool hasActivityInWord() const { return sawLotusActivityInWord; }
     bool takeActivityInWord() {
         const bool v = sawLotusActivityInWord;
         sawLotusActivityInWord = false;
         return v;
+    }
+
+    void pushPostBoundaryChar(uint32_t cp) {
+        pendingPostBoundaryChars.push_back(cp);
+    }
+    std::vector<uint32_t> takePostBoundaryChars() {
+        auto out = std::move(pendingPostBoundaryChars);
+        pendingPostBoundaryChars.clear();
+        return out;
+    }
+
+    void appendVkBoundaryCommit(std::string_view s) {
+        vkBoundaryCommitUtf8.append(s);
+    }
+    const std::string &vkBoundaryCommit() const {
+        return vkBoundaryCommitUtf8;
+    }
+    std::string takeVkBoundaryCommit() {
+        auto out = std::move(vkBoundaryCommitUtf8);
+        vkBoundaryCommitUtf8.clear();
+        return out;
     }
 
     void reset() {
@@ -213,6 +255,8 @@ struct LotusBridgeTracker {
         hasPendingBoundary = false;
         suppressPostKey = false;
         sawLotusActivityInWord = false;
+        pendingPostBoundaryChars.clear();
+        vkBoundaryCommitUtf8.clear();
     }
 };
 
@@ -241,11 +285,28 @@ public:
 
     void setPendingBoundary(uint32_t cp) { lotus_.setBoundary(cp); }
     bool hasPendingBoundary() const { return lotus_.hasPendingBoundary; }
+    uint32_t pendingBoundaryCp() const { return lotus_.boundaryCp(); }
     uint32_t takePendingBoundary() { return lotus_.takeBoundary(); }
     void clearPendingBoundary() { lotus_.clearBoundary(); }
 
     void markLotusActivity() { lotus_.markActivity(); }
+    bool hasLotusActivityInWord() const { return lotus_.hasActivityInWord(); }
     bool takeLotusActivityInWord() { return lotus_.takeActivityInWord(); }
+
+    void pushPostBoundaryChar(uint32_t cp) { lotus_.pushPostBoundaryChar(cp); }
+    std::vector<uint32_t> takePostBoundaryChars() {
+        return lotus_.takePostBoundaryChars();
+    }
+
+    void appendVkBoundaryCommit(std::string_view s) {
+        lotus_.appendVkBoundaryCommit(s);
+    }
+    const std::string &vkBoundaryCommit() const {
+        return lotus_.vkBoundaryCommit();
+    }
+    std::string takeVkBoundaryCommit() {
+        return lotus_.takeVkBoundaryCommit();
+    }
 
     bool isSelfCommitting() const { return lotus_.selfCommitting; }
     void setSelfCommitting(bool v) { lotus_.selfCommitting = v; }

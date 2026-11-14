@@ -319,6 +319,49 @@ uint8_t SmartKeyAddon::classifyProfile(InputContext *ic,
 
 namespace {
 
+std::string encodeUtf8(uint32_t cp) {
+    std::string out;
+    if (cp <= 0x7F) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0x10FFFF) {
+        out.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+    return out;
+}
+
+uint32_t countUtf8Chars(std::string_view s) {
+    uint32_t count = 0;
+    for (unsigned char b : s) {
+        if ((b & 0xC0) != 0x80) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+void replayPostBoundaryChars(SmartKeyState *state, SmartKeyEngineHandle *engine,
+                             const std::vector<uint32_t> &queuedChars,
+                             uint64_t nowMs) {
+    SmartKeyAction unused{};
+    for (uint32_t cp : queuedChars) {
+        if (isTelexBurstTriggerChar(cp) || state->hasLotusActivityInWord()) {
+            state->armLotusBurst(nowMs);
+        }
+        smartkey_session_process_key(state->session(), engine,
+                                     SMARTKEY_KEY_CHAR, cp, nowMs, &unused);
+    }
+}
+
 bool decodeKeyEvent(const KeyEvent &keyEvent, bool &isShortcutReset,
                     uint8_t &keyKind, uint32_t &codepoint) {
     isShortcutReset = false;
@@ -459,17 +502,17 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         const Key rawKey = keyEvent.rawKey();
 
         // `fcitx5-lotus-server` terminates every uinput replacement burst with `FcitxKey_Pause`.
-        // Keep `pendingBoundary` intact across `Pause` so `onCommitString` (fired inside
-        // `LotusState::finishReplacement`) can evaluate the completed word immediately.
+        // Re-arm the echo grace window across `Pause` (rather than clearing to 0) so chained
+        // bursts launched immediately from `LotusState::replayBufferedKeys()` stay suppressed.
         if (rawKey.sym() == FcitxKey_Pause) {
             state->markLotusActivity();
-            state->clearLotusBurst();
+            state->rearmLotusBurstEcho(nowMs);
             state->setSuppressPostKey(true);
             return;
         }
 
-        // Ignore synthetic `BackSpace` / `Left` / `Delete` echoes injected by `fcitx5-lotus-server`
-        // during a mid-word or break-time uinput replacement burst. Note that `LotusState` forwards
+        // Ignore synthetic `BackSpace` / `Left` / `Delete` echoes injected by `fcitx5-lotus`
+        // during a mid-word or break-time replacement burst. Note that `LotusState` forwards
         // intermediate echo BackSpaces unfiltered so they reach the client app, which means
         // `PostInputMethod` WILL fire for them — `setSuppressPostKey(true)` blocks `onPostKeyEvent`
         // from mistaking synthetic echoes for user BackSpaces!
@@ -481,18 +524,6 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
             state->rearmLotusBurstEcho(nowMs);
             state->setSuppressPostKey(true);
             return;
-        }
-
-        // If a previous boundary key was filtered by Lotus without completing via `onCommitString`
-        // (e.g. user typed fast into `LotusState::bufferedKeys_` mid-burst, or Lotus consumed the
-        // key in Emoji popup mode), flush stale composing state before recording the new key.
-        if (state->hasPendingBoundary()) {
-            state->clearPendingBoundary();
-            state->takeLotusActivityInWord();
-            SmartKeyAction unused{};
-            smartkey_session_process_key(state->session(), engine_,
-                                         SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
-                                         &unused);
         }
 
         bool isShortcutReset = false;
@@ -511,11 +542,56 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
             return;
         }
 
+        // On Wayland compositors without echoFrontend, `LotusWlrVirtualKeyboard` emits
+        // precomposed non-ASCII runes or ASCII chars mapped onto `kTextKeys[0..11]` (XKB 10..21).
+        // Never record those synthetic echoes into `SmartKeySession`; capture break-time
+        // boundary commits so `onPostKeyEvent` can evaluate the completed word on boundary delivery.
+        if (keyKind == SMARTKEY_KEY_CHAR &&
+            isSyntheticVkKey(static_cast<uint32_t>(rawKey.code()), codepoint) &&
+            (codepoint >= 0x80 || state->isInLotusBurst(nowMs))) {
+            state->markLotusActivity();
+            state->rearmLotusBurstEcho(nowMs);
+            if (state->hasPendingBoundary()) {
+                state->appendVkBoundaryCommit(encodeUtf8(codepoint));
+                if (codepoint == state->pendingBoundaryCp()) {
+                    return;
+                }
+            }
+            state->setSuppressPostKey(true);
+            return;
+        }
+
+        // If a previous boundary key is waiting for a Lotus burst commit and the user already
+        // types non-boundary letter(s) of the next word into `LotusState::bufferedKeys_`,
+        // queue them for replay after `onCommitString` finishes evaluating the prior word.
+        if (state->hasPendingBoundary()) {
+            if (keyKind == SMARTKEY_KEY_CHAR &&
+                !isSmartKeyBoundaryChar(codepoint) &&
+                state->isInLotusBurst(nowMs)) {
+                state->pushPostBoundaryChar(codepoint);
+                if (isTelexBurstTriggerChar(codepoint) ||
+                    state->hasLotusActivityInWord()) {
+                    state->armLotusBurst(nowMs);
+                }
+                state->setSuppressPostKey(true);
+                return;
+            }
+            state->clearPendingBoundary();
+            state->takeLotusActivityInWord();
+            SmartKeyAction unused{};
+            smartkey_session_process_key(state->session(), engine_,
+                                         SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
+                                         &unused);
+        }
+
         // Record non-boundary letters (`a..z`, etc.) passively in `PreInputMethod` so SmartKey
         // sees every raw keystroke even when `LotusState::keyEvent` filters the key to run a
-        // uinput burst. Only arm the burst window on keys capable of triggering a Lotus burst.
+        // uinput burst. Arm the burst window on Telex triggers OR any subsequent letter after
+        // Lotus has already modified the current word (covers mid-word English fallbacks and
+        // tone-target shifts).
         if (keyKind == SMARTKEY_KEY_CHAR && !isSmartKeyBoundaryChar(codepoint)) {
-            if (isTelexBurstTriggerChar(codepoint)) {
+            if (isTelexBurstTriggerChar(codepoint) ||
+                state->hasLotusActivityInWord()) {
                 state->armLotusBurst(nowMs);
             }
             SmartKeyAction unused{};
@@ -619,6 +695,32 @@ void SmartKeyAddon::onPostKeyEvent(KeyEvent &keyEvent) {
         return;
     }
 
+    // On Wayland compositors without echoFrontend, `LotusWlrVirtualKeyboard` emits the
+    // boundary-restore sequence via virtual key events ending with the boundary char itself.
+    if (state->hasPendingBoundary() && !state->vkBoundaryCommit().empty() &&
+        keyKind == SMARTKEY_KEY_CHAR &&
+        codepoint == state->pendingBoundaryCp()) {
+        const uint32_t boundaryCp = state->takePendingBoundary();
+        const std::string vkCommit = state->takeVkBoundaryCommit();
+        const auto queuedChars = state->takePostBoundaryChars();
+        state->takeLotusActivityInWord();
+        state->clearLotusBurst();
+
+        const uint64_t nowMs = monotonicNowMs();
+        SmartKeyAction act{};
+        if (smartkey_session_on_lotus_commit(state->session(), engine_,
+                                             boundaryCp, vkCommit.c_str(),
+                                             nowMs, &act) &&
+            act.kind == SMARTKEY_ACTION_REPLACE) {
+            if (act.delete_chars > 0) {
+                act.delete_chars -= 1;
+            }
+            applyReplaceAction(ic, state, keyEvent, act);
+        }
+        replayPostBoundaryChars(state, engine_, queuedChars, nowMs);
+        return;
+    }
+
     // Reaching `PostInputMethod` on a boundary/edit/nav key proves `LotusState::keyEvent`
     // forwarded this key without filtering it.
     state->clearLotusBurst();
@@ -666,22 +768,55 @@ void SmartKeyAddon::onCommitString(CommitStringEvent &commitEvent) {
         return;
     }
 
+    const std::string &committed = commitEvent.text();
+    const std::string boundaryUtf8 = encodeUtf8(state->pendingBoundaryCp());
+    const std::size_t pos =
+        boundaryUtf8.empty() ? std::string::npos : committed.find(boundaryUtf8);
+    if (pos == std::string::npos) {
+        // Intermediate mid-word commit (e.g. `"àg"` flushed before a chained burst inside
+        // `LotusState::replayBufferedKeys()` while the boundary key is still buffered).
+        // Keep `pendingBoundary` intact and extend the burst window so the chained burst's
+        // synthetic echoes stay suppressed until the boundary commit arrives.
+        state->rearmLotusBurstEcho(monotonicNowMs());
+        return;
+    }
+
     smartkey_session_set_lang(state->session(), "vi");
+    const std::string wordCommitPart =
+        committed.substr(0, pos + boundaryUtf8.size());
+    const std::string afterBoundaryPart =
+        committed.substr(pos + boundaryUtf8.size());
     const uint32_t boundaryCp = state->takePendingBoundary();
+    const auto queuedChars = state->takePostBoundaryChars();
     state->takeLotusActivityInWord();
     state->clearLotusBurst();
 
     const uint64_t nowMs = monotonicNowMs();
     SmartKeyAction act{};
-    if (!smartkey_session_on_lotus_commit(
-            state->session(), engine_, boundaryCp, commitEvent.text().c_str(),
-            nowMs, &act)) {
-        return;
+    const bool hasAction = smartkey_session_on_lotus_commit(
+        state->session(), engine_, boundaryCp, wordCommitPart.c_str(), nowMs,
+        &act);
+
+    if (hasAction && act.kind == SMARTKEY_ACTION_REPLACE) {
+        if (afterBoundaryPart.empty()) {
+            applyDeleteAndCommit(ic, state, act);
+        } else {
+            const uint32_t extraAfterChars = countUtf8Chars(afterBoundaryPart);
+            std::string combinedInsert;
+            if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
+                combinedInsert.assign(act.insert_utf8, act.insert_byte_len);
+            }
+            combinedInsert += afterBoundaryPart;
+            SmartKeyAction adjustedAct = act;
+            adjustedAct.delete_chars = act.delete_chars + extraAfterChars;
+            adjustedAct.insert_utf8 = combinedInsert.c_str();
+            adjustedAct.insert_byte_len =
+                static_cast<uint32_t>(combinedInsert.size());
+            applyDeleteAndCommit(ic, state, adjustedAct);
+        }
     }
 
-    if (act.kind == SMARTKEY_ACTION_REPLACE) {
-        applyDeleteAndCommit(ic, state, act);
-    }
+    replayPostBoundaryChars(state, engine_, queuedChars, nowMs);
 }
 
 void SmartKeyAddon::onUpdatePreedit(Event &event) {

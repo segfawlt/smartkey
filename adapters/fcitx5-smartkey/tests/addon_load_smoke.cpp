@@ -112,8 +112,38 @@ void verifyProfileClassification() {
 
     st.setBoundary(' ');
     assert(st.hasPendingBoundary);
+    assert(st.boundaryCp() == ' ');
     assert(st.takeBoundary() == ' ');
     assert(!st.hasPendingBoundary);
+
+    // Virtual-keyboard synthetic key classification & fast-typing queues
+    using fcitx::smartkey::isSyntheticVkKey;
+    assert(isSyntheticVkKey(24, 0x00E0));   // 'à' (>= 0x80, non-boundary)
+    assert(isSyntheticVkKey(38, 0x1EA1));   // 'ạ' (>= 0x80, non-boundary)
+    assert(!isSyntheticVkKey(24, 0x201C));  // curly opening quote is a boundary char
+    assert(isSyntheticVkKey(10, 'o'));      // XKB 10 (KEY_1) emitting ASCII letter
+    assert(isSyntheticVkKey(14, ' '));      // XKB 14 emitting Space
+    assert(!isSyntheticVkKey(10, '1'));     // Physical digit '1' on XKB 10
+    assert(!isSyntheticVkKey(38, 'a'));     // Physical 'a' on XKB 38
+
+    assert(!st.hasActivityInWord());
+    st.markActivity();
+    assert(st.hasActivityInWord());
+    assert(st.takeActivityInWord());
+    assert(!st.hasActivityInWord());
+
+    st.setBoundary(' ');
+    st.pushPostBoundaryChar('t');
+    st.pushPostBoundaryChar('i');
+    const auto queued = st.takePostBoundaryChars();
+    assert(queued.size() == 2 && queued[0] == 't' && queued[1] == 'i');
+    assert(st.takePostBoundaryChars().empty());
+
+    st.appendVkBoundaryCommit("ongx");
+    st.appendVkBoundaryCommit(" ");
+    assert(st.vkBoundaryCommit() == "ongx ");
+    assert(st.takeVkBoundaryCommit() == "ongx ");
+    assert(st.vkBoundaryCommit().empty());
 }
 
 } // namespace
