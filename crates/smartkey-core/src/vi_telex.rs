@@ -1707,6 +1707,31 @@ pub fn rescue_telex_typo_with_options(raw_keys: &str, opts: LotusOptions) -> Opt
                 }
             }
         }
+
+        // 4b. Split coda transposition across a Telex tone/horn or mark key (e.g. `hoagfn -> hoanfg -> hoàng`,
+        //     `tieegsn -> tieensg -> tiếng`, `thahsn -> thanhs -> thánh`, `lihjc -> licjh -> lịch`):
+        //     when rolling a 2-key coda (`ng`, `nh`, `ch`) together with a tone/mark key, the Telex key
+        //     can land between the reversed coda consonants (`g-f-n`), which a single adjacent swap
+        //     cannot untangle (`g <-> f` gives `hoafgn`; `f <-> n` gives `hoagnf`).
+        for i in 1..(n - 2) {
+            let is_reversed_coda = matches!(
+                (bytes[i], bytes[i + 2]),
+                (b'g', b'n') | (b'h', b'n') | (b'h', b'c')
+            );
+            let mid = bytes[i + 1];
+            let is_telex_mid = is_tone_or_horn_key(mid)
+                || (is_double_mark_key(mid) && bytes[..i + 1].contains(&mid));
+            if !is_reversed_coda || !is_telex_mid {
+                continue;
+            }
+            let mut swapped = bytes.to_vec();
+            swapped.swap(i, i + 2);
+            if let Ok(cand) = std::str::from_utf8(&swapped) {
+                if let Some(rescued) = try_candidate_repair(cand, raw_keys, screen_chars, opts) {
+                    return Some(rescued);
+                }
+            }
+        }
     }
 
     None
@@ -1809,6 +1834,28 @@ mod tests {
 
         let r10 = rescue_telex_typo("tieegns").expect("should rescue tieegns");
         assert_eq!(r10.replacement, "tiếng");
+
+        let r11 = rescue_telex_typo("hoagnf").expect("should rescue hoagnf");
+        assert_eq!(r11.replacement, "hoàng");
+        assert_eq!(r11.screen_chars, 6);
+
+        let r12 = rescue_telex_typo("hoafgn").expect("should rescue hoafgn");
+        assert_eq!(r12.replacement, "hoàng");
+        assert_eq!(r12.screen_chars, 6);
+
+        let r13 = rescue_telex_typo("hoagfn").expect("should rescue hoagfn");
+        assert_eq!(r13.replacement, "hoàng");
+        assert_eq!(r13.screen_chars, 6);
+        assert_eq!(rescue_telex_typo("Hoagfn").unwrap().replacement, "Hoàng");
+
+        let r14 = rescue_telex_typo("tieegsn").expect("should rescue tieegsn");
+        assert_eq!(r14.replacement, "tiếng");
+
+        let r15 = rescue_telex_typo("lihjc").expect("should rescue lihjc");
+        assert_eq!(r15.replacement, "lịch");
+
+        let r16 = rescue_telex_typo("thahsn").expect("should rescue thahsn");
+        assert_eq!(r16.replacement, "thánh");
 
         // Casing preservation:
         assert_eq!(

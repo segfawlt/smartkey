@@ -177,6 +177,19 @@ fn test_vi_lotus_broken_telex_rescue_and_exact_screen_chars() {
             insert: "không ".to_string(),
         }
     );
+
+    // 7. `hoagnf ` (adjacent coda transposition) and `hoagfn ` (split coda transposition across `f`) -> `"hoàng "`
+    for raw in ["hoagnf ", "hoagfn "] {
+        let (buf, actions) = type_sequence(&mut session, &mut engine, raw);
+        assert_eq!(buf, "hoàng ");
+        assert_eq!(
+            actions.last().unwrap(),
+            &SessionAction::Replace {
+                delete_chars: 6,
+                insert: "hoàng ".to_string(),
+            }
+        );
+    }
 }
 
 #[test]
