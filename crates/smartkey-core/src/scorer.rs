@@ -49,6 +49,11 @@ pub trait UserRuleView {
         let _ = candidate_lower;
         0.0
     }
+    /// Bounded personal-dict usage frequency (`175..=225`) used by Step 5f fuzzy rescue.
+    fn personal_word_freq(&self, lower_word: &str) -> u8 {
+        let _ = lower_word;
+        175
+    }
     fn personal_words(&self) -> Option<&BTreeSet<String>> {
         None
     }
@@ -595,13 +600,20 @@ impl EnglishScorer {
                     }
                 }
             }
+            let allow_personal_case_upgrade = in_personal
+                && !shift_slip_fixed
+                && (is_mixed_case_word || (user_title_case && !ctx.at_sentence_start))
+                && rules
+                    .lookup_personal_canonical(&core_lower)
+                    .is_some_and(|c| !c.chars().any(char::is_uppercase));
             return (
                 EvalOutcome::Unchanged {
                     reason: MatchKind::ValidWord,
-                    // If `in_personal` is already true, no need to stage it again; if it is only
-                    // `1x` undo-shielded (`in_personal == false`), set `do_not_learn: false` so its
-                    // next untouched use graduates it into `personal_dict`!
-                    do_not_learn: in_personal,
+                    // If `in_personal` is already true, no need to stage it again unless upgrading
+                    // a lowercase `personal_dict` entry to canonical case (`"domixi"` -> `"Domixi"`);
+                    // if `1x` undo-shielded (`in_personal == false`), set `do_not_learn: false` so
+                    // its next untouched use graduates it into `personal_dict`!
+                    do_not_learn: in_personal && !allow_personal_case_upgrade,
                 },
                 Vec::new(),
             );
@@ -1170,7 +1182,7 @@ impl EnglishScorer {
                 push_candidate(
                     &mut pool,
                     pword,
-                    175,
+                    rules.personal_word_freq(pword),
                     0.14,
                     MatchKind::PersonalDict,
                     Some(cost),

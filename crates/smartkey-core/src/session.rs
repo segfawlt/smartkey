@@ -742,6 +742,7 @@ impl SmartKeySession {
             }
         }
         self.flush_pending_unknown(engine, &mut events);
+        let _ = engine.store.flush_dirty_state();
         self.reset_state_only();
         events
     }
@@ -1925,9 +1926,12 @@ impl SmartKeySession {
                     }
                 }
 
-                engine
-                    .store
-                    .log_autocorrect_applied(&word, &replacement, kind);
+                engine.store.log_autocorrect_applied_with_context(
+                    prev_before.as_deref(),
+                    &word,
+                    &replacement,
+                    kind,
+                );
 
                 let base_chars = on_screen_word_override.unwrap_or_else(|| {
                     vi_sim
@@ -1995,33 +1999,44 @@ impl SmartKeySession {
                     }
                 }
 
+                if reason == MatchKind::ValidWord {
+                    let core_lower = word
+                        .trim_matches(|c: char| !c.is_alphabetic() && c != '\'' && c != '’')
+                        .to_lowercase();
+                    if !core_lower.is_empty() {
+                        engine.store.record_personal_word_use(&self.lang, &core_lower);
+                    }
+                }
+
                 if !do_not_learn {
                     self.pending_unknown = Some((self.lang.clone(), word.clone()));
-                    let (best_candidate, best_score, threshold) =
-                        if let Some(scorer) = engine.scorer() {
-                            let explanation = scorer.explain(
-                                &word,
-                                &ctx,
-                                engine.store.scorer_config(),
-                                &engine.store,
-                            );
-                            let (thresh, _) = crate::scorer::EnglishScorer::thresholds(
-                                engine.store.scorer_config().aggressiveness,
-                            );
-                            let (cand, score) = match explanation.top_candidates.first() {
-                                Some(c) => (Some(c.replacement.clone()), c.score),
-                                None => (None, 0.0),
+                    if reason != MatchKind::ValidWord {
+                        let (best_candidate, best_score, threshold) =
+                            if let Some(scorer) = engine.scorer() {
+                                let explanation = scorer.explain(
+                                    &word,
+                                    &ctx,
+                                    engine.store.scorer_config(),
+                                    &engine.store,
+                                );
+                                let (thresh, _) = crate::scorer::EnglishScorer::thresholds(
+                                    engine.store.scorer_config().aggressiveness,
+                                );
+                                let (cand, score) = match explanation.top_candidates.first() {
+                                    Some(c) => (Some(c.replacement.clone()), c.score),
+                                    None => (None, 0.0),
+                                };
+                                (cand, score, thresh)
+                            } else {
+                                (None, 0.0, 0.14)
                             };
-                            (cand, score, thresh)
-                        } else {
-                            (None, 0.0, 0.14)
-                        };
-                    engine.store.log_unfixed_unknown(
-                        &word,
-                        best_candidate.as_deref(),
-                        best_score,
-                        threshold,
-                    );
+                        engine.store.log_unfixed_unknown(
+                            &word,
+                            best_candidate.as_deref(),
+                            best_score,
+                            threshold,
+                        );
+                    }
                 } else {
                     if reason == MatchKind::ValidWord
                         && self.lang.as_str() == "en"

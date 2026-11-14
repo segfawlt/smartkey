@@ -23,8 +23,9 @@ pub use session::{
     apply_key_to_buffer, KeyInput, SessionAction, SessionOutput, SmartKeyEngine, SmartKeySession,
 };
 pub use store::{
-    BlockPair, CompiledRules, DiagnosticEvent, LearnerState, Preset, RuleStore, SkippedEditEntry,
-    UndoResolution,
+    BlockPair, CompiledRules, ConfidenceTier, DiagnosticEvent, LearnerState, Preset,
+    PruneCandidate, PruneKinds, PruneOptions, PruneReport, RuleOrigin, RuleStat, RuleStore,
+    SkippedEditEntry, UndoResolution,
 };
 pub use types::{
     Aggressiveness, AppProfile, Candidate, Dialect, EvalOutcome, Explanation, InputOrigin, LangId,

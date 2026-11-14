@@ -8,9 +8,9 @@ use std::time::Instant;
 use serde::Serialize;
 use smartkey_core::event_log::current_epoch_ms;
 use smartkey_core::{
-    apply_key_to_buffer, DiagnosticEvent, Dialect, EnglishScorer, EvalContext, EvalOutcome,
-    EventLog, KeyInput, LangId, LoggedDiagnosticRecord, MatchKind, Preset, RuleStore,
-    SessionAction, SmartKeyEngine, SmartKeySession, UndoResolution,
+    apply_key_to_buffer, ConfidenceTier, DiagnosticEvent, Dialect, EnglishScorer, EvalContext,
+    EvalOutcome, EventLog, KeyInput, LangId, LoggedDiagnosticRecord, MatchKind, Preset, PruneKinds,
+    PruneOptions, RuleStore, SessionAction, SmartKeyEngine, SmartKeySession, UndoResolution,
 };
 
 /// Git state stamped at build time by `build.rs`: HEAD hash or tag (e.g.
@@ -533,6 +533,47 @@ fn parse_lang_arg(raw: &str) -> Result<LangId, CliError> {
 }
 
 #[derive(Serialize)]
+struct ConfidenceCountsJson {
+    manual: usize,
+    confirmed: usize,
+    provisional: usize,
+    suspect: usize,
+}
+
+#[derive(Serialize)]
+struct ConfidenceRuleJson {
+    kind: &'static str,
+    key: String,
+    display: String,
+    tier: &'static str,
+    origin: &'static str,
+    hits: u32,
+    strikes: u32,
+    created_epoch_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_hit_epoch_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct StagedEntryJson {
+    queue: &'static str,
+    key: String,
+    display: String,
+    count: u32,
+    threshold: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StagedJson {
+    rules_path: String,
+    initialized: bool,
+    total: usize,
+    staged: Vec<StagedEntryJson>,
+}
+
+#[derive(Serialize)]
 struct RulesJson {
     rules_path: String,
     initialized: bool,
@@ -546,12 +587,348 @@ struct RulesJson {
     snippets: std::collections::BTreeMap<String, String>,
     blocklist: Vec<(String, String)>,
     telex_passthrough: Vec<String>,
+    confidence_counts: ConfidenceCountsJson,
+    confidence: Vec<ConfidenceRuleJson>,
+}
+
+fn parse_confidence_tier(raw: &str) -> Result<ConfidenceTier, CliError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "suspect" | "suspicious" => Ok(ConfidenceTier::Suspect),
+        "provisional" => Ok(ConfidenceTier::Provisional),
+        "confirmed" => Ok(ConfidenceTier::Confirmed),
+        "manual" => Ok(ConfidenceTier::Manual),
+        other => Err(CliError::Usage(format!(
+            "invalid --tier {other:?} (expected suspect, provisional, confirmed, or manual)"
+        ))),
+    }
+}
+
+fn parse_prune_kinds(raw: &str) -> Result<PruneKinds, CliError> {
+    let mut kinds = PruneKinds::none();
+    let mut any = false;
+    for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        any = true;
+        match part.to_ascii_lowercase().as_str() {
+            "fix" | "fixes" => kinds.fix = true,
+            "context" | "ctx" => kinds.context = true,
+            "word" | "words" | "personal" => kinds.word = true,
+            "block" | "blocks" | "blocklist" => kinds.block = true,
+            "passthrough" | "pt" | "telex" => kinds.passthrough = true,
+            "all" => kinds = PruneKinds::all(),
+            other => {
+                return Err(CliError::Usage(format!(
+                    "invalid --kind token {other:?} (expected fix, context, word, block, passthrough, or all)"
+                )));
+            }
+        }
+    }
+    if !any {
+        return Err(CliError::Usage(
+            "--kind requires at least one of fix, context, word, block, passthrough, or all"
+                .to_string(),
+        ));
+    }
+    Ok(kinds)
+}
+
+fn format_age_ago(now_ms: u64, ts_ms: u64) -> String {
+    if ts_ms == 0 {
+        return "untracked".to_string();
+    }
+    let diff_s = now_ms.saturating_sub(ts_ms) / 1000;
+    if diff_s < 60 {
+        format!("{diff_s}s")
+    } else if diff_s < 3600 {
+        format!("{}m", diff_s / 60)
+    } else if diff_s < 86_400 {
+        format!("{}h", diff_s / 3600)
+    } else {
+        format!("{}d", diff_s / 86_400)
+    }
+}
+
+fn tier_sort_rank(tier: &str) -> u8 {
+    match tier {
+        "suspect" => 0,
+        "provisional" => 1,
+        "confirmed" => 2,
+        _ => 3,
+    }
+}
+
+fn collect_rule_confidence(store: &RuleStore) -> (ConfidenceCountsJson, Vec<ConfidenceRuleJson>) {
+    let c = store.compiled();
+    let mut raw: Vec<(&'static str, String, String, bool)> = Vec::new();
+
+    for (typed, fixed) in &c.corrections {
+        raw.push((
+            "fix",
+            RuleStore::stat_key_fix("en", typed),
+            format!("{typed} -> {fixed}"),
+            false,
+        ));
+    }
+    for (lk, map) in &c.lang_corrections {
+        for (typed, fixed) in map {
+            let display = if lk == "en" {
+                format!("{typed} -> {fixed}")
+            } else {
+                format!("[{lk}] {typed} -> {fixed}")
+            };
+            raw.push(("fix", RuleStore::stat_key_fix(lk, typed), display, false));
+        }
+    }
+    for ((prev, typed), fixed) in &c.context_corrections {
+        raw.push((
+            "context",
+            RuleStore::stat_key_ctx(prev, typed),
+            format!("{prev} {typed} -> {fixed}"),
+            false,
+        ));
+    }
+    for w in &c.personal_dict {
+        let canon = c
+            .personal_dict_canonical
+            .get(w)
+            .map(String::as_str)
+            .unwrap_or(w.as_str());
+        raw.push((
+            "word",
+            RuleStore::stat_key_word("en", w),
+            canon.to_string(),
+            c.pinned.contains(w),
+        ));
+    }
+    for (lk, set) in &c.lang_personal_dict {
+        if lk == "en" {
+            continue;
+        }
+        let canon_map = c.lang_personal_dict_canonical.get(lk);
+        for w in set {
+            let canon = canon_map
+                .and_then(|m| m.get(w))
+                .map(String::as_str)
+                .unwrap_or(w.as_str());
+            raw.push((
+                "word",
+                RuleStore::stat_key_word(lk, w),
+                format!("[{lk}] {canon}"),
+                false,
+            ));
+        }
+    }
+    for (t, r) in &c.blocklist {
+        raw.push((
+            "block",
+            RuleStore::stat_key_block(t, r),
+            format!("{t} !-> {r}"),
+            false,
+        ));
+    }
+    for w in &c.telex_passthrough {
+        raw.push(("passthrough", RuleStore::stat_key_pt(w), w.clone(), false));
+    }
+
+    let mut counts = ConfidenceCountsJson {
+        manual: 0,
+        confirmed: 0,
+        provisional: 0,
+        suspect: 0,
+    };
+    let mut items = Vec::with_capacity(raw.len());
+    for (kind, key, display, is_pinned) in raw {
+        let (tier, stat, hits, strikes) = store.classify_rule_confidence(&key);
+        match tier {
+            ConfidenceTier::Manual => counts.manual += 1,
+            ConfidenceTier::Confirmed => counts.confirmed += 1,
+            ConfidenceTier::Provisional => counts.provisional += 1,
+            ConfidenceTier::Suspect => counts.suspect += 1,
+        }
+        let origin = if is_pinned {
+            "pinned"
+        } else {
+            stat.map(|s| s.origin.as_str()).unwrap_or("untracked")
+        };
+        items.push(ConfidenceRuleJson {
+            kind,
+            key,
+            display,
+            tier: tier.as_str(),
+            origin,
+            hits,
+            strikes,
+            created_epoch_ms: stat.map(|s| s.created_epoch_ms).unwrap_or(0),
+            last_hit_epoch_ms: stat.and_then(|s| s.last_hit_epoch_ms),
+        });
+    }
+    items.sort_by(|a, b| {
+        tier_sort_rank(a.tier)
+            .cmp(&tier_sort_rank(b.tier))
+            .then_with(|| a.kind.cmp(b.kind))
+            .then_with(|| a.display.cmp(&b.display))
+    });
+    (counts, items)
+}
+
+fn collect_staged_entries(st: &smartkey_core::LearnerState) -> Vec<StagedEntryJson> {
+    let mut staged = Vec::new();
+    for (k, &count) in &st.staged_corrections {
+        if let Some(rest) = k.strip_prefix("case:") {
+            let display = rest
+                .split_once(':')
+                .map(|(l, w)| format!("[{l}] {w}"))
+                .unwrap_or_else(|| rest.to_string());
+            staged.push(StagedEntryJson {
+                queue: "case_fix",
+                key: k.clone(),
+                display,
+                count,
+                threshold: 2,
+                canonical: None,
+            });
+        } else {
+            let display = k
+                .split_once(':')
+                .map(|(l, pair)| format!("[{l}] {pair}"))
+                .unwrap_or_else(|| k.clone());
+            staged.push(StagedEntryJson {
+                queue: "fix",
+                key: k.clone(),
+                display,
+                count,
+                threshold: 2,
+                canonical: None,
+            });
+        }
+    }
+    for (k, &count) in &st.staged_context {
+        staged.push(StagedEntryJson {
+            queue: "context",
+            key: k.clone(),
+            display: format!("[en] {}", k.replace('|', " ")),
+            count,
+            threshold: 2,
+            canonical: None,
+        });
+    }
+    for (k, &count) in &st.untouched_unknowns {
+        if let Some(rest) = k.strip_prefix("case_upgrade:") {
+            let display = rest
+                .split_once(':')
+                .map(|(l, w)| format!("[{l}] {w}"))
+                .unwrap_or_else(|| rest.to_string());
+            staged.push(StagedEntryJson {
+                queue: "case_upgrade",
+                key: k.clone(),
+                display,
+                count,
+                threshold: 2,
+                canonical: None,
+            });
+        } else if let Some((l, w)) = k.split_once(':') {
+            // Skip bare diagnostic hit counters from `log_unfixed_unknown`; only show lang-prefixed staging queues.
+            let canon = st.staged_personal_canonical.get(k).cloned();
+            let display = match &canon {
+                Some(c) => format!("[{l}] {c}"),
+                None => format!("[{l}] {w}"),
+            };
+            staged.push(StagedEntryJson {
+                queue: "untouched_word",
+                key: k.clone(),
+                display,
+                count,
+                threshold: 3,
+                canonical: canon,
+            });
+        }
+    }
+    for (k, &count) in &st.staged_undo_keep {
+        if let Some(rest) = k.strip_prefix("demote:") {
+            let display = rest
+                .split_once(':')
+                .map(|(l, w)| format!("[{l}] {w}"))
+                .unwrap_or_else(|| rest.to_string());
+            staged.push(StagedEntryJson {
+                queue: "personal_demote",
+                key: k.clone(),
+                display,
+                count,
+                threshold: 2,
+                canonical: None,
+            });
+        } else {
+            let display = k
+                .split_once(':')
+                .map(|(l, pair)| format!("[{l}] {pair}"))
+                .unwrap_or_else(|| k.clone());
+            staged.push(StagedEntryJson {
+                queue: "undo_keep",
+                key: k.clone(),
+                display,
+                count,
+                threshold: 2,
+                canonical: None,
+            });
+        }
+    }
+    for (k, &count) in &st.staged_contraction_rejects {
+        let display = k
+            .split_once(':')
+            .map(|(l, pair)| format!("[{l}] {pair}"))
+            .unwrap_or_else(|| k.clone());
+        staged.push(StagedEntryJson {
+            queue: "contraction_reject",
+            key: k.clone(),
+            display,
+            count,
+            threshold: 2,
+            canonical: None,
+        });
+    }
+    for (k, &count) in &st.staged_telex_passthrough {
+        staged.push(StagedEntryJson {
+            queue: "telex_passthrough",
+            key: k.clone(),
+            display: format!("[vi] {k}"),
+            count,
+            threshold: 2,
+            canonical: None,
+        });
+    }
+    staged
+}
+
+fn print_confidence_line(item: &ConfidenceRuleJson, now_ms: u64) {
+    let ref_ts = item.last_hit_epoch_ms.unwrap_or(item.created_epoch_ms);
+    let age_label = if item.last_hit_epoch_ms.is_some() {
+        format!("last hit {} ago", format_age_ago(now_ms, ref_ts))
+    } else if item.created_epoch_ms > 0 {
+        format!("created {} ago", format_age_ago(now_ms, ref_ts))
+    } else {
+        "untracked".to_string()
+    };
+    let strike_note = if item.strikes > 0 {
+        format!(", strikes={}", item.strikes)
+    } else {
+        String::new()
+    };
+    println!(
+        "  [{tier:<11}] {kind:<11} {display}  (origin={origin}, hits={hits}{strike_note}, {age_label})",
+        tier = item.tier,
+        kind = item.kind,
+        display = item.display,
+        origin = item.origin,
+        hits = item.hits
+    );
 }
 
 fn print_rules_help() {
     println!(
         "USAGE:\n  \
-         smartkey rules [summary|list] [--json] [--dir <path>]\n  \
+         smartkey rules [summary] [--json] [--dir <path>]\n  \
+         smartkey rules list [--suspect | --tier <suspect|provisional|confirmed|manual>] [--json] [--dir <path>]\n  \
+         smartkey rules staged [--json] [--dir <path>]\n  \
+         smartkey rules prune [--older-than <dur>] [--zero-hits | --max-hits <N>] [--kind <list>] [--include-manual] [--dry-run] [--json] [--dir <path>]\n  \
          smartkey rules add fix <typed> <replacement> [--lang en|vi] [--dir <path>]\n  \
          smartkey rules add context <prev> <typed> <replacement> [--dir <path>]\n  \
          smartkey rules add snippet <trigger> <expansion> [--dir <path>]\n  \
@@ -559,7 +936,7 @@ fn print_rules_help() {
          smartkey rules add block <typed> <rejected> [--dir <path>]\n  \
          smartkey rules add passthrough <ascii_word> [--dir <path>]\n  \
          smartkey rules remove <fix|context|snippet|word|block|passthrough> ... [--lang en|vi] [--dir <path>]\n\n\
-         Inspect or edit personal dictionary words, corrections, snippets, blocklist pairs, and Telex passthrough rules."
+         Inspect, audit confidence, inspect pending staged queues, prune stale learned rules, or edit personal rules."
     );
 }
 
@@ -567,6 +944,13 @@ fn cmd_rules(args: &[String]) -> CliResult {
     let mut dir = default_config_dir();
     let mut lang = LangId::en();
     let mut as_json = false;
+    let mut tier_filter: Option<ConfidenceTier> = None;
+    let mut older_than_ms: u64 = 30 * 86_400_000;
+    let mut max_hits: u32 = 0;
+    let mut kinds = PruneKinds::default();
+    let mut include_manual = false;
+    let mut dry_run = false;
+    let mut used_prune_flag = false;
     let mut pos: Vec<&str> = Vec::new();
     let mut end_of_flags = false;
 
@@ -603,6 +987,56 @@ fn cmd_rules(args: &[String]) -> CliResult {
             "--json" => {
                 as_json = true;
             }
+            "--suspect" | "--suspicious" => {
+                tier_filter = Some(ConfidenceTier::Suspect);
+            }
+            "--tier" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--tier requires a tier name".to_string()))?;
+                tier_filter = Some(parse_confidence_tier(raw)?);
+            }
+            "--older-than" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| {
+                    CliError::Usage("--older-than requires a duration (e.g. 30d, 12h)".to_string())
+                })?;
+                older_than_ms = parse_duration_ms(raw).map_err(|e| {
+                    CliError::Usage(format!("invalid --older-than {raw:?}: {e}"))
+                })?;
+                used_prune_flag = true;
+            }
+            "--zero-hits" => {
+                max_hits = 0;
+                used_prune_flag = true;
+            }
+            "--max-hits" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--max-hits requires a number".to_string()))?;
+                max_hits = raw.trim().parse::<u32>().map_err(|_| {
+                    CliError::Usage(format!("invalid --max-hits {raw:?} (expected integer)"))
+                })?;
+                used_prune_flag = true;
+            }
+            "--kind" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--kind requires rule kind(s)".to_string()))?;
+                kinds = parse_prune_kinds(raw)?;
+                used_prune_flag = true;
+            }
+            "--include-manual" => {
+                include_manual = true;
+                used_prune_flag = true;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                used_prune_flag = true;
+            }
             other if other.starts_with('-') => {
                 return Err(CliError::Usage(format!(
                     "unknown flag {other} (run `smartkey rules --help` for usage)"
@@ -614,6 +1048,18 @@ fn cmd_rules(args: &[String]) -> CliResult {
     }
 
     let action = pos.first().copied().unwrap_or("summary");
+    if action != "prune" && used_prune_flag {
+        return Err(CliError::Usage(
+            "prune flags (--older-than, --zero-hits, --max-hits, --kind, --include-manual, --dry-run) require `smartkey rules prune`"
+                .to_string(),
+        ));
+    }
+    if !matches!(action, "list" | "ls") && tier_filter.is_some() {
+        return Err(CliError::Usage(
+            "--suspect / --tier flags require `smartkey rules list`".to_string(),
+        ));
+    }
+
     match action {
         "summary" | "list" | "ls" => {
             if pos.len() > 1 {
@@ -626,6 +1072,15 @@ fn cmd_rules(args: &[String]) -> CliResult {
             let c = store.compiled();
             let st = store.state();
             let expected_rules_path = dir.join("rules.toml");
+            let now_ms = current_epoch_ms();
+            let (confidence_counts, all_confidence) = collect_rule_confidence(&store);
+            let filtered_confidence: Vec<ConfidenceRuleJson> = match tier_filter {
+                Some(t) => all_confidence
+                    .into_iter()
+                    .filter(|item| item.tier == t.as_str())
+                    .collect(),
+                None => all_confidence,
+            };
 
             if as_json {
                 let mut personal_words: Vec<String> = c
@@ -674,8 +1129,33 @@ fn cmd_rules(args: &[String]) -> CliResult {
                     snippets: c.snippets.clone(),
                     blocklist: c.blocklist.iter().cloned().collect(),
                     telex_passthrough: c.telex_passthrough.iter().cloned().collect(),
+                    confidence_counts,
+                    confidence: filtered_confidence,
                 };
                 println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                return Ok(());
+            }
+
+            if let Some(t) = tier_filter {
+                println!(
+                    "=== Rules Matching Confidence Tier: {} ({} found) ===",
+                    t.as_str(),
+                    filtered_confidence.len()
+                );
+                println!(
+                    "Totals: {} manual, {} confirmed, {} provisional, {} suspect",
+                    confidence_counts.manual,
+                    confidence_counts.confirmed,
+                    confidence_counts.provisional,
+                    confidence_counts.suspect
+                );
+                if filtered_confidence.is_empty() {
+                    println!("No rules match tier `{}`.", t.as_str());
+                } else {
+                    for item in &filtered_confidence {
+                        print_confidence_line(item, now_ms);
+                    }
+                }
                 return Ok(());
             }
 
@@ -713,6 +1193,18 @@ fn cmd_rules(args: &[String]) -> CliResult {
                 st.untouched_unknowns.len(),
                 st.trouble_words.len()
             );
+            println!(
+                "Rule Confidence      : {} manual, {} confirmed, {} provisional, {} suspect",
+                confidence_counts.manual,
+                confidence_counts.confirmed,
+                confidence_counts.provisional,
+                confidence_counts.suspect
+            );
+            if confidence_counts.suspect > 0 {
+                println!(
+                    "Tip: run `smartkey rules list --suspect` to review low-confidence or disputed rules."
+                );
+            }
 
             if action == "list" || action == "ls" {
                 if !c.corrections.is_empty() {
@@ -795,6 +1287,25 @@ fn cmd_rules(args: &[String]) -> CliResult {
                         words.join(", ")
                     );
                 }
+                println!("\n=== Confidence Breakdown ===");
+                println!(
+                    "  manual={} | confirmed={} | provisional={} | suspect={}",
+                    confidence_counts.manual,
+                    confidence_counts.confirmed,
+                    confidence_counts.provisional,
+                    confidence_counts.suspect
+                );
+                let review_items: Vec<&ConfidenceRuleJson> = filtered_confidence
+                    .iter()
+                    .filter(|it| matches!(it.tier, "suspect" | "provisional"))
+                    .collect();
+                if review_items.is_empty() {
+                    println!("  No suspect or provisional learned rules.");
+                } else {
+                    for item in review_items {
+                        print_confidence_line(item, now_ms);
+                    }
+                }
             } else if !st.skipped_edits.is_empty() {
                 println!(
                     "\nRecent Guard-Rejected Edits ({}):",
@@ -811,6 +1322,95 @@ fn cmd_rules(args: &[String]) -> CliResult {
                         entry.reason
                     );
                 }
+            }
+            Ok(())
+        }
+        "staged" => {
+            if pos.len() > 1 {
+                return Err(CliError::Usage(format!(
+                    "unexpected argument {:?} (run `smartkey rules --help` for usage)",
+                    pos[1]
+                )));
+            }
+            let (store, initialized) = load_rule_store_readonly(&dir, Preset::Balanced)?;
+            let staged = collect_staged_entries(store.state());
+            let rules_path = dir.join("rules.toml");
+            if as_json {
+                let payload = StagedJson {
+                    rules_path: rules_path.display().to_string(),
+                    initialized,
+                    total: staged.len(),
+                    staged,
+                };
+                println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                return Ok(());
+            }
+            println!(
+                "=== Staged Rule Candidates ({} pending) ===",
+                staged.len()
+            );
+            if staged.is_empty() {
+                println!("No staged candidates.");
+            } else {
+                for item in &staged {
+                    println!(
+                        "  [{count}/{threshold}] {queue:<18} {display}",
+                        count = item.count,
+                        threshold = item.threshold,
+                        queue = item.queue,
+                        display = item.display
+                    );
+                }
+            }
+            Ok(())
+        }
+        "prune" => {
+            if pos.len() > 1 {
+                return Err(CliError::Usage(format!(
+                    "unexpected argument {:?} (run `smartkey rules --help` for usage)",
+                    pos[1]
+                )));
+            }
+            let rules_path = dir.join("rules.toml");
+            let state_path = dir.join("learner_state.json");
+            let mut store =
+                RuleStore::load_or_init(rules_path, state_path, Preset::Balanced)
+                    .map_err(map_store_err)?;
+            let now_ms = current_epoch_ms();
+            let opts = PruneOptions {
+                older_than_ms,
+                max_hits,
+                kinds,
+                include_manual,
+                dry_run,
+            };
+            let report = store.prune_rules(now_ms, &opts).map_err(map_store_err)?;
+            if !report.dry_run && report.removed_count > 0 {
+                let _ = notify_fcitx5_reload();
+            }
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                return Ok(());
+            }
+            let mode_label = if report.dry_run {
+                "Dry-run: would remove"
+            } else {
+                "Removed"
+            };
+            println!(
+                "{mode_label} {} stale rule(s) ({} untracked hand-edited rule(s) spared).",
+                report.matched.len(),
+                report.skipped_untracked
+            );
+            for cand in &report.matched {
+                println!(
+                    "  [{tier:<11}] {kind:<11} {display}  (origin={origin}, hits={hits})",
+                    tier = cand.tier.as_str(),
+                    kind = cand.kind,
+                    display = cand.display,
+                    origin = cand.origin.as_str(),
+                    hits = cand.hits
+                );
             }
             Ok(())
         }
@@ -1342,11 +1942,8 @@ fn parse_local_date_midnight_ms(ymd: &str) -> Option<u64> {
     }
 }
 
-fn parse_since_spec(raw: &str, now_ms: u64) -> Result<u64, CliError> {
+fn parse_duration_ms(raw: &str) -> Result<u64, String> {
     let trimmed = raw.trim();
-    if let Some(ms) = parse_local_date_midnight_ms(trimmed) {
-        return Ok(ms);
-    }
     if trimmed.len() >= 2 {
         let (num_part, unit_part) = trimmed.split_at(trimmed.len() - 1);
         if let Ok(n) = num_part.parse::<u64>() {
@@ -1359,13 +1956,27 @@ fn parse_since_spec(raw: &str, now_ms: u64) -> Result<u64, CliError> {
                 _ => None,
             };
             if let Some(unit) = mult_ms {
-                return Ok(now_ms.saturating_sub(n.saturating_mul(unit)));
+                return Ok(n.saturating_mul(unit));
             }
         }
     }
-    Err(CliError::Usage(format!(
-        "invalid --since {raw:?} (expected relative duration like 30m, 2h, 7d or date YYYY-MM-DD)"
-    )))
+    Err(format!(
+        "invalid duration {raw:?} (expected <N>s, <N>m, <N>h, <N>d, or <N>w)"
+    ))
+}
+
+fn parse_since_spec(raw: &str, now_ms: u64) -> Result<u64, CliError> {
+    let trimmed = raw.trim();
+    if let Some(ms) = parse_local_date_midnight_ms(trimmed) {
+        return Ok(ms);
+    }
+    parse_duration_ms(trimmed)
+        .map(|dur| now_ms.saturating_sub(dur))
+        .map_err(|_| {
+            CliError::Usage(format!(
+                "invalid --since {raw:?} (expected relative duration like 30m, 2h, 7d or date YYYY-MM-DD)"
+            ))
+        })
 }
 
 fn format_local_timestamp(ts_ms: u64) -> String {
@@ -2540,7 +3151,8 @@ COMMANDS:
   reload                                                 Reload configuration & dictionary packs in Fcitx5
   log [fixed|manual|unfixed] [--today|--yesterday|--since <spec>] [--grep <p>] [--json] [-n <N>] [--clear]
                                                          Query diagnostic counters & durable JSONL event logs
-  rules [list|add|remove] ... [--json] [--dir <path>]    Inspect or edit personal words, rules, snippets & blocks
+  rules [list|staged|prune|add|remove] ... [--json] [--dir <path>]
+                                                         Inspect confidence, staged queues, prune stale rules, or edit rules
   config [list|get <key>|set <key> <val>] [--json]       Inspect or update settings & diagnostics in rules.toml
   explain [--json] [--lang en|vi] [--prev <w>] [--punct <c>] [--dialect mixed|us|gb] [--sentence-start] [--dir <path>] <token>
                                                          Explain scoring, proper nouns & candidate ranking
@@ -3003,5 +3615,118 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cli_confidence_staged_and_prune_commands() {
+        let dir = env::temp_dir().join(format!(
+            "smartkey_cli_conf_{}_{}",
+            std::process::id(),
+            current_epoch_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rules_path = dir.join("rules.toml");
+        let state_path = dir.join("learner_state.json");
+        {
+            let mut store =
+                RuleStore::load_or_init(rules_path, state_path, Preset::Balanced).unwrap();
+            store
+                .set_user_correction(&LangId::en(), "adn", "and")
+                .unwrap();
+            store.add_correction(&LangId::en(), "staletypo", "fixed");
+            store.add_personal_word_with_stage(&LangId::en(), "domixi", "untouched_3x");
+            store
+                .state_mut()
+                .untouched_unknowns
+                .insert("en:xqztest".to_string(), 1);
+            store
+                .state_mut()
+                .untouched_unknowns
+                .insert("rawdiag".to_string(), 4);
+            store
+                .state_mut()
+                .staged_corrections
+                .insert("case:en:pytorch".to_string(), 1);
+            store.flush_state().unwrap();
+
+            let staged = collect_staged_entries(store.state());
+            assert!(staged
+                .iter()
+                .any(|e| e.key == "en:xqztest" && e.count == 1 && e.threshold == 3));
+            assert!(staged
+                .iter()
+                .any(|e| e.key == "case:en:pytorch" && e.count == 1 && e.threshold == 2));
+            assert!(
+                !staged.iter().any(|e| e.key == "rawdiag"),
+                "bare diagnostic log keys must not clutter `rules staged`"
+            );
+        }
+
+        let dir_str = dir.to_str().unwrap();
+        assert_eq!(
+            run_cli(&vec_args(&["rules", "--json", "--dir", dir_str])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&["rules", "list", "--suspect", "--dir", dir_str])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules", "list", "--tier", "manual", "--dir", dir_str
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&["rules", "staged", "--json", "--dir", dir_str])),
+            Ok(())
+        );
+        assert!(matches!(
+            run_cli(&vec_args(&[
+                "rules",
+                "summary",
+                "--suspect",
+                "--dir",
+                dir_str
+            ])),
+            Err(CliError::Usage(_))
+        ));
+        assert!(matches!(
+            run_cli(&vec_args(&["rules", "list", "--dry-run", "--dir", dir_str])),
+            Err(CliError::Usage(_))
+        ));
+
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules",
+                "prune",
+                "--older-than",
+                "0s",
+                "--dry-run",
+                "--dir",
+                dir_str
+            ])),
+            Ok(())
+        );
+        let (reloaded_dry, _) = load_rule_store_readonly(&dir, Preset::Balanced).unwrap();
+        assert!(reloaded_dry.compiled().corrections.contains_key("staletypo"));
+
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "rules",
+                "prune",
+                "--older-than",
+                "0s",
+                "--dir",
+                dir_str
+            ])),
+            Ok(())
+        );
+        let (reloaded, _) = load_rule_store_readonly(&dir, Preset::Balanced).unwrap();
+        assert!(!reloaded.compiled().corrections.contains_key("staletypo"));
+        assert!(reloaded.compiled().corrections.contains_key("adn"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

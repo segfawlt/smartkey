@@ -1627,3 +1627,195 @@ fn polish_homograph_is_left_alone() {
     feed_keys(&mut session, &mut engine, &mut buf, "Polish ");
     assert_eq!(buf, "polish the code Polish ");
 }
+
+#[test]
+fn f1_novel_oov_1x_session_shield_and_2x_fast_track_preserves_canonical_case() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    // 1x manual fix to novel OOV `"Domixi"`: staged (not in personal_dict yet),
+    // but shields `"domixi"` in-session and credits +2 toward untouched promotion.
+    let evs1 = feed_keys(&mut session, &mut engine, &mut buf, "dmoxii <CBS>Domixi ");
+    assert!(evs1.iter().any(|e| matches!(
+        e,
+        LearnEvent::StagedCorrection {
+            orig,
+            fixed,
+            count: 1,
+            ..
+        } if orig == "dmoxii" && fixed == "Domixi"
+    )));
+    assert!(
+        !engine.store().compiled().personal_dict.contains("domixi"),
+        "1x fix must NOT graduate to personal_dict immediately"
+    );
+
+    // One untouched use in the same session reaches 3/3 and preserves canonical `"Domixi"`.
+    feed_keys(&mut session, &mut engine, &mut buf, "domixi ok ");
+    assert!(
+        engine.store().compiled().personal_dict.contains("domixi"),
+        "1x fix + 1x untouched must fast-track graduate to personal_dict"
+    );
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .personal_dict_canonical
+            .get("domixi")
+            .map(String::as_str),
+        Some("Domixi")
+    );
+
+    let mut next_session = SmartKeySession::new();
+    let mut next_buf = String::new();
+    feed_keys(&mut next_session, &mut engine, &mut next_buf, "hello domixi ");
+    assert_eq!(next_buf, "hello Domixi ");
+}
+
+#[test]
+fn f1_case_only_manual_edit_learns_tech_and_oov_but_ignores_ordinary_words() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+
+    // Ordinary prose words (`hello -> Hello`, `polish -> Polish`) must be ignored (`SameWord`).
+    for _ in 0..3 {
+        let mut s = SmartKeySession::new();
+        let mut b = String::new();
+        feed_keys(&mut s, &mut engine, &mut b, "hello <CBS>Hello ");
+        feed_keys(&mut s, &mut engine, &mut b, "polish <CBS>Polish ");
+    }
+    assert!(!engine.store().compiled().personal_dict.contains("hello"));
+    assert!(!engine.store().compiled().personal_dict.contains("polish"));
+    {
+        let mut s = SmartKeySession::new();
+        let mut b = String::new();
+        feed_keys(
+            &mut s,
+            &mut engine,
+            &mut b,
+            "we hello world and polish the code ",
+        );
+        assert_eq!(b, "we hello world and polish the code ");
+    }
+
+    // Intentional TitleCase novel word (`hyprland -> Hyprland`) stages at 1x and learns at 2x.
+    let mut s1 = SmartKeySession::new();
+    let mut b1 = String::new();
+    let ev1 = feed_keys(&mut s1, &mut engine, &mut b1, "hyprland <CBS>Hyprland ");
+    assert!(ev1.iter().any(|e| matches!(
+        e,
+        LearnEvent::StagedCorrection {
+            fixed,
+            count: 1,
+            ..
+        } if fixed == "Hyprland"
+    )));
+    assert!(!engine.store().compiled().personal_dict.contains("hyprland"));
+
+    let mut s2 = SmartKeySession::new();
+    let mut b2 = String::new();
+    let ev2 = feed_keys(&mut s2, &mut engine, &mut b2, "hyprland <CBS>Hyprland ");
+    assert!(ev2.iter().any(|e| matches!(
+        e,
+        LearnEvent::GraduatedPersonalWord { word, .. } if word == "Hyprland"
+    )));
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .personal_dict_canonical
+            .get("hyprland")
+            .map(String::as_str),
+        Some("Hyprland")
+    );
+    let mut s3 = SmartKeySession::new();
+    let mut b3 = String::new();
+    feed_keys(&mut s3, &mut engine, &mut b3, "using hyprland ");
+    assert_eq!(b3, "using Hyprland ");
+
+    // Lowercase-first personal_dict (`"domixv"` x3) upgrades to `"Domixv"` at 2x intentional mid-sentence cased typing.
+    let mut s4 = SmartKeySession::new();
+    let mut b4 = String::new();
+    feed_keys(
+        &mut s4,
+        &mut engine,
+        &mut b4,
+        "hi domixv ok domixv ok domixv ok ",
+    );
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .personal_dict_canonical
+            .get("domixv")
+            .map(String::as_str),
+        Some("domixv")
+    );
+    let mut s5 = SmartKeySession::new();
+    let mut b5 = String::new();
+    feed_keys(&mut s5, &mut engine, &mut b5, "hi Domixv ok hi Domixv ok ");
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .personal_dict_canonical
+            .get("domixv")
+            .map(String::as_str),
+        Some("Domixv")
+    );
+    let mut s6 = SmartKeySession::new();
+    let mut b6 = String::new();
+    feed_keys(&mut s6, &mut engine, &mut b6, "meet domixv ");
+    assert_eq!(b6, "meet Domixv ");
+}
+
+#[test]
+fn f3_personal_word_usage_boosts_typo_rescue_tiebreak_after_reset() {
+    static NEXT_F3_ID: AtomicU64 = AtomicU64::new(900);
+    let dir = std::env::temp_dir().join(format!(
+        "smartkey_f3_test_{}_{}",
+        std::process::id(),
+        NEXT_F3_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let rules_path = dir.join("rules.toml");
+    let state_path = dir.join("learner_state.json");
+
+    let mut store = RuleStore::load_or_init(rules_path, state_path, Preset::Balanced).unwrap();
+    store
+        .add_user_personal_word(&LangId::en(), "zarqv")
+        .unwrap();
+    store
+        .add_user_personal_word(&LangId::en(), "zarqb")
+        .unwrap();
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    assert_eq!(engine.store().personal_word_freq("zarqv"), 175);
+    assert_eq!(engine.store().personal_word_freq("zarqb"), 175);
+
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+    for _ in 0..15 {
+        feed_keys(&mut session, &mut engine, &mut buf, "zarqb ");
+    }
+    session.reset(&mut engine);
+
+    let freq_b = engine.store().personal_word_freq("zarqb");
+    let freq_v = engine.store().personal_word_freq("zarqv");
+    assert!(
+        freq_b > freq_v && freq_b <= 225,
+        "expected flushed usage boost for zarqb (got b={freq_b}, v={freq_v})"
+    );
+
+    let mut test_session = SmartKeySession::new();
+    let mut test_buf = String::new();
+    feed_keys(&mut test_session, &mut engine, &mut test_buf, "zarqn ");
+    assert_eq!(
+        test_buf, "zarqb ",
+        "more frequently used personal_dict word must win edit-distance tie"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

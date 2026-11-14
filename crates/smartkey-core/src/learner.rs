@@ -249,6 +249,7 @@ pub fn record_undo_keep_verbatim(
     }
     store.add_session_word_shield(&typed_lower);
     store.add_session_pair_block(&typed_lower, &rejected_lower);
+    store.sync_state_before_write();
     if !reject_pair_permanently(store, lang, &typed_lower, &rejected_lower) {
         // `1x` rejection of a curated contraction pair: session shield only, nothing permanent.
         // Must return BEFORE touching `staged_undo_keep`: `RuleStore::is_undo_shielded` treats any
@@ -256,7 +257,6 @@ pub fn record_undo_keep_verbatim(
         // silence the curated rule on the very next session and defeat the `2x` requirement.
         return LearnEvent::ShieldedWordSession { word: typed_lower };
     }
-    store.sync_state_before_write();
 
     let key = format!("{}:{}->{}", lang.as_str(), typed_lower, rejected_lower);
     let cnt = {
@@ -272,7 +272,7 @@ pub fn record_undo_keep_verbatim(
             &typed_lower
         };
         if is_prose_word_token(&typed_lower) {
-            store.add_personal_word(lang, word_to_save);
+            store.add_personal_word_with_stage(lang, word_to_save, "undo_keep_2x");
         }
         let _ = store.flush_state();
         LearnEvent::GraduatedUndoKeep {
@@ -352,6 +352,7 @@ pub fn resolve_restored_edit(
     ) {
         return vec![edit_ev];
     }
+    store.sync_state_before_write();
     // Curated contraction pairs stage their rejection (`2x` -> permanent); other pairs keep the
     // immediate `1x` block. Editing to a 3rd word (`"dont" -> "don't" -> BS -> "donut "`) is weak
     // evidence against the contraction — it may simply have been a different intended word.
@@ -401,6 +402,7 @@ pub fn record_manual_edit(
     let label = match &ev {
         LearnEvent::StagedCorrection { count, .. } => Some(format!("staged ({count}x)")),
         LearnEvent::GraduatedCorrection { .. } => Some("graduated".to_string()),
+        LearnEvent::GraduatedPersonalWord { .. } => Some("graduated_case".to_string()),
         LearnEvent::StagedContextCorrection { count, .. } => {
             Some(format!("staged_context ({count}x)"))
         }
@@ -420,6 +422,19 @@ pub fn record_manual_edit(
     ev
 }
 
+fn is_intentional_cased_token(trimmed: &str) -> bool {
+    let alpha: Vec<char> = trimmed.chars().filter(|c| c.is_alphabetic()).collect();
+    if alpha.len() < 2 {
+        return false;
+    }
+    let has_upper = alpha.iter().any(|c| c.is_uppercase());
+    let has_lower = alpha.iter().any(|c| c.is_lowercase());
+    let looks_like_shift_slip = alpha[0].is_uppercase()
+        && alpha[1].is_uppercase()
+        && alpha.iter().skip(2).any(|c| c.is_lowercase());
+    has_upper && has_lower && !looks_like_shift_slip
+}
+
 fn record_manual_edit_inner(
     store: &mut RuleStore,
     lexicon: Option<&EnglishLexicon>,
@@ -428,10 +443,107 @@ fn record_manual_edit_inner(
     orig_raw: &str,
     fixed_raw: &str,
 ) -> LearnEvent {
-    let orig_lower = orig_raw.trim().to_lowercase();
-    let fixed_lower = fixed_raw.trim().to_lowercase();
+    let orig_trimmed = orig_raw.trim();
+    let fixed_trimmed = fixed_raw.trim();
+    let orig_lower = orig_trimmed.to_lowercase();
+    let fixed_lower = fixed_trimmed.to_lowercase();
 
     if orig_lower == fixed_lower {
+        if orig_trimmed != fixed_trimmed
+            && is_prose_word_token(&fixed_lower)
+            && fixed_lower.chars().count() >= 2
+            && is_intentional_cased_token(fixed_trimmed)
+        {
+            let target_has_non_ascii = fixed_lower
+                .chars()
+                .any(|c| !c.is_ascii() && c.is_alphabetic());
+            if lang.as_str() == "vi" && !target_has_non_ascii {
+                return LearnEvent::None;
+            }
+            let effective_lang = if target_has_non_ascii && lang.as_str() == "en" {
+                LangId("vi".to_string())
+            } else {
+                lang.clone()
+            };
+            let has_internal_upper = fixed_trimmed.chars().skip(1).any(char::is_uppercase);
+            let is_tech_word = effective_lang.as_str() == "en"
+                && lexicon.is_some_and(|l| {
+                    l.lookup_proper_noun(&fixed_lower).is_none()
+                        && l.lookup_word(&fixed_lower).is_some_and(|m| m.is_tech())
+                });
+            let is_blocked_proper = effective_lang.as_str() == "en"
+                && lexicon.is_some_and(|l| {
+                    l.lookup_proper_noun(&fixed_lower)
+                        .is_some_and(|p| p == fixed_trimmed)
+                })
+                && store.is_pair_blocked(&fixed_lower, &fixed_lower);
+            let is_non_lex_word = effective_lang.as_str() != "en"
+                || lexicon.is_none_or(|l| {
+                    !l.contains_any_english(&fixed_lower)
+                        && l.lookup_known_typos(&fixed_lower).is_none()
+                });
+            let is_stretch = !store.is_personal_word(&fixed_lower)
+                && is_expressive_stretch(&fixed_lower, |w| {
+                    store.is_personal_word(w)
+                        || lexicon.is_some_and(|l| l.contains_any_english(w))
+                });
+            if !is_stretch
+                && (has_internal_upper || is_tech_word || is_blocked_proper || is_non_lex_word)
+            {
+                store.reload_if_modified();
+                if is_non_lex_word && !store.is_personal_word(&fixed_lower) {
+                    store.add_session_word_shield(&fixed_lower);
+                    let unk_key = format!("{}:{fixed_lower}", effective_lang.as_str());
+                    let e = store
+                        .state_mut()
+                        .untouched_unknowns
+                        .entry(unk_key.clone())
+                        .or_insert(0);
+                    *e = e.saturating_add(2);
+                    store
+                        .state_mut()
+                        .staged_personal_canonical
+                        .insert(unk_key, fixed_trimmed.to_string());
+                }
+                let case_key = format!("case:{}:{fixed_lower}", effective_lang.as_str());
+                let count = {
+                    let e = store
+                        .state_mut()
+                        .staged_corrections
+                        .entry(case_key)
+                        .or_insert(0);
+                    *e = e.saturating_add(1);
+                    *e
+                };
+                if count >= 2 {
+                    clear_pair_rejection(store, &effective_lang, &fixed_lower, fixed_trimmed);
+                    store.state_mut().staged_undo_keep.remove(&format!(
+                        "{}:{fixed_lower}->{fixed_lower}",
+                        effective_lang.as_str()
+                    ));
+                    if !is_blocked_proper {
+                        store.add_personal_word_with_stage(
+                            &effective_lang,
+                            fixed_trimmed,
+                            "case_fix_2x",
+                        );
+                        store.clear_untouched_unknown(&effective_lang, &fixed_lower);
+                    }
+                    let _ = store.flush_state();
+                    return LearnEvent::GraduatedPersonalWord {
+                        lang: effective_lang.0,
+                        word: fixed_trimmed.to_string(),
+                    };
+                }
+                let _ = store.flush_state();
+                return LearnEvent::StagedCorrection {
+                    lang: effective_lang.0,
+                    orig: orig_trimmed.to_string(),
+                    fixed: fixed_trimmed.to_string(),
+                    count,
+                };
+            }
+        }
         return LearnEvent::Ignored(SkipReason::SameWord);
     }
     if !is_prose_word_token(&orig_lower) || !is_prose_word_token(&fixed_lower) {
@@ -621,18 +733,30 @@ fn record_manual_edit_inner(
         };
 
         if target_is_novel_unknown {
+            store.add_session_word_shield(&fixed_lower);
             let unk_key = format!("{}:{}", effective_lang.as_str(), fixed_lower);
+            if target_to_save.chars().any(char::is_uppercase) {
+                store
+                    .state_mut()
+                    .staged_personal_canonical
+                    .insert(unk_key.clone(), target_to_save.clone());
+            }
             let unk_cnt = {
                 let e = store
                     .state_mut()
                     .untouched_unknowns
                     .entry(unk_key)
                     .or_insert(0);
-                *e = e.saturating_add(1);
+                *e = e.saturating_add(2);
                 *e
             };
             if unk_cnt >= 3 {
-                store.add_personal_word(&effective_lang, &target_to_save);
+                store.add_personal_word_with_stage(
+                    &effective_lang,
+                    &target_to_save,
+                    "personal_promoted_2x",
+                );
+                store.clear_untouched_unknown(&effective_lang, &fixed_lower);
             }
         }
 
@@ -664,6 +788,7 @@ fn record_manual_edit_inner(
                     &target_to_save,
                     "personal_promoted_2x",
                 );
+                store.clear_untouched_unknown(&effective_lang, &fixed_lower);
             }
             store.add_correction(&effective_lang, &orig_lower, &target_to_save);
             // Graduation is strictly stronger evidence than any earlier rejection of the same
@@ -778,6 +903,53 @@ pub fn record_untouched_unknown(
         });
 
     if store.is_personal_word(&lower) {
+        let canon = if lang.as_str() != "en" {
+            store
+                .compiled()
+                .lang_personal_dict_canonical
+                .get(lang.as_str())
+                .and_then(|m| m.get(&lower))
+                .or_else(|| store.compiled().personal_dict_canonical.get(&lower))
+        } else {
+            store.compiled().personal_dict_canonical.get(&lower)
+        };
+        if is_intentional_cased_token(word_trimmed)
+            && canon.is_none_or(|c| !c.chars().any(char::is_uppercase))
+        {
+            let target_lang = if lang.as_str() != "en"
+                && !store.is_explicit_personal_word(lang, &lower)
+                && store.compiled().personal_dict.contains(&lower)
+            {
+                LangId::en()
+            } else {
+                lang.clone()
+            };
+            let up_key = format!("case_upgrade:{}:{}", target_lang.as_str(), lower);
+            let cnt = {
+                let e = store
+                    .state_mut()
+                    .untouched_unknowns
+                    .entry(up_key.clone())
+                    .or_insert(0);
+                *e = e.saturating_add(1);
+                *e
+            };
+            if cnt >= 2 {
+                store.state_mut().untouched_unknowns.remove(&up_key);
+                store.add_personal_word_with_stage(&target_lang, word_trimmed, "case_upgrade_2x");
+                let _ = store.flush_state();
+                return LearnEvent::GraduatedPersonalWord {
+                    lang: target_lang.0,
+                    word: word_trimmed.to_string(),
+                };
+            }
+            let _ = store.flush_state();
+            return LearnEvent::StagedUntouchedUnknown {
+                lang: target_lang.0,
+                word: word_trimmed.to_string(),
+                count: cnt,
+            };
+        }
         return LearnEvent::None;
     }
     if lang.as_str() == "en"
@@ -789,8 +961,18 @@ pub fn record_untouched_unknown(
     }
 
     let key = format!("{}:{}", lang.as_str(), lower);
+    if has_upper && is_intentional_cased_token(word_trimmed) {
+        store
+            .state_mut()
+            .staged_personal_canonical
+            .insert(key.clone(), word_trimmed.to_string());
+    }
     let count = {
-        let e = store.state_mut().untouched_unknowns.entry(key).or_insert(0);
+        let e = store
+            .state_mut()
+            .untouched_unknowns
+            .entry(key.clone())
+            .or_insert(0);
         *e = e.saturating_add(1);
         *e
     };
@@ -804,12 +986,20 @@ pub fn record_untouched_unknown(
     let required_count = if has_prior_undo { 1 } else { 3 };
     let word_to_save = if has_upper {
         word_trimmed.to_string()
+    } else if let Some(canon) = store.state().staged_personal_canonical.get(&key).cloned() {
+        canon
     } else {
         lower.clone()
     };
 
     if count >= required_count {
-        store.add_personal_word(lang, &word_to_save);
+        let stage = if has_prior_undo {
+            "undo_keep_2x"
+        } else {
+            "untouched_3x"
+        };
+        store.add_personal_word_with_stage(lang, &word_to_save, stage);
+        store.clear_untouched_unknown(lang, &lower);
         let _ = store.flush_state();
         LearnEvent::GraduatedPersonalWord {
             lang: lang.0.clone(),
