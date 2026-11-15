@@ -3,6 +3,7 @@
 > **Date:** 2026-11-16 · **Method:** read-only recon. Local repo audited directly; upstream inspected from fresh `--depth 1` clones in `/tmp/smartkey-android-scout/`.
 > **Pins inspected:** `fcitx5-android` @ `eb5b502` (2026-10-13), fcitx5 core submodule @ `1e00551` (= fcitx **5.1.22**), `fcitx5-unikey` @ `ed9170c`, `plugin-scaffold` @ HEAD.
 > **Citation abbreviations:** `APP` = fcitx5-android, `CORE` = fcitx (pinned submodule), `UNIKEY` = fcitx5-unikey, `SCF` = plugin-scaffold, `SK` = this repo.
+> **Round 2 (2026-11-16):** §8 below answers the four round-2 surgical gates (§`prompt-android-fcitx5-round2.md`) at the **identical pins**; upstream publish state re-verified live against the maven mirror + GitHub API.
 > **Correction to the mission brief:** there is no `fcitx5-android/plugins` repo (404). Plugins are **in-tree** under `APP/plugin/` (engines as git submodules); out-of-tree plugins are generated from `fcitx5-android/plugin-scaffold`. All plugin questions were answered against the real layout.
 
 ---
@@ -250,4 +251,120 @@ README confirms GitHub Release/F-Droid share one signing key (`APP/README.md:14-
 
 ---
 
-*Raw scout notes (three agent reports with full citation chains) were consolidated into this document; upstream clones remain in `/tmp/smartkey-android-scout/` for re-verification.*
+## 8. Round-2 Surgical Deep-Dive (Implementation Gates)
+
+> Same clones/pins as round 1 (`APP @ eb5b502`, `CORE @ 1e00551`, `UNIKEY @ ed9170c`, `SCF @ cc9eede`), verified before use. Round-1 findings are cited, not repeated.
+
+### 8.1 Gate 1 — Preedit-to-Commit Atomicity (closes R2, largely closes R3) `[Observed]`
+
+Full trace of an engine commit while client preedit is non-empty (unikey = reference), tap Space on `teǐ`-style composition:
+
+| Step | Code | What happens |
+|---|---|---|
+| 1 | `UNIKEY/src/unikey-im.cpp:620-628` | Space was appended to `preeditStr_` by `syncState`; `preeditStr_.back() == sym && isWordBreakSym(sym)` → `commit()` |
+| 2 | `unikey-im.cpp:736-741` | `ic_->commitString(preeditStr_)` — **word + trailing space in one string**; then `reset()` (`unikey-im.cpp:189-195`) → `updatePreedit()` → `inputPanel.reset()` (`:775`) + `ic_->updatePreedit()` |
+| 3 | `CORE/src/lib/fcitx/inputcontext_p.h:72-76, 96-124` | Both events are delivered **synchronously, in call order**: `CommitStringEvent` → `q->commitStringImpl(...)` (`:101-107`); then `UpdatePreeditEvent` → `q->updatePreeditImpl()` (`:116-120`). `InputContext::updatePreedit` dedupes empty-after-empty via `lastPreeditUpdateIsEmpty_` (`CORE/src/lib/fcitx/inputcontext.cpp:473-487`) |
+| 4 | `APP/.../androidfrontend/androidfrontend.cpp:39-42, 62-64` | `commitStringImpl` → `frontend_->commitString(text, -1)`; `updatePreeditImpl` → `frontend_->updateClientPreedit(...)` — two JNI events, commit first |
+| 5 | `APP/.../input/FcitxInputMethodService.kt:234-236` | `FcitxEvent.CommitStringEvent` → `commitText(text, -1)` (`:423-455`) |
+| 6 | `FcitxInputMethodService.kt:426-445` | composing `"te"` ≠ commit `"tei "` → **`ic.commitText(text, 1)` — the Android platform op removes the composing span and replaces it with the committed text in ONE call** (the code's own comment: "committed text should replace composing (if any)", `:436-437`). When composing == commit text, the fast path instead batch-`finishComposingText`es (`:426-439`) |
+| 7 | `FcitxInputMethodService.kt:306-308, 131-134, 922-942, 950-953`; `APP/.../core/FormattedText.kt:136-142` | Follow-up `ClientPreeditEvent("")` → `updateComposingText`: internal `composingText` was already reset to `FormattedText.Empty` by `resetComposingState()` → `spanEquals` true → **no InputConnection op at all** |
+
+**Net: exactly ONE `InputConnection.commitText` for the whole word+boundary commit.** No `deleteSurroundingText`, no batch-edit dependency, no flicker surface. The engine never has to delete anything because the committed text replaces the composing region atomically.
+
+**Verdict (Q3): YES.** If `smartkey-en` (Option 2) holds the current word in client preedit (like `keyboard-us` already does — `androidkeyboard.cpp:278-291`, and like unikey) and commits `word+boundary` as one `commitString`:
+- **R2 is eliminated** — the unbatched `deleteSurroundingText` + `commitText` pair from round-1 §2.4/§2.6 only exists in the raw-commit design; the preedit-hold design reduces the boundary to a single atomic platform op. Per-keystroke op count is unchanged (1 `setComposingText`/keystroke, batched, `FcitxInputMethodService.kt:925, 971` — vs 1 `commitText`/keystroke today).
+- **R3 is blocked mid-word** — swipe-delete is gated on `preeditState.isEmpty && horizontalCandidate.adapter.total <= 0` and enters a no-op `Reset` state while preedit is active (`APP/.../keyboard/CommonKeyActionListener.kt:136-146`). In-word cursor moves become visible to the engine via the composing-range logic (`FcitxInputMethodService.kt:880-914`) — a real reconcile hook for the shadow buffer.
+
+**Downsides (accepted):**
+- `TYPE_NULL` fields (Termux, some custom views) **strip `CapabilityFlag::Preedit`** (`APP/.../core/CapabilityFlag.kt:108-112`) → `ic->updatePreedit()` no-ops (`CORE/src/lib/fcitx/inputcontext.cpp:475-477`) → no visible composing, but the engine's internal buffer still commits on boundary (this is exactly unikey's behavior in those fields today — graceful degradation, automatic).
+- Composing underline styling on every keystroke (`Underline` format flag, `androidkeyboard.cpp:282-284` precedent); some exotic editors render composing text oddly — same risk unikey already carries for every Vietnamese Android user.
+- `ClientUnfocusCommit` in `DefaultFlags` (`CapabilityFlag.kt:91-95`) auto-commits preedit on focus loss (good: matches SmartKey session reset).
+- The win requires the preedit-hold design; the current Phase-0 raw-commit addon still pays delete+commit (`handleDeleteSurrounding` is a single unbatched op, `FcitxInputMethodService.kt:340-352`).
+
+### 8.2 Gate 2 — What Soft-Keyboard Features Depend on `keyboard-us` `[Observed]`
+
+**Do not exist anywhere upstream** (0 grep hits app-wide, Kotlin + C++): auto-capitalization (`capitalize`, `TYPE_TEXT_FLAG_CAP_*` handling), double-space period, glide typing (round-1 §7.1-R7). Shift is a manual toggle only (`TextKeyboard.kt:28` `CapsState`, no engine involvement). These are net-new work for *any* engine, not things lost by replacing `keyboard-us`.
+
+**Shared by ALL engines** (Kotlin app layer, engine-agnostic — unikey already rides on all of it):
+
+| Feature | Citation |
+|---|---|
+| QWERTY layout, hardcoded single layout for every IM | `TextKeyboard.kt:27-68` |
+| Long-press popup symbols (`AlphabetKey(char, popup)`) | `TextKeyboard.kt:30-58`; `KeyDefPreset.kt:42-62` (round-1 §2.3) |
+| Layout switch `?123` / symbol keyboards | `TextKeyboard.kt:66` (`LayoutSwitchKey`) |
+| Spacebar: fixed `" "` label, emits `FcitxKey_space` | `KeyDefPreset.kt:207-217` |
+| IM switching: `LanguageKey` = globe icon, Press = next IM, LongPress = picker | `KeyDefPreset.kt` (`class LanguageKey`, `LangSwitchAction` / `ShowInputMethodPickerAction`) |
+| Swipe-delete, spacebar cursor-move, backspace repeat, clipboard window | round-1 §2.4 |
+| Candidate toolbar rendering | §8.3 |
+| `EditorInfo` → `CapabilityFlag` mapping | `CapabilityFlag.kt:97-180` (round-1 §2.6) |
+
+**`InputMethodEntry` metadata binds nothing on the keyboard**: `setLabel`/`setIcon` (`androidkeyboard.cpp:165-171`) surface only in the IM list/picker (`SubtypeManager.kt:20` hardcodes `IM_KEYBOARD = "keyboard-us"` only for subtype-sync special-casing). There is **no per-engine layout or spacebar label** — a `smartkey-en` IM gets the identical QWERTY automatically.
+
+**Engine-owned in `androidkeyboard.cpp`** (what a replacement engine must re-provide if it wants the same affordances):
+
+| Behavior | Citation |
+|---|---|
+| Word buffer with internal cursor + Home/End/Left/Right in-buffer nav | `androidkeyboard.cpp:119-151` |
+| Spell-hint candidate list via `ISpell::hintForDisplay` | `:249-276` |
+| `insertSpace` prepend-space option | `:84-88, 242-246` |
+| Commit via `commitStringWithCursor` when capability set | `:320-337` |
+| Digit keys 1-0 select candidates (`selectionKeys_`) | `:77-84, 164-197` |
+| Hint gating: `NoSpellCheck` / `Password` / `hintOnPhysicalKeyboard` / `event.isVirtual()` | `:298-306` |
+
+**Passthrough contract:** any key the engine does *not* filter is committed by the app itself (virtual key → `commitText(unicode)`, `FcitxInputMethodService.kt:243-249`). `keyboard-us` buffers letters/digits/hyphen/apostrophe (`FCITX_HYPHEN_APOS`, `:87-100`) and lets Space/Enter/other punctuation fall through after `commitBuffer` (`:153-160`).
+
+### 8.3 Gate 3 — Candidate Toolbar Integration (`CommonCandidateList`) `[Observed]`
+
+Minimal C++ pattern (verbatim from `androidkeyboard.cpp`, the app's own reference):
+
+1. Subclass `CandidateWord`, override `select(InputContext*)` → `inputContext->commitString(commit_)` + panel reset + engine state reset (`androidkeyboard.cpp:27-34`).
+2. Build `CommonCandidateList`, `append<CustomCandidateWord>(...)`, `setPageSize(...)`, `setSelectionKey(...)`, `setCursorIncludeUnselected(true)`, then `inputPanel().setCandidateList(std::move(l))` (`:249-276`).
+3. Trigger UI: `inputContext->updateUserInterface(UserInterfaceComponent::InputPanel)` (`:291`) (or `InputContextFlushUI` round-1 §2.5).
+4. Native → Kotlin: `FcitxEvent.CandidateListEvent` (`APP/.../core/FcitxEvent.kt:275-276`) → `HorizontalCandidateComponent` renders chips (`APP/.../candidates/horizontal/HorizontalCandidateComponent.kt:170-193`).
+
+**Rendering semantics:** chips are **uniform — no default highlight of chip 0**. All candidates render in `candidateTextColor`, optional `comment` in `candidateCommentColor`, press feedback only (`APP/.../candidates/CandidateItemUi.kt:26-42`). Highlighted/selected state is not conveyed on the horizontal bar.
+
+**Tap threading:** `holder.itemView.setOnClickListener { fcitx.launchOnReady { it.select(holder.idx) } }` (`HorizontalCandidateComponent.kt:95-97`) → `Fcitx.select(idx)` = `withFcitxContext { selectCandidate(idx) }` (`APP/.../core/Fcitx.kt:105, 276`) = `withContext(dispatcher)` (`Fcitx.kt:480-482`) → the fcitx event-dispatcher thread → engine's `candidateList->candidate(idx).select(ic)`. **Yes: tap handling is marshaled onto the same fcitx dispatcher thread.** Digit-key selection bypasses UI entirely (`:77-84`).
+
+**For SmartKey:** candidate chips give a zero-UI-code "did you mean" surface (resolves U2's visible-undo question): chip 0 = keep-as-typed, further chips = corrections; the `comment` field can carry labels. `smartkey-vi` gets unikey-style behavior for free.
+
+### 8.4 Gate 4 — Real Out-of-Tree Native Build Wiring (refines round-1 §6.3)
+
+**Publish truth — one correction + one confirmation** `[Observed]` + `[Empirical]`:
+
+- The publish target is **GitHub Packages**: `https://maven.pkg.github.com/fcitx5-android/fcitx5-android` (`APP/.github/workflows/publish.yml:40-48`; repo config `APP/build-logic/convention/build.gradle.kts:71-81`). `maven.fcitx.workers.dev` (referenced by the scaffold's repositories, `SCF/data/templates/settings.gradle.kts.mustache:3, 14`) is the public mirror plugins actually consume.
+- Published set = `:build-logic:convention`, `:lib:common`, `:lib:plugin-base` only (`publish.yml:40-48`). Live probe: `org.fcitx.fcitx5.android.lib:plugin_base` latest **0.1.3** with snapshot `0.1.3-12-geb5b502` (the exact round-1 pin) `[Empirical]`; `org.fcitx.fcitx5.android.lib:fcitx5` → **404, unpublished** `[Empirical]` — round-1 §6.3 stands.
+- **Scaffold reality:** `SCF @ cc9eede` ships **no native wiring at all** — 6 mustache templates are metadata-only (no `CMakeLists.txt`, no cpp dir). The root fixture already declares all conventions `apply false`, including `native-app-convention`, `native-lib-convention`, `fcitx-headers` (`SCF/data/fixtures/build.gradle.kts:4-14`), so native support is purely additive. It pins `main_version = 0.1.2` while 0.1.3 is published.
+- **Org census** `[Empirical: GH API /orgs/fcitx5-android/repos]`: **no out-of-tree native plugin repo exists** (only `plugin-scaffold` + infra repos). The in-tree unikey wiring is the only proven pattern.
+
+**How `find_package(Fcitx5Core)` resolves in a native plugin** (unikey reference, `[Observed]`):
+
+1. Gradle: plugin app module applies `native-app-convention` + `externalNativeBuild { cmake { targets("unikey") } }` and depends on `implementation(project(":lib:fcitx5"))` (`APP/plugin/unikey/build.gradle.kts:2-16, 50-53`).
+2. `lib/fcitx5` is a prefab AAR built from the fcitx5 submodule + `prebuilt` submodule (`APP/lib/fcitx5/build.gradle.kts:1-8, 28-84`; submodule `fcitx5 @ 1e00551`, `prebuilt @ 3f987c60`). Its CMake package configs come from the **`devel` prefab component**, produced by `FcitxHeadersPlugin` running a CMake install of component `Devel` into `build/devel` and wiring it as a header-only prefab package (`APP/build-logic/.../FcitxHeadersPlugin.kt:29-42, 46-56`; enabled via `fcitxHeaders { installDevelComponent = true }`, `APP/lib/fcitx5/build.gradle.kts:6-8`).
+3. Plugin `CMakeLists.txt`: `find_package(fcitx5 REQUIRED CONFIG)` (prefab) → import cmake modules from `fcitx5::cmake` `INTERFACE_INCLUDE_DIRECTORIES` into `CMAKE_MODULE_PATH` → `find_package(ECM MODULE)`, `find_package(Fcitx5Core MODULE)`, `find_package(Fcitx5Module MODULE)` (`APP/plugin/unikey/src/main/cpp/CMakeLists.txt:9-15`).
+4. `native-lib-convention` = android **library** + `prefabPublishing` (`APP/build-logic/.../NativeLibConventionPlugin.kt:20-33`) — what the vendored `lib/fcitx5` module applies.
+
+**Cleanest repo layout for `plugin-smartkey`** (no org precedent exists; this replicates unikey 1:1 in a standalone repo):
+
+```
+plugin-smartkey/                 # generate from SCF, then set main_version = 0.1.3
+├── settings.gradle.kts          # scaffold template + include(":lib:fcitx5")
+├── build.gradle.kts             # scaffold fixture unchanged
+├── app/
+│   ├── build.gradle.kts         # scaffold template + apply native-app-convention +
+│   │                            #   externalNativeBuild { cmake { targets("smartkey") } } +
+│   │                            #   jniLibs excludes **/libc++_shared.so, **/libFcitx5* +
+│   │                            #   implementation(project(":lib:fcitx5"))
+│   └── src/main/cpp/
+│       ├── CMakeLists.txt       # unikey pattern (§8.4 step 3) + add_subdirectory(smartkey addon)
+│       └── smartkey/            # addon sources; links libsmartkey_ffi.a (cargo-ndk), --exclude-libs,ALL
+└── lib/fcitx5/                  # vendored verbatim from APP @ eb5b502:
+                                 #   build.gradle.kts + src/main/cpp/{CMakeLists.txt, cmake/,
+                                 #   fcitx5 @ 1e00551, prebuilt @ 3f987c60}
+```
+
+Alternative worth filing upstream: a one-line publish addition (`./gradlew :lib:fcitx5:publish` in `publish.yml:41-48`) would let out-of-tree plugins consume `fcitx5` from the version catalog like `plugin_base`/`common` and eliminate the vendored module entirely. `[Inferred: trivial PR; until merged, vendoring is the only self-contained path]`
+
+---
+
+*Raw scout notes (three agent reports with full citation chains) were consolidated into this document; upstream clones remain in `/tmp/smartkey-android-scout/` for re-verification. Round-2 gates (§8) verified 2026-11-16 at identical pins.*
