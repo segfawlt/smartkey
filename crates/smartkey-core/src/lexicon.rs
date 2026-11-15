@@ -206,6 +206,18 @@ pub struct EnglishLexicon {
     lev2: LevenshteinAutomatonBuilder,
 }
 
+struct ParsedSections {
+    wf_range: (usize, usize),
+    tf_range: (usize, usize),
+    tp_range: (usize, usize),
+    uk_to_us: Vec<(Box<str>, Box<str>)>,
+    us_to_uk: Vec<(Box<str>, Box<str>)>,
+    proper_nouns: Vec<(Box<str>, Box<str>)>,
+    bigram_keys: Vec<u32>,
+    bigram_scores: Vec<u8>,
+    smash_entries: Vec<SmashEntry>,
+}
+
 impl EnglishLexicon {
     /// Loads the bundled English `.skdict` dictionary when compiled with `feature = "bundled-en"`.
     #[cfg(feature = "bundled-en")]
@@ -216,15 +228,23 @@ impl EnglishLexicon {
 
     /// Zero-copy load over a `'static` byte slice (`include_bytes!` or `mmap`).
     pub fn from_static_bytes(bytes: &'static [u8]) -> Result<Self, LexiconError> {
-        Self::parse_image(bytes, true)
+        let parsed = Self::parse_sections(bytes)?;
+        let words_cow = Cow::Borrowed(&bytes[parsed.wf_range.0..parsed.wf_range.1]);
+        let typos_cow = Cow::Borrowed(&bytes[parsed.tf_range.0..parsed.tf_range.1]);
+        let pool_cow = Cow::Borrowed(&bytes[parsed.tp_range.0..parsed.tp_range.1]);
+        Self::from_parsed(words_cow, typos_cow, pool_cow, parsed)
     }
 
     /// Loads from an owned byte buffer (e.g. Android asset stream or custom file).
     pub fn from_owned_bytes(bytes: Vec<u8>) -> Result<Self, LexiconError> {
-        Self::parse_image(&bytes, false)
+        let parsed = Self::parse_sections(&bytes)?;
+        let words_cow = Cow::Owned(bytes[parsed.wf_range.0..parsed.wf_range.1].to_vec());
+        let typos_cow = Cow::Owned(bytes[parsed.tf_range.0..parsed.tf_range.1].to_vec());
+        let pool_cow = Cow::Owned(bytes[parsed.tp_range.0..parsed.tp_range.1].to_vec());
+        Self::from_parsed(words_cow, typos_cow, pool_cow, parsed)
     }
 
-    fn parse_image(bytes: &[u8], is_static: bool) -> Result<Self, LexiconError> {
+    fn parse_sections(bytes: &[u8]) -> Result<ParsedSections, LexiconError> {
         let mut cursor = 0usize;
         if bytes.len() < 8 {
             return Err(LexiconError::TruncatedData);
@@ -255,9 +275,9 @@ impl EnglishLexicon {
             Ok((start, start + len))
         };
 
-        let (wf_start, wf_end) = read_slice(bytes, &mut cursor)?;
-        let (tf_start, tf_end) = read_slice(bytes, &mut cursor)?;
-        let (tp_start, tp_end) = read_slice(bytes, &mut cursor)?;
+        let wf_range = read_slice(bytes, &mut cursor)?;
+        let tf_range = read_slice(bytes, &mut cursor)?;
+        let tp_range = read_slice(bytes, &mut cursor)?;
 
         // UK -> US pairs
         let uk_count = read_u32(bytes, &mut cursor)? as usize;
@@ -340,33 +360,35 @@ impl EnglishLexicon {
             proper_nouns.dedup_by(|a, b| a.0 == b.0);
         }
 
-        let (words_cow, typos_cow, pool_cow) = if is_static {
-            // Safe static subslice reconstruction via pointer math unneeded if called from `from_static_bytes`;
-            // instead, pass Owned for `from_owned_bytes` and Borrowed via helper in `from_static_bytes_inner`.
-            (
-                Cow::Owned(bytes[wf_start..wf_end].to_vec()),
-                Cow::Owned(bytes[tf_start..tf_end].to_vec()),
-                Cow::Owned(bytes[tp_start..tp_end].to_vec()),
-            )
-        } else {
-            (
-                Cow::Owned(bytes[wf_start..wf_end].to_vec()),
-                Cow::Owned(bytes[tf_start..tf_end].to_vec()),
-                Cow::Owned(bytes[tp_start..tp_end].to_vec()),
-            )
-        };
-        let _ = is_static;
-
-        Ok(Self {
-            words_fst: Map::new(words_cow)?,
-            typos_fst: Map::new(typos_cow)?,
-            typo_pool: pool_cow,
+        Ok(ParsedSections {
+            wf_range,
+            tf_range,
+            tp_range,
             uk_to_us,
             us_to_uk,
             proper_nouns,
             bigram_keys,
             bigram_scores,
             smash_entries,
+        })
+    }
+
+    fn from_parsed(
+        words_cow: Cow<'static, [u8]>,
+        typos_cow: Cow<'static, [u8]>,
+        typo_pool: Cow<'static, [u8]>,
+        parsed: ParsedSections,
+    ) -> Result<Self, LexiconError> {
+        Ok(Self {
+            words_fst: Map::new(words_cow)?,
+            typos_fst: Map::new(typos_cow)?,
+            typo_pool,
+            uk_to_us: parsed.uk_to_us,
+            us_to_uk: parsed.us_to_uk,
+            proper_nouns: parsed.proper_nouns,
+            bigram_keys: parsed.bigram_keys,
+            bigram_scores: parsed.bigram_scores,
+            smash_entries: parsed.smash_entries,
             lev1: LevenshteinAutomatonBuilder::new(1, true),
             lev2: LevenshteinAutomatonBuilder::new(2, true),
         })
@@ -1199,5 +1221,16 @@ dictionary=main:en_us,locale=en_US
             "gap < {PROPER_NOUN_MIN_CASE_GAP}: {:?}",
             lint.errors
         );
+    }
+
+    #[cfg(feature = "bundled-en")]
+    #[test]
+    fn from_static_bytes_borrows_fst_and_typo_pool_without_copy() {
+        use std::borrow::Cow;
+        let lex = super::EnglishLexicon::from_bundled().expect("bundled lexicon loads");
+        assert!(matches!(lex.typo_pool, Cow::Borrowed(_)));
+        assert!(matches!(lex.words_fst.as_fst().as_bytes(), b if !b.is_empty()));
+        assert!(lex.lookup_word("the").is_some());
+        assert!(lex.lookup_known_typos("teh").is_some());
     }
 }

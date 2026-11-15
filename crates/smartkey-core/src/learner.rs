@@ -287,7 +287,9 @@ pub fn record_undo_keep_verbatim(
 
 /// Row 1 & Row 3: Resolves an `EditingRestored` word after an autocorrect undo (`1x BackSpace`).
 /// - If `final == rejected`: `Self-Confirm Cancel` (proves BackSpace was an accident!).
-/// - If `final == raw_typed`: delegates to `record_undo_keep_verbatim` (`1x` session shield, `2x` permanent).
+/// - If `final == raw_typed`: delegates to `record_undo_keep_verbatim` (`1x` immediate permanent
+///   blocklist for non-curated pairs + session shield, staging curated/case-only pairs at `2x`;
+///   promotes `raw_typed` to `personal_dict` at `2x`).
 /// - If `final` is a 3rd word (`fomr -> foam -> BS -> form`): `1x` immediate permanent `blocklist(fomr, foam)`
 ///   (curated contraction pairs stage at `2x` instead, see `reject_pair_permanently`)
 ///   plus routes `(fomr -> form)` through the `2x` guarded manual-edit learner.
@@ -484,8 +486,7 @@ fn record_manual_edit_inner(
                 });
             let is_stretch = !store.is_personal_word(&fixed_lower)
                 && is_expressive_stretch(&fixed_lower, |w| {
-                    store.is_personal_word(w)
-                        || lexicon.is_some_and(|l| l.contains_any_english(w))
+                    store.is_personal_word(w) || lexicon.is_some_and(|l| l.contains_any_english(w))
                 });
             if !is_stretch
                 && (has_internal_upper || is_tech_word || is_blocked_proper || is_non_lex_word)

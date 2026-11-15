@@ -973,11 +973,16 @@ impl EnglishScorer {
                     }
                 };
                 let mapped = self.lexicon.map_dialect(raw_t, config.dialect);
-                let freq = self
-                    .lexicon
-                    .lookup_word(mapped)
-                    .map(|m| m.effective_freq(config.dialect))
-                    .unwrap_or(145);
+                let Some(meta) = self.lexicon.lookup_word(mapped) else {
+                    continue;
+                };
+                if meta.is_offensive() || !meta.is_valid_for_dialect(config.dialect) {
+                    continue;
+                }
+                let freq = meta.effective_freq(config.dialect);
+                if freq == 0 {
+                    continue;
+                }
                 push_candidate(
                     &mut pool,
                     mapped,

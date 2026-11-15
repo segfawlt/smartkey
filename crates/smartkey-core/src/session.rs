@@ -108,6 +108,18 @@ impl SmartKeyEngine {
             return true;
         }
 
+        // Safe sentence-start TitleCase passthrough for English words whose Telex-composed
+        // lowercase forms (`ò`, `ì`, `ỏ`) are not standalone Vietnamese sentence starters.
+        // (`As` -> `Á`, `Is` -> `Í`, `Was` -> `Ứa`, `Has` -> `Há`, `His` -> `Hí` stay
+        // Vietnamese at sentence start because those are real Vietnamese sentence starters.)
+        if ctx.prev_word.is_none()
+            && ctx.at_sentence_start
+            && matches!(token, "If" | "Of" | "Or")
+            && !self.store.is_lang_only_personal_word("vi", &lower)
+        {
+            return true;
+        }
+
         // English-Sentence Momentum Shield: when the immediately preceding word was an unambiguous
         // English word (not in `vietnamese.cm.dict` or `slang_vi`), keep common short English words
         // (`of -> ò`, `is -> í`, `as -> á`, `or -> ỏ`, `if -> ì`, `was -> ứa`, `has -> há`, `for -> fỏ`)
@@ -680,9 +692,9 @@ impl SmartKeySession {
     }
 
     /// Reconciles the shadow buffer when the client notifies `InputContextSurroundingTextUpdated`
-    /// (e.g. user clicked the mouse elsewhere mid-word without pressing a cursor-movement key).
-    /// Ignores updates within `80 ms` of a keystroke or matching a prefix of `buf` so async
-    /// Wayland/GTK toolkit key-echo lag never resets active typing.
+    /// (e.g. user clicked the mouse elsewhere mid-word or post-correction without pressing a
+    /// cursor-movement key). Ignores updates within `80 ms` (or `400 ms` during active `vi` Lotus
+    /// uinput bursts) of a keystroke so async Wayland/GTK key-echo lag never resets active typing.
     pub fn reconcile_surrounding(
         &mut self,
         engine: &mut SmartKeyEngine,
@@ -690,35 +702,87 @@ impl SmartKeySession {
         cursor_chars: usize,
         now_ms: u64,
     ) {
-        if self.lang.as_str() != "en" || now_ms.saturating_sub(self.last_key_ms) <= 80 {
+        let echo_guard_ms = if self.lang.as_str() == "vi" && self.lotus_composing {
+            400
+        } else {
+            80
+        };
+        if now_ms.saturating_sub(self.last_key_ms) <= echo_guard_ms {
             return;
         }
+
+        let mut total = 0usize;
+        let mut byte_end = surrounding_text.len();
+        for (b_idx, _) in surrounding_text.char_indices() {
+            if total == cursor_chars {
+                byte_end = b_idx;
+                break;
+            }
+            total += 1;
+        }
+        if total < cursor_chars {
+            return;
+        }
+        let before = &surrounding_text[..byte_end];
+
+        fn ends_with_or_window_suffix(before: &str, expected: &str) -> bool {
+            if expected.is_empty() {
+                return true;
+            }
+            if before.is_empty() {
+                return false;
+            }
+            before.ends_with(expected)
+                || (before.len() < expected.len() && expected.ends_with(before))
+        }
+
+        fn tail_token_matches(tail_token: &str, buf: &str) -> bool {
+            let t = tail_token.to_lowercase();
+            let b = buf.to_lowercase();
+            t == b || (!t.is_empty() && b.starts_with(&t))
+        }
+
         let should_reset = match &self.mode {
-            Mode::Composing { buf, .. } if !buf.is_empty() => {
-                let mut total = 0usize;
-                let mut byte_end = surrounding_text.len();
-                for (b_idx, _) in surrounding_text.char_indices() {
-                    if total == cursor_chars {
-                        byte_end = b_idx;
-                        break;
-                    }
-                    total += 1;
-                }
-                if total < cursor_chars {
-                    false
+            Mode::JustAutocorrected {
+                applied,
+                trailing_boundaries,
+                ..
+            } => {
+                let expected = format!("{applied}{trailing_boundaries}");
+                !ends_with_or_window_suffix(before, &expected)
+            }
+            Mode::AfterWord {
+                word,
+                trailing_spaces,
+                ..
+            } if !(self.lang.as_str() == "vi" && self.lotus_composing) => {
+                let expected = format!("{word}{}", " ".repeat(*trailing_spaces));
+                !ends_with_or_window_suffix(before, &expected)
+            }
+            Mode::Composing { buf, .. }
+            | Mode::EditingRestored { buf, .. }
+            | Mode::EditingPrevious { buf, .. }
+                if !buf.is_empty() =>
+            {
+                let tail_token = before
+                    .rsplit(|c: char| {
+                        Self::is_immediate_boundary(c)
+                            || Self::is_opening_delimiter_when_idle(c)
+                            || c == '\n'
+                            || c == '\r'
+                    })
+                    .next()
+                    .unwrap_or("");
+                if self.lang.as_str() == "vi" && self.lotus_composing {
+                    let preedit = crate::vi_telex::simulate_lotus_word_with_options(
+                        buf,
+                        engine.store.lotus_options(),
+                    )
+                    .preedit_before_break;
+                    !tail_token_matches(tail_token, buf)
+                        && !tail_token_matches(tail_token, &preedit)
                 } else {
-                    let before = &surrounding_text[..byte_end];
-                    let tail_token = before
-                        .rsplit(|c: char| {
-                            Self::is_immediate_boundary(c)
-                                || Self::is_opening_delimiter_when_idle(c)
-                                || c == '\n'
-                                || c == '\r'
-                        })
-                        .next()
-                        .unwrap_or("");
-                    !tail_token.eq_ignore_ascii_case(buf)
-                        && (tail_token.is_empty() || !buf.starts_with(tail_token))
+                    !tail_token_matches(tail_token, buf)
                 }
             }
             _ => false,
@@ -2013,7 +2077,9 @@ impl SmartKeySession {
                         .trim_matches(|c: char| !c.is_alphabetic() && c != '\'' && c != '’')
                         .to_lowercase();
                     if !core_lower.is_empty() {
-                        engine.store.record_personal_word_use(&self.lang, &core_lower);
+                        engine
+                            .store
+                            .record_personal_word_use(&self.lang, &core_lower);
                     }
                 }
 

@@ -187,3 +187,130 @@ fn shorthand_toggle_and_slang_zero_fuzzy_pollution() {
         );
     }
 }
+
+#[test]
+fn step5a_curated_typos_enforce_metadata_and_dialects_stay_green() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let scorer = EnglishScorer::new_bundled().expect("bundled English lexicon must load");
+
+    // Verify `must_not_touch.txt` and `must_fix.tsv` remain 100% intact across `EnUs` and `EnGb`
+    // (allowing the intentional cross-dialect spelling normalizations in each strict dialect).
+    let must_not =
+        fs::read_to_string(root.join("tests/corpus/must_not_touch.txt")).expect("must_not_touch");
+    let must_fix = fs::read_to_string(root.join("tests/corpus/must_fix.tsv")).expect("must_fix");
+
+    for dialect in [Dialect::Mixed, Dialect::EnUs, Dialect::EnGb] {
+        let cfg = ScorerConfig {
+            dialect,
+            ..ScorerConfig::default()
+        };
+        for (idx, line) in must_not.lines().enumerate() {
+            let tok = line.trim();
+            if tok.is_empty() || tok.starts_with('#') {
+                continue;
+            }
+            if dialect == Dialect::EnUs
+                && matches!(tok, "colour" | "behaviour" | "realise" | "centre")
+            {
+                continue;
+            }
+            if dialect == Dialect::EnGb
+                && matches!(tok, "color" | "behavior" | "realize" | "center")
+            {
+                continue;
+            }
+            let outcome = scorer.evaluate(tok, &EvalContext::default(), &cfg, &EmptyUserRules);
+            assert!(
+                matches!(outcome, EvalOutcome::Unchanged { .. }),
+                "line {}: {tok:?} unexpectedly changed in {dialect:?}: {outcome:?}",
+                idx + 1
+            );
+        }
+
+        for (idx, line) in must_fix.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let cols: Vec<&str> = trimmed.split('\t').collect();
+            let prev_col = cols[0].trim();
+            let typed = cols[1].trim();
+            let punct_col = cols[2].trim();
+            let expected = if dialect == Dialect::EnGb && typed == "beahviour" {
+                "behaviour"
+            } else {
+                cols[3].trim()
+            };
+            let ctx = EvalContext {
+                prev_word: if prev_col == "-" || prev_col == "^" {
+                    None
+                } else {
+                    Some(prev_col)
+                },
+                boundary_punct: if punct_col == "-" {
+                    None
+                } else {
+                    punct_col.chars().next()
+                },
+                at_sentence_start: prev_col == "^",
+                ..EvalContext::default()
+            };
+            let outcome = scorer.evaluate(typed, &ctx, &cfg, &EmptyUserRules);
+            let actual = match &outcome {
+                EvalOutcome::Autocorrect { replacement, .. } => replacement.as_str(),
+                EvalOutcome::Unchanged { .. } => typed,
+            };
+            assert_eq!(
+                actual,
+                expected,
+                "line {}: mismatch in {dialect:?} for {typed:?}",
+                idx + 1
+            );
+        }
+    }
+
+    // Synthetic lexicon proving Step 5a skips offensive, zero-freq slang, wrong-dialect, and missing words:
+    let bytes = smartkey_core::compile_skdict_from_sources(
+        " word=cleanword,f=180\n word=badword,f=180,possibly_offensive=true\n",
+        " word=brituk,f=210\n",
+        "",
+        "slangzero\n",
+        "",
+        "clenaword,cleanword\nbadwrod,badword\nbirktu,brituk\nslngzero,slangzero\nmisswrod,nonexistentword\n",
+        "{}",
+        "",
+    );
+    let lex = smartkey_core::EnglishLexicon::from_owned_bytes(bytes).unwrap();
+    let syn_scorer = EnglishScorer::new(lex);
+    let us_cfg = ScorerConfig {
+        dialect: Dialect::EnUs,
+        ..ScorerConfig::default()
+    };
+    let gb_cfg = ScorerConfig {
+        dialect: Dialect::EnGb,
+        ..ScorerConfig::default()
+    };
+
+    assert!(matches!(
+        syn_scorer.evaluate("clenaword", &EvalContext::default(), &us_cfg, &EmptyUserRules),
+        EvalOutcome::Autocorrect { replacement, .. } if replacement == "cleanword"
+    ));
+    // `birktu -> brituk` (len 6, DL 3: reachable only via Step 5a) fires in EnGb, skipped in EnUs:
+    assert!(matches!(
+        syn_scorer.evaluate("birktu", &EvalContext::default(), &gb_cfg, &EmptyUserRules),
+        EvalOutcome::Autocorrect { replacement, .. } if replacement == "brituk"
+    ));
+    for blocked in ["badwrod", "birktu", "slngzero", "misswrod"] {
+        assert!(
+            matches!(
+                syn_scorer.evaluate(blocked, &EvalContext::default(), &us_cfg, &EmptyUserRules),
+                EvalOutcome::Unchanged { .. }
+            ),
+            "Step 5a must never propose {blocked:?} under EnUs"
+        );
+    }
+}

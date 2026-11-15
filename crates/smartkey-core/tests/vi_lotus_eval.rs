@@ -425,3 +425,47 @@ fn test_vi_lotus_uinput_restore_class_rescue_and_unknown_learning() {
         .untouched_unknowns
         .contains_key("feeel"));
 }
+
+#[test]
+fn test_vi_lotus_sentence_start_english_passthrough_and_surrounding_undo_guard() {
+    let (mut engine, mut session) = make_vi_engine_and_session();
+
+    // 1. Safe sentence-start TitleCase passthrough (`If`, `Of`, `Or`), including 1x BackSpace
+    //    revert back to Lotus's Vietnamese rune (`Ò`):
+    let (if_buf, _) = type_sequence(&mut session, &mut engine, "If ");
+    assert_eq!(if_buf, "If ");
+
+    let _ = session.reset(&mut engine);
+    let (mut of_buf, _) = type_sequence(&mut session, &mut engine, "Of ");
+    assert_eq!(of_buf, "Of ");
+    let bs = session.process_key(&mut engine, KeyInput::BackSpace, 2_500);
+    apply_key_to_buffer(&mut of_buf, KeyInput::BackSpace, &bs.action);
+    assert_eq!(of_buf, "Ò");
+
+    let _ = session.reset(&mut engine);
+    let (or_buf, _) = type_sequence(&mut session, &mut engine, "Or ");
+    assert_eq!(or_buf, "Or ");
+
+    // 2. Sentence-initial real Vietnamese starters (`Á`, `Í`, `Há`) remain shielded Vietnamese:
+    for (keys, expected) in [
+        ("As haauj ", "Á hậu "),
+        ("Is thooi ", "Í thôi "),
+        ("Has mieengj ", "Há miệng "),
+    ] {
+        let _ = session.reset(&mut engine);
+        let (vi_buf, _) = type_sequence(&mut session, &mut engine, keys);
+        assert_eq!(vi_buf, expected);
+    }
+
+    // 3. Displaced-cursor `reconcile_surrounding` in `vi` mode (> 400 ms echo guard) resets
+    //    `JustAutocorrected` so clicking away cancels the `1x BackSpace` undo:
+    let _ = session.reset(&mut engine);
+    let (rescued_buf, _) = type_sequence(&mut session, &mut engine, "ttieengs ");
+    assert_eq!(rescued_buf, "tiếng ");
+    // Within 400ms echo guard -> ignored:
+    session.reconcile_surrounding(&mut engine, "elsewhere", 4, 1_500);
+    // Past 400ms echo guard at displaced cursor -> resets JustAutocorrected:
+    session.reconcile_surrounding(&mut engine, "elsewhere", 4, 2_000);
+    let bs_after_click = session.process_key(&mut engine, KeyInput::BackSpace, 2_050);
+    assert_eq!(bs_after_click.action, SessionAction::PassThrough);
+}

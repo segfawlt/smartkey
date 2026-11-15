@@ -1670,7 +1670,12 @@ fn f1_novel_oov_1x_session_shield_and_2x_fast_track_preserves_canonical_case() {
 
     let mut next_session = SmartKeySession::new();
     let mut next_buf = String::new();
-    feed_keys(&mut next_session, &mut engine, &mut next_buf, "hello domixi ");
+    feed_keys(
+        &mut next_session,
+        &mut engine,
+        &mut next_buf,
+        "hello domixi ",
+    );
     assert_eq!(next_buf, "hello Domixi ");
 }
 
@@ -1818,4 +1823,50 @@ fn f3_personal_word_usage_boosts_typo_rescue_tiebreak_after_reset() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reconcile_surrounding_guards_displaced_cursor_undo() {
+    let mut engine = SmartKeyEngine::in_memory_default().expect("bundled engine");
+
+    // 1. Staying at the corrected word boundary keeps 1x BackSpace undo alive:
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+    for (i, ch) in "teh ".chars().enumerate() {
+        let out = session.process_key(&mut engine, KeyInput::Char(ch), 1_000 + (i as u64) * 20);
+        apply_key_to_buffer(&mut buf, KeyInput::Char(ch), &out.action);
+    }
+    assert_eq!(buf, "the ");
+    session.reconcile_surrounding(&mut engine, "hello the ", 10, 1_300);
+    let bs = session.process_key(&mut engine, KeyInput::BackSpace, 1_320);
+    assert!(
+        matches!(bs.action, SessionAction::Replace { ref insert, .. } if insert == "teh"),
+        "expected undo Replace when cursor stayed after 'the ', got {:?}",
+        bs.action
+    );
+
+    // 2. Clicking elsewhere before pressing BackSpace resets JustAutocorrected so BackSpace
+    //    passes through normally instead of deleting/inserting 'teh' at the displaced cursor:
+    let mut session2 = SmartKeySession::new();
+    let mut buf2 = String::new();
+    for (i, ch) in "teh ".chars().enumerate() {
+        let out = session2.process_key(&mut engine, KeyInput::Char(ch), 2_000 + (i as u64) * 20);
+        apply_key_to_buffer(&mut buf2, KeyInput::Char(ch), &out.action);
+    }
+    assert_eq!(buf2, "the ");
+    session2.reconcile_surrounding(&mut engine, "other text", 5, 2_300);
+    let bs2 = session2.process_key(&mut engine, KeyInput::BackSpace, 2_320);
+    assert_eq!(bs2.action, SessionAction::PassThrough);
+
+    // 3. Moving cursor to index 0 also clears JustAutocorrected:
+    let mut session3 = SmartKeySession::new();
+    let mut buf3 = String::new();
+    for (i, ch) in "teh ".chars().enumerate() {
+        let out = session3.process_key(&mut engine, KeyInput::Char(ch), 3_000 + (i as u64) * 20);
+        apply_key_to_buffer(&mut buf3, KeyInput::Char(ch), &out.action);
+    }
+    assert_eq!(buf3, "the ");
+    session3.reconcile_surrounding(&mut engine, "the ", 0, 3_300);
+    let bs3 = session3.process_key(&mut engine, KeyInput::BackSpace, 3_320);
+    assert_eq!(bs3.action, SessionAction::PassThrough);
 }
