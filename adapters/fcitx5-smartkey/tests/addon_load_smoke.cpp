@@ -45,6 +45,8 @@ void verifyProfileClassification() {
     // Wayland reverse-DNS & Flatpak code editors / IDEs -> BYPASS
     assert(classifyProgramName("dev.zed.Zed") == SMARTKEY_PROFILE_BYPASS);
     assert(classifyProgramName("com.visualstudio.code") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("zcode") == SMARTKEY_PROFILE_BYPASS);
+    assert(classifyProgramName("/usr/bin/zcode") == SMARTKEY_PROFILE_BYPASS);
     assert(classifyProgramName("com.vscodium.codium") == SMARTKEY_PROFILE_BYPASS);
     assert(classifyProgramName("com.sublimetext.three") == SMARTKEY_PROFILE_BYPASS);
     assert(classifyProgramName("com.jetbrains.rustrover") == SMARTKEY_PROFILE_BYPASS);

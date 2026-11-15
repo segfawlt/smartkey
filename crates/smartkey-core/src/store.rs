@@ -388,6 +388,205 @@ impl LearnerState {
     }
 }
 
+/// Normalizes an application / compositor program ID (`app_id`, `WM_CLASS`, or executable path)
+/// by stripping any leading path prefix, trimming whitespace, and ASCII-lowercasing.
+pub fn normalize_program_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let base = trimmed
+        .rsplit_once('/')
+        .map(|(_, tail)| tail)
+        .unwrap_or(trimmed);
+    base.to_ascii_lowercase()
+}
+
+fn matches_exact_or_app_segment(prog: &str, names: &[&str]) -> bool {
+    if names.contains(&prog) {
+        return true;
+    }
+    if prog.contains('.') {
+        for seg in prog.split('.').skip(1) {
+            if seg.len() >= 3 && names.contains(&seg) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn matches_set_or_app_segment(prog: &str, set: &BTreeSet<String>) -> bool {
+    if set.contains(prog) {
+        return true;
+    }
+    if prog.contains('.') {
+        for seg in prog.split('.').skip(1) {
+            if seg.len() >= 3 && set.contains(seg) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn matches_any_substring(prog: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| prog.contains(needle))
+}
+
+/// Classifies a program ID using SmartKey's built-in desktop app table (shared with Fcitx5 C++).
+/// Returns `(AppProfile, reason)` where `reason` is `"program-list"`, `"browser"`, `"chat"`, or `"prose"`.
+pub fn classify_builtin_program(raw_program: &str) -> (AppProfile, &'static str) {
+    let prog = normalize_program_id(raw_program);
+    if prog.is_empty() {
+        return (AppProfile::Prose, "prose");
+    }
+
+    const BYPASS_EXACT: &[&str] = &[
+        "alacritty",
+        "kitty",
+        "foot",
+        "footclient",
+        "ghostty",
+        "wezterm",
+        "wezterm-gui",
+        "konsole",
+        "gnome-terminal",
+        "gnome-terminal-server",
+        "kgx",
+        "org.gnome.console",
+        "ptyxis",
+        "blackbox",
+        "xterm",
+        "urxvt",
+        "st",
+        "tilix",
+        "terminator",
+        "xfce4-terminal",
+        "yakuake",
+        "warp",
+        "tabby",
+        "rio",
+        "code",
+        "code-oss",
+        "codium",
+        "vscodium",
+        "cursor",
+        "windsurf",
+        "zcode",
+        "zed",
+        "zed-editor",
+        "nvim",
+        "nvim-qt",
+        "neovide",
+        "vim",
+        "gvim",
+        "emacs",
+        "helix",
+        "sublime_text",
+        "sublimetext",
+        "subl",
+        "idea",
+        "clion",
+        "pycharm",
+        "rustrover",
+        "goland",
+        "webstorm",
+        "datagrip",
+        "phpstorm",
+        "rider",
+        "rubymine",
+        "aqua",
+        "fleet",
+        "mps",
+        "android-studio",
+        "androidstudio",
+        "rstudio",
+        "qtcreator",
+        "geany",
+        "lapce",
+        "lite-xl",
+        "kakoune",
+        "micro",
+    ];
+    const BYPASS_SUBSTR: &[&str] = &["terminal", "jetbrains-", "jetbrains.", "androidstudio"];
+
+    if matches_exact_or_app_segment(&prog, BYPASS_EXACT)
+        || matches_any_substring(&prog, BYPASS_SUBSTR)
+    {
+        return (AppProfile::Bypass, "program-list");
+    }
+
+    const BROWSER_EXACT: &[&str] = &[
+        "firefox",
+        "firefox-developer-edition",
+        "librewolf",
+        "waterfox",
+        "zen",
+        "zen-bin",
+        "zen_browser",
+        "chromium",
+        "chrome",
+        "google-chrome",
+        "google-chrome-stable",
+        "brave",
+        "brave-browser",
+        "vivaldi",
+        "vivaldi-stable",
+        "epiphany",
+        "microsoft-edge",
+        "msedge",
+        "edge",
+        "opera",
+        "arc",
+        "thorium",
+        "floorp",
+        "mullvad-browser",
+        "ungoogled-chromium",
+        "falkon",
+        "qutebrowser",
+    ];
+    const BROWSER_SUBSTR: &[&str] = &["firefox", "chromium", "chrome", "msedge"];
+
+    if matches_exact_or_app_segment(&prog, BROWSER_EXACT)
+        || matches_any_substring(&prog, BROWSER_SUBSTR)
+    {
+        return (AppProfile::Browser, "browser");
+    }
+
+    const CHAT_EXACT: &[&str] = &[
+        "discord",
+        "vesktop",
+        "legcord",
+        "webcord",
+        "telegram",
+        "telegram-desktop",
+        "org.telegram.desktop",
+        "slack",
+        "signal",
+        "signal-desktop",
+        "element",
+        "element-desktop",
+        "riot",
+        "fractal",
+        "caprine",
+    ];
+    const CHAT_SUBSTR: &[&str] = &["discord", "telegram", "slack", "signal"];
+
+    if matches_exact_or_app_segment(&prog, CHAT_EXACT) || matches_any_substring(&prog, CHAT_SUBSTR)
+    {
+        return (AppProfile::Chat, "chat");
+    }
+
+    (AppProfile::Prose, "prose")
+}
+
+fn app_profile_key(profile: AppProfile) -> &'static str {
+    match profile {
+        AppProfile::Bypass => "bypass",
+        AppProfile::Browser => "browser",
+        AppProfile::Chat => "chat",
+        AppProfile::Prose => "prose",
+    }
+}
+
 /// Optional user overrides in `[app_profiles]` (`rules.toml`) for custom Flatpak/Wayland app IDs
 /// and compositors that omit foreign-toplevel metadata (`unknown_app_policy = "prose" | "bypass"`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -400,38 +599,82 @@ pub struct AppProfileConfig {
 }
 
 impl AppProfileConfig {
-    fn matches_set(prog: &str, set: &BTreeSet<String>) -> bool {
-        if set.contains(prog) {
-            return true;
+    fn bucket(&self, profile: AppProfile) -> &BTreeSet<String> {
+        match profile {
+            AppProfile::Bypass => &self.bypass,
+            AppProfile::Browser => &self.browser,
+            AppProfile::Chat => &self.chat,
+            AppProfile::Prose => &self.prose,
         }
-        if prog.contains('.') {
-            for seg in prog.split('.').skip(1) {
-                if seg.len() >= 3 && set.contains(seg) {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
-    pub fn classify_override(&self, normalized_app: &str) -> Option<AppProfile> {
-        let app = normalized_app.trim().to_ascii_lowercase();
-        if app.is_empty() {
-            return self.unknown_app_policy;
+    fn bucket_mut(&mut self, profile: AppProfile) -> &mut BTreeSet<String> {
+        match profile {
+            AppProfile::Bypass => &mut self.bypass,
+            AppProfile::Browser => &mut self.browser,
+            AppProfile::Chat => &mut self.chat,
+            AppProfile::Prose => &mut self.prose,
         }
-        if Self::matches_set(&app, &self.bypass) {
+    }
+
+    /// Resolves only explicit user overrides in `[app_profiles]` (`bypass`/`browser`/`chat`/`prose`).
+    pub fn classify_explicit_override(&self, raw_program: &str) -> Option<AppProfile> {
+        let app = normalize_program_id(raw_program);
+        if app.is_empty() {
+            return None;
+        }
+        if matches_set_or_app_segment(&app, &self.bypass) {
             return Some(AppProfile::Bypass);
         }
-        if Self::matches_set(&app, &self.browser) {
+        if matches_set_or_app_segment(&app, &self.browser) {
             return Some(AppProfile::Browser);
         }
-        if Self::matches_set(&app, &self.chat) {
+        if matches_set_or_app_segment(&app, &self.chat) {
             return Some(AppProfile::Chat);
         }
-        if Self::matches_set(&app, &self.prose) {
+        if matches_set_or_app_segment(&app, &self.prose) {
             return Some(AppProfile::Prose);
         }
         None
+    }
+
+    /// Resolves user overrides in `[app_profiles]`, applying `unknown_app_policy` both when
+    /// `raw_program` is empty and when a named program is unlisted by overrides and built-ins.
+    pub fn classify_override(&self, normalized_app: &str) -> Option<AppProfile> {
+        let app = normalize_program_id(normalized_app);
+        if app.is_empty() {
+            return self.unknown_app_policy;
+        }
+        if let Some(prof) = self.classify_explicit_override(&app) {
+            return Some(prof);
+        }
+        if classify_builtin_program(&app).1 == "prose" {
+            return self.unknown_app_policy;
+        }
+        None
+    }
+
+    /// Unified desktop app classifier: checks `[app_profiles]` overrides first, then built-in
+    /// lists, applying `unknown_app_policy` when `raw_program` is empty or unlisted.
+    pub fn classify_app(&self, raw_program: &str) -> (AppProfile, &'static str) {
+        let app = normalize_program_id(raw_program);
+        if app.is_empty() {
+            return self
+                .unknown_app_policy
+                .map_or((AppProfile::Prose, "prose"), |policy| {
+                    (policy, "unknown-app-policy")
+                });
+        }
+        if let Some(prof) = self.classify_explicit_override(&app) {
+            return (prof, "user-app-override");
+        }
+        let builtin = classify_builtin_program(&app);
+        if builtin.1 == "prose" {
+            if let Some(policy) = self.unknown_app_policy {
+                return (policy, "unknown-app-policy");
+            }
+        }
+        builtin
     }
 }
 
@@ -1208,10 +1451,9 @@ impl RuleStore {
         if self.pending_personal_hits.is_empty() {
             return;
         }
-        let drained: Vec<(String, (u32, u64))> =
-            std::mem::take(&mut self.pending_personal_hits)
-                .into_iter()
-                .collect();
+        let drained: Vec<(String, (u32, u64))> = std::mem::take(&mut self.pending_personal_hits)
+            .into_iter()
+            .collect();
         for (key, (delta, ts)) in drained {
             if delta == 0 || !self.is_stat_word_active(&key) {
                 continue;
@@ -1227,11 +1469,7 @@ impl RuleStore {
                     hits: 0,
                 });
             entry.hits = entry.hits.saturating_add(delta);
-            entry.last_hit_epoch_ms = Some(
-                entry
-                    .last_hit_epoch_ms
-                    .map_or(ts, |prev| prev.max(ts)),
-            );
+            entry.last_hit_epoch_ms = Some(entry.last_hit_epoch_ms.map_or(ts, |prev| prev.max(ts)));
         }
     }
 
@@ -1383,7 +1621,10 @@ impl RuleStore {
             .get(key)
             .map(|(d, _)| *d)
             .unwrap_or(0);
-        let effective_hits = stat.map(|s| s.hits).unwrap_or(0).saturating_add(pending_delta);
+        let effective_hits = stat
+            .map(|s| s.hits)
+            .unwrap_or(0)
+            .saturating_add(pending_delta);
 
         let strikes = if let Some(rest) = key.strip_prefix("word:") {
             if let Some((lang, w)) = rest.split_once(':') {
@@ -2839,6 +3080,173 @@ impl RuleStore {
         Ok(removed)
     }
 
+    fn remove_app_from_doc_bucket(
+        apps_tbl: &mut Table,
+        profile: AppProfile,
+        app_norm: &str,
+    ) -> bool {
+        let key = app_profile_key(profile);
+        let Some(arr) = apps_tbl.get_mut(key).and_then(Item::as_array_mut) else {
+            return false;
+        };
+        let before = arr.len();
+        arr.retain(|v| {
+            !v.as_str()
+                .is_some_and(|s| normalize_program_id(s) == app_norm)
+        });
+        arr.len() != before
+    }
+
+    /// Adds a program ID override to `[app_profiles].<profile>` in `rules.toml`, removing it
+    /// from any competing profile bucket first. Returns `Ok(true)` if `rules.toml` changed.
+    pub fn add_app_profile_override(
+        &mut self,
+        profile: AppProfile,
+        raw_app: &str,
+    ) -> io::Result<bool> {
+        let app_norm = normalize_program_id(raw_app);
+        if app_norm.is_empty() || app_norm.chars().any(char::is_whitespace) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "program id must be a non-empty single token",
+            ));
+        }
+
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+
+        const ALL_PROFILES: [AppProfile; 4] = [
+            AppProfile::Bypass,
+            AppProfile::Browser,
+            AppProfile::Chat,
+            AppProfile::Prose,
+        ];
+        let in_target = self
+            .compiled
+            .app_profiles
+            .bucket(profile)
+            .contains(&app_norm);
+        let in_other = ALL_PROFILES
+            .iter()
+            .any(|&p| p != profile && self.compiled.app_profiles.bucket(p).contains(&app_norm));
+        if in_target && !in_other {
+            return Ok(false);
+        }
+
+        if let Some(existing) = self.doc.get("app_profiles") {
+            if !existing.is_table() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "[app_profiles] in rules.toml is not a table",
+                ));
+            }
+        }
+
+        let apps_tbl = self
+            .doc
+            .entry("app_profiles")
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "[app_profiles] in rules.toml is not a table",
+                )
+            })?;
+
+        for &other in &ALL_PROFILES {
+            Self::remove_app_from_doc_bucket(apps_tbl, other, &app_norm);
+            if other != profile {
+                self.compiled
+                    .app_profiles
+                    .bucket_mut(other)
+                    .remove(&app_norm);
+            }
+        }
+
+        let target_key = app_profile_key(profile);
+        if !apps_tbl.contains_key(target_key) {
+            apps_tbl.insert(target_key, Item::Value(Value::Array(Array::new())));
+        }
+        let arr = apps_tbl
+            .get_mut(target_key)
+            .and_then(Item::as_array_mut)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("[app_profiles].{target_key} in rules.toml is not an array"),
+                )
+            })?;
+        arr.push(app_norm.as_str());
+        self.compiled
+            .app_profiles
+            .bucket_mut(profile)
+            .insert(app_norm);
+
+        self.flush_rules()?;
+        Ok(true)
+    }
+
+    /// Removes a program ID override from `[app_profiles]` (either a specific bucket or all buckets
+    /// when `profile` is `None`). Returns `Ok(true)` if an entry was removed.
+    pub fn remove_app_profile_override(
+        &mut self,
+        profile: Option<AppProfile>,
+        raw_app: &str,
+    ) -> io::Result<bool> {
+        let app_norm = normalize_program_id(raw_app);
+        if app_norm.is_empty() || app_norm.chars().any(char::is_whitespace) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "program id must be a non-empty single token",
+            ));
+        }
+
+        self.sync_external_edits_before_write();
+        if self.parse_locked {
+            self.flush_rules()?;
+        }
+
+        let targets: Vec<AppProfile> = match profile {
+            Some(p) => vec![p],
+            None => vec![
+                AppProfile::Bypass,
+                AppProfile::Browser,
+                AppProfile::Chat,
+                AppProfile::Prose,
+            ],
+        };
+
+        let mut removed = false;
+        for &target in &targets {
+            if self
+                .compiled
+                .app_profiles
+                .bucket_mut(target)
+                .remove(&app_norm)
+            {
+                removed = true;
+            }
+        }
+        if let Some(apps_tbl) = self
+            .doc
+            .get_mut("app_profiles")
+            .and_then(Item::as_table_mut)
+        {
+            for &target in &targets {
+                if Self::remove_app_from_doc_bucket(apps_tbl, target, &app_norm) {
+                    removed = true;
+                }
+            }
+        }
+        if removed {
+            self.flush_rules()?;
+        }
+        Ok(removed)
+    }
+
     /// Inspects or removes stale rules matching age, hit count, kind, and origin filters.
     /// Hand-edited untracked rules (absent from `rule_stats`) and pinned personal words are spared.
     pub fn prune_rules(&mut self, now_ms: u64, opts: &PruneOptions) -> io::Result<PruneReport> {
@@ -2982,7 +3390,8 @@ impl RuleStore {
                 continue;
             }
             let ref_ms = s.last_hit_epoch_ms.unwrap_or(s.created_epoch_ms);
-            if effective_hits <= opts.max_hits && now_ms.saturating_sub(ref_ms) >= opts.older_than_ms
+            if effective_hits <= opts.max_hits
+                && now_ms.saturating_sub(ref_ms) >= opts.older_than_ms
             {
                 matched.push(PruneCandidate {
                     kind: kind_label.to_string(),
@@ -3506,7 +3915,8 @@ impl RuleStore {
                     "bypass" | "off" | "disable" => Some(AppProfile::Bypass),
                     "browser" => Some(AppProfile::Browser),
                     "chat" => Some(AppProfile::Chat),
-                    "prose" | "default" => Some(AppProfile::Prose),
+                    "prose" => Some(AppProfile::Prose),
+                    "default" | "none" | "prose_default" => None,
                     _ => None,
                 };
             }
@@ -3514,7 +3924,7 @@ impl RuleStore {
                 if let Some(arr) = apps.get(key).and_then(Item::as_array) {
                     for v in arr {
                         if let Some(s) = v.as_str() {
-                            let norm = s.trim().to_ascii_lowercase();
+                            let norm = normalize_program_id(s);
                             if !norm.is_empty() {
                                 dst.insert(norm);
                             }
@@ -3747,12 +4157,7 @@ impl UserRuleView for RuleStore {
         } else {
             return 175;
         };
-        let base_hits = self
-            .state
-            .rule_stats
-            .get(&key)
-            .map(|s| s.hits)
-            .unwrap_or(0);
+        let base_hits = self.state.rule_stats.get(&key).map(|s| s.hits).unwrap_or(0);
         let pending = self
             .pending_personal_hits
             .get(&key)
@@ -3986,11 +4391,8 @@ fomr = \"from\"
         // Append an untracked rule directly in TOML and test dry-run + live prune.
         let mut toml_raw = fs::read_to_string(&rules_path).unwrap();
         toml_raw.push_str("\n# manual raw entry\nrawtypo = \"fixed\"\n");
-        let patched = toml_raw.replacen(
-            "[corrections]",
-            "[corrections]\nhandedited = \"clean\"",
-            1,
-        );
+        let patched =
+            toml_raw.replacen("[corrections]", "[corrections]\nhandedited = \"clean\"", 1);
         fs::write(&rules_path, patched).unwrap();
 
         let mut store =
@@ -4038,6 +4440,123 @@ fomr = \"from\"
         assert!(store.compiled().corrections.contains_key("adn"));
         assert!(store.compiled().corrections.contains_key("handedited"));
         assert!(!store.state().rule_stats.contains_key("fix:en:oldfix"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_profile_classifier_unifies_builtins_overrides_unknown_policy_and_crud() {
+        let dir = std::env::temp_dir().join(format!(
+            "smartkey_app_profiles_{}_{}",
+            std::process::id(),
+            current_epoch_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rules_path = dir.join("rules.toml");
+        let state_path = dir.join("state.json");
+        fs::write(
+            &rules_path,
+            "# keep user header\n[app_profiles]\nunknown_app_policy = \"default\"\nbypass = [\"/usr/bin/CustomTerm\"]\n",
+        )
+        .unwrap();
+
+        let mut store =
+            RuleStore::load_or_init(rules_path.clone(), state_path, Preset::Balanced).unwrap();
+
+        assert_eq!(normalize_program_id("/usr/bin/ZCode"), "zcode");
+        assert_eq!(
+            store.compiled().app_profiles.unknown_app_policy,
+            None,
+            "unknown_app_policy = \"default\" must clear override rather than coercing to Prose"
+        );
+        assert_eq!(
+            store.compiled().app_profiles.classify_app("zcode"),
+            (AppProfile::Bypass, "program-list")
+        );
+        assert_eq!(
+            store
+                .compiled()
+                .app_profiles
+                .classify_app("/opt/CustomTerm"),
+            (AppProfile::Bypass, "user-app-override")
+        );
+        assert_eq!(
+            store
+                .compiled()
+                .app_profiles
+                .classify_app("org.mozilla.firefox"),
+            (AppProfile::Browser, "browser")
+        );
+        assert_eq!(
+            store.compiled().app_profiles.classify_app("vesktop"),
+            (AppProfile::Chat, "chat")
+        );
+        assert_eq!(
+            store.compiled().app_profiles.classify_app("obsidian"),
+            (AppProfile::Prose, "prose")
+        );
+
+        // Switching unknown_app_policy to bypass applies both to empty IDs and unknown named apps,
+        // while built-in Browser/Chat and explicit Prose overrides keep their intended profiles.
+        store
+            .set_setting("app_profiles.unknown_app_policy", "bypass")
+            .unwrap();
+        assert_eq!(
+            store.compiled().app_profiles.classify_app(""),
+            (AppProfile::Bypass, "unknown-app-policy")
+        );
+        assert_eq!(
+            store
+                .compiled()
+                .app_profiles
+                .classify_app("my-custom-editor"),
+            (AppProfile::Bypass, "unknown-app-policy")
+        );
+        assert_eq!(
+            store
+                .compiled()
+                .app_profiles
+                .classify_override("my-custom-editor"),
+            Some(AppProfile::Bypass)
+        );
+        assert_eq!(
+            store.compiled().app_profiles.classify_app("firefox"),
+            (AppProfile::Browser, "browser")
+        );
+
+        // Explicit CRUD moves across buckets cleanly and preserves TOML comments.
+        assert!(store
+            .add_app_profile_override(AppProfile::Prose, "obsidian")
+            .unwrap());
+        assert!(!store
+            .add_app_profile_override(AppProfile::Prose, "obsidian")
+            .unwrap());
+        assert_eq!(
+            store.compiled().app_profiles.classify_app("obsidian"),
+            (AppProfile::Prose, "user-app-override")
+        );
+
+        assert!(store
+            .add_app_profile_override(AppProfile::Bypass, "/usr/bin/Obsidian")
+            .unwrap());
+        assert_eq!(
+            store.compiled().app_profiles.classify_app("obsidian"),
+            (AppProfile::Bypass, "user-app-override")
+        );
+        assert!(!store.compiled().app_profiles.prose.contains("obsidian"));
+
+        assert!(store.remove_app_profile_override(None, "obsidian").unwrap());
+        assert!(!store
+            .remove_app_profile_override(Some(AppProfile::Bypass), "obsidian")
+            .unwrap());
+        assert_eq!(
+            store.compiled().app_profiles.classify_app("obsidian"),
+            (AppProfile::Bypass, "unknown-app-policy")
+        );
+
+        let raw = fs::read_to_string(&rules_path).unwrap();
+        assert!(raw.contains("# keep user header"));
 
         let _ = fs::remove_dir_all(&dir);
     }

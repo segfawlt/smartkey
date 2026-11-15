@@ -8,9 +8,10 @@ use std::time::Instant;
 use serde::Serialize;
 use smartkey_core::event_log::current_epoch_ms;
 use smartkey_core::{
-    apply_key_to_buffer, ConfidenceTier, DiagnosticEvent, Dialect, EnglishScorer, EvalContext,
-    EvalOutcome, EventLog, KeyInput, LangId, LoggedDiagnosticRecord, MatchKind, Preset, PruneKinds,
-    PruneOptions, RuleStore, SessionAction, SmartKeyEngine, SmartKeySession, UndoResolution,
+    apply_key_to_buffer, normalize_program_id, AppProfile, ConfidenceTier, DiagnosticEvent,
+    Dialect, EnglishScorer, EvalContext, EvalOutcome, EventLog, KeyInput, LangId,
+    LoggedDiagnosticRecord, MatchKind, Preset, PruneKinds, PruneOptions, RuleStore, SessionAction,
+    SmartKeyEngine, SmartKeySession, UndoResolution,
 };
 
 /// Git state stamped at build time by `build.rs`: HEAD hash or tag (e.g.
@@ -1002,9 +1003,8 @@ fn cmd_rules(args: &[String]) -> CliResult {
                 let raw = args.get(i).ok_or_else(|| {
                     CliError::Usage("--older-than requires a duration (e.g. 30d, 12h)".to_string())
                 })?;
-                older_than_ms = parse_duration_ms(raw).map_err(|e| {
-                    CliError::Usage(format!("invalid --older-than {raw:?}: {e}"))
-                })?;
+                older_than_ms = parse_duration_ms(raw)
+                    .map_err(|e| CliError::Usage(format!("invalid --older-than {raw:?}: {e}")))?;
                 used_prune_flag = true;
             }
             "--zero-hits" => {
@@ -1345,10 +1345,7 @@ fn cmd_rules(args: &[String]) -> CliResult {
                 println!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 return Ok(());
             }
-            println!(
-                "=== Staged Rule Candidates ({} pending) ===",
-                staged.len()
-            );
+            println!("=== Staged Rule Candidates ({} pending) ===", staged.len());
             if staged.is_empty() {
                 println!("No staged candidates.");
             } else {
@@ -1373,9 +1370,8 @@ fn cmd_rules(args: &[String]) -> CliResult {
             }
             let rules_path = dir.join("rules.toml");
             let state_path = dir.join("learner_state.json");
-            let mut store =
-                RuleStore::load_or_init(rules_path, state_path, Preset::Balanced)
-                    .map_err(map_store_err)?;
+            let mut store = RuleStore::load_or_init(rules_path, state_path, Preset::Balanced)
+                .map_err(map_store_err)?;
             let now_ms = current_epoch_ms();
             let opts = PruneOptions {
                 older_than_ms,
@@ -2061,10 +2057,17 @@ fn format_diagnostic_event_line(ev: &DiagnosticEvent) -> String {
             app,
             profile,
             reason,
-        } => format!(
-            "{:<6} APP_BYPASS app={app:?} profile={profile:?} reason={reason:?}",
-            "[--]"
-        ),
+        } => {
+            let label = if *profile == AppProfile::Bypass {
+                "APP_BYPASS"
+            } else {
+                "APP_PROFILE"
+            };
+            format!(
+                "{:<6} {label} app={app:?} profile={profile:?} reason={reason:?}",
+                "[--]"
+            )
+        }
         DiagnosticEvent::RuleLearned {
             rule,
             stage,
@@ -2968,6 +2971,298 @@ fn cmd_plugin(args: &[String]) -> CliResult {
     }
 }
 
+fn parse_app_profile(raw: &str) -> Result<AppProfile, CliError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "bypass" => Ok(AppProfile::Bypass),
+        "browser" => Ok(AppProfile::Browser),
+        "chat" => Ok(AppProfile::Chat),
+        "prose" => Ok(AppProfile::Prose),
+        other => Err(CliError::Usage(format!(
+            "unknown app profile {other:?} (expected bypass, browser, chat, or prose)"
+        ))),
+    }
+}
+
+fn app_profile_label(profile: AppProfile) -> &'static str {
+    match profile {
+        AppProfile::Bypass => "bypass",
+        AppProfile::Browser => "browser",
+        AppProfile::Chat => "chat",
+        AppProfile::Prose => "prose",
+    }
+}
+
+fn print_app_help() {
+    println!(
+        "\
+USAGE:
+  smartkey app list [--json] [--dir <path>]
+  smartkey app classify <program_id> [--json] [--dir <path>]
+  smartkey app add <bypass|browser|chat|prose> <program_id> [--json] [--dir <path>]
+  smartkey app remove [bypass|browser|chat|prose] <program_id> [--json] [--dir <path>]
+  Aliases: apps
+
+Inspect resolved application profiles or manage `[app_profiles]` overrides in rules.toml."
+    );
+}
+
+#[derive(Serialize)]
+struct AppListJson<'a> {
+    unknown_app_policy: Option<&'static str>,
+    bypass: Vec<&'a str>,
+    browser: Vec<&'a str>,
+    chat: Vec<&'a str>,
+    prose: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+struct AppClassifyJson<'a> {
+    program_id: &'a str,
+    normalized_id: String,
+    profile: &'static str,
+    reason: &'static str,
+    unknown_app_policy: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct AppEditJson {
+    action: &'static str,
+    profile: Option<&'static str>,
+    program_id: String,
+    changed: bool,
+    fcitx5_reloaded: bool,
+}
+
+fn cmd_app(args: &[String]) -> CliResult {
+    let mut dir = default_config_dir();
+    let mut as_json = false;
+    let mut pos: Vec<&str> = Vec::new();
+    let mut end_of_flags = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if end_of_flags {
+            pos.push(arg);
+            i += 1;
+            continue;
+        }
+        match arg {
+            "--help" | "-h" => {
+                print_app_help();
+                return Ok(());
+            }
+            "--" => {
+                end_of_flags = true;
+            }
+            "--json" => {
+                as_json = true;
+            }
+            "--dir" => {
+                i += 1;
+                let p = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--dir requires a path".to_string()))?;
+                dir = PathBuf::from(p);
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag {other} (try `smartkey app --help`)"
+                )));
+            }
+            other => pos.push(other),
+        }
+        i += 1;
+    }
+
+    let action = pos.first().copied().unwrap_or("list");
+    match action {
+        "list" | "ls" => {
+            if pos.len() > 1 {
+                return Err(CliError::Usage(format!(
+                    "unexpected argument {:?} (usage: smartkey app list [--json] [--dir <path>])",
+                    pos[1]
+                )));
+            }
+            let (store, _) = load_rule_store_readonly(&dir, Preset::Balanced)?;
+            let apps = &store.compiled().app_profiles;
+            let pol = apps.unknown_app_policy.map(app_profile_label);
+            if as_json {
+                let payload = AppListJson {
+                    unknown_app_policy: pol,
+                    bypass: apps.bypass.iter().map(String::as_str).collect(),
+                    browser: apps.browser.iter().map(String::as_str).collect(),
+                    chat: apps.chat.iter().map(String::as_str).collect(),
+                    prose: apps.prose.iter().map(String::as_str).collect(),
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| CliError::Runtime(e.to_string()))?
+                );
+                return Ok(());
+            }
+
+            println!("=== SmartKey Application Profiles ===");
+            println!(
+                "  unknown_app_policy : {}",
+                pol.unwrap_or("default (prose)")
+            );
+            for (name, set) in [
+                ("bypass", &apps.bypass),
+                ("browser", &apps.browser),
+                ("chat", &apps.chat),
+                ("prose", &apps.prose),
+            ] {
+                if set.is_empty() {
+                    println!("  {name:<8} : (none)");
+                } else {
+                    let joined: Vec<&str> = set.iter().map(String::as_str).collect();
+                    println!("  {name:<8} : {}", joined.join(", "));
+                }
+            }
+            println!(
+                "  tip      : test any app ID via `smartkey app classify <program_id>`, or set policy via `smartkey config set app_profiles.unknown_app_policy bypass`"
+            );
+            Ok(())
+        }
+        "classify" | "check" => {
+            if pos.len() != 2 {
+                return Err(CliError::Usage(
+                    "usage: smartkey app classify <program_id> [--json] [--dir <path>]".to_string(),
+                ));
+            }
+            let raw_app = pos[1];
+            let (store, _) = load_rule_store_readonly(&dir, Preset::Balanced)?;
+            let apps = &store.compiled().app_profiles;
+            let (profile, reason) = apps.classify_app(raw_app);
+            let norm = normalize_program_id(raw_app);
+            let pol = apps.unknown_app_policy.map(app_profile_label);
+            if as_json {
+                let payload = AppClassifyJson {
+                    program_id: raw_app,
+                    normalized_id: norm,
+                    profile: app_profile_label(profile),
+                    reason,
+                    unknown_app_policy: pol,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| CliError::Runtime(e.to_string()))?
+                );
+                return Ok(());
+            }
+            println!(
+                "program={raw_app:?} normalized={norm:?} profile={} reason={reason} unknown_app_policy={}",
+                app_profile_label(profile),
+                pol.unwrap_or("default")
+            );
+            Ok(())
+        }
+        "add" => {
+            if pos.len() != 3 {
+                return Err(CliError::Usage(
+                    "usage: smartkey app add <bypass|browser|chat|prose> <program_id> [--json] [--dir <path>]"
+                        .to_string(),
+                ));
+            }
+            let profile = parse_app_profile(pos[1])?;
+            let raw_app = pos[2];
+            let norm = normalize_program_id(raw_app);
+            let mut store = load_rule_store_mut(&dir, Preset::Balanced)?;
+            let changed = store
+                .add_app_profile_override(profile, raw_app)
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            let reloaded = if changed {
+                notify_fcitx5_reload()
+            } else {
+                false
+            };
+            let label = app_profile_label(profile);
+            if as_json {
+                let payload = AppEditJson {
+                    action: "add",
+                    profile: Some(label),
+                    program_id: norm,
+                    changed,
+                    fcitx5_reloaded: reloaded,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| CliError::Runtime(e.to_string()))?
+                );
+                return Ok(());
+            }
+            if changed {
+                println!(
+                    "Assigned app {norm:?} to profile '{label}' ({})",
+                    if reloaded {
+                        "Fcitx5 reloaded"
+                    } else {
+                        "saved to rules.toml"
+                    }
+                );
+            } else {
+                println!("App {norm:?} already assigned to profile '{label}'.");
+            }
+            Ok(())
+        }
+        "remove" | "rm" | "del" => {
+            let (profile, raw_app) = match pos.len() {
+                2 => (None, pos[1]),
+                3 => (Some(parse_app_profile(pos[1])?), pos[2]),
+                _ => {
+                    return Err(CliError::Usage(
+                        "usage: smartkey app remove [bypass|browser|chat|prose] <program_id> [--json] [--dir <path>]"
+                            .to_string(),
+                    ));
+                }
+            };
+            let norm = normalize_program_id(raw_app);
+            let mut store = load_rule_store_mut(&dir, Preset::Balanced)?;
+            let removed = store
+                .remove_app_profile_override(profile, raw_app)
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            if !removed {
+                return Err(CliError::Runtime(format!(
+                    "no [app_profiles] override found for {norm:?}"
+                )));
+            }
+            let reloaded = notify_fcitx5_reload();
+            let prof_label = profile.map(app_profile_label);
+            if as_json {
+                let payload = AppEditJson {
+                    action: "remove",
+                    profile: prof_label,
+                    program_id: norm,
+                    changed: true,
+                    fcitx5_reloaded: reloaded,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| CliError::Runtime(e.to_string()))?
+                );
+                return Ok(());
+            }
+            println!(
+                "Removed [app_profiles] override for {norm:?} ({})",
+                if reloaded {
+                    "Fcitx5 reloaded"
+                } else {
+                    "saved to rules.toml"
+                }
+            );
+            Ok(())
+        }
+        other => Err(CliError::Usage(format!(
+            "unknown app subcommand {other:?} (usage: smartkey app [list|classify|add|remove] ...)"
+        ))),
+    }
+}
+
 fn cmd_repl(args: &[String]) -> CliResult {
     let mut dir = default_config_dir();
     let mut in_memory = false;
@@ -3156,6 +3451,8 @@ COMMANDS:
   config [list|get <key>|set <key> <val>] [--json]       Inspect or update settings & diagnostics in rules.toml
   explain [--json] [--lang en|vi] [--prev <w>] [--punct <c>] [--dialect mixed|us|gb] [--sentence-start] [--dir <path>] <token>
                                                          Explain scoring, proper nouns & candidate ranking
+  app|apps [list|classify|add|remove] ... [--json] [--dir <path>]
+                                                         Inspect resolved app profiles or edit [app_profiles] overrides
   plugin|plugins [list|enable|disable|toggle] [vi-lotus] [--dir <path>]
                                                          Manage modular input-method & language bridge plugins
   dict|dicts [list|dir|install <lang> <src>|remove <lang>|update [lang]]
@@ -3183,6 +3480,7 @@ fn run_cli(args: &[String]) -> CliResult {
         Some("config" | "cfg") => cmd_config(&args[1..]),
         Some("log") => cmd_log(&args[1..]),
         Some("explain") => cmd_explain(&args[1..]),
+        Some("app" | "apps") => cmd_app(&args[1..]),
         Some("plugin" | "plugins") => cmd_plugin(&args[1..]),
         Some("dict" | "dicts") => cmd_dict(&args[1..]),
         Some("repl") => cmd_repl(&args[1..]),
@@ -3267,13 +3565,13 @@ mod tests {
 
         // Per-command `--help` exits Ok(())
         for sub in [
-            "status", "enable", "reload", "init", "rules", "config", "log", "explain", "plugin",
-            "dict", "repl",
+            "status", "enable", "reload", "init", "rules", "config", "log", "explain", "app",
+            "plugin", "dict", "repl",
         ] {
             assert_eq!(run_cli(&vec_args(&[sub, "--help"])), Ok(()));
         }
 
-        // Read-only `status` / `rules` / `config` / `log` must NOT create config directories when missing
+        // Read-only `status` / `rules` / `config` / `log` / `app` must NOT create config directories when missing
         let uninit_dir =
             env::temp_dir().join(format!("smartkey_cli_readonly_{}", std::process::id()));
         let _ = fs::remove_dir_all(&uninit_dir);
@@ -3282,6 +3580,11 @@ mod tests {
         assert_eq!(run_cli(&vec_args(&["rules", "--dir", dir_str])), Ok(()));
         assert_eq!(run_cli(&vec_args(&["config", "--dir", dir_str])), Ok(()));
         assert_eq!(run_cli(&vec_args(&["log", "--dir", dir_str])), Ok(()));
+        assert_eq!(run_cli(&vec_args(&["app", "--dir", dir_str])), Ok(()));
+        assert_eq!(
+            run_cli(&vec_args(&["app", "classify", "zcode", "--dir", dir_str])),
+            Ok(())
+        );
         assert!(
             !uninit_dir.exists(),
             "read-only inspection commands must not create config dir on disk"
@@ -3710,7 +4013,10 @@ mod tests {
             Ok(())
         );
         let (reloaded_dry, _) = load_rule_store_readonly(&dir, Preset::Balanced).unwrap();
-        assert!(reloaded_dry.compiled().corrections.contains_key("staletypo"));
+        assert!(reloaded_dry
+            .compiled()
+            .corrections
+            .contains_key("staletypo"));
 
         assert_eq!(
             run_cli(&vec_args(&[
@@ -3726,6 +4032,101 @@ mod tests {
         let (reloaded, _) = load_rule_store_readonly(&dir, Preset::Balanced).unwrap();
         assert!(!reloaded.compiled().corrections.contains_key("staletypo"));
         assert!(reloaded.compiled().corrections.contains_key("adn"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_app_classify_and_override_crud_respects_unknown_policy_and_comments() {
+        let dir = env::temp_dir().join(format!(
+            "smartkey_cli_app_{}_{}",
+            std::process::id(),
+            current_epoch_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rules_path = dir.join("rules.toml");
+        fs::write(
+            &rules_path,
+            "# keep user app comments\n[settings]\nenabled = true\n",
+        )
+        .unwrap();
+        let d = dir.to_str().unwrap();
+
+        assert_eq!(
+            run_cli(&vec_args(&["app", "list", "--json", "--dir", d])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "app", "classify", "zcode", "--json", "--dir", d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "app", "add", "prose", "obsidian", "--json", "--dir", d
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&["app", "add", "bypass", "obsidian", "--dir", d])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "config",
+                "set",
+                "app_profiles.unknown_app_policy",
+                "bypass",
+                "--dir",
+                d
+            ])),
+            Ok(())
+        );
+
+        let (store, _) = load_rule_store_readonly(&dir, Preset::Balanced).unwrap();
+        assert_eq!(
+            store.compiled().app_profiles.classify_app("obsidian"),
+            (AppProfile::Bypass, "user-app-override")
+        );
+        assert_eq!(
+            store.compiled().app_profiles.classify_app("unknown-editor"),
+            (AppProfile::Bypass, "unknown-app-policy")
+        );
+
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "app", "remove", "bypass", "obsidian", "--json", "--dir", d
+            ])),
+            Ok(())
+        );
+        assert!(matches!(
+            run_cli(&vec_args(&["app", "remove", "obsidian", "--dir", d])),
+            Err(CliError::Runtime(_))
+        ));
+        assert!(matches!(
+            run_cli(&vec_args(&["app", "add", "invalidprof", "foo", "--dir", d])),
+            Err(CliError::Usage(_))
+        ));
+
+        let raw = fs::read_to_string(&rules_path).unwrap();
+        assert!(raw.contains("# keep user app comments"));
+
+        let bypass_line = format_diagnostic_event_line(&DiagnosticEvent::AppBypass {
+            app: "zcode".to_string(),
+            profile: AppProfile::Bypass,
+            reason: "program-list".to_string(),
+        });
+        assert!(bypass_line.contains("APP_BYPASS"));
+
+        let prose_line = format_diagnostic_event_line(&DiagnosticEvent::AppBypass {
+            app: "obsidian".to_string(),
+            profile: AppProfile::Prose,
+            reason: "user-app-override".to_string(),
+        });
+        assert!(prose_line.contains("APP_PROFILE"));
+        assert!(!prose_line.contains("APP_BYPASS"));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -357,6 +357,17 @@ pub unsafe extern "C" fn smartkey_engine_log_app_event(
     });
 }
 
+fn static_reason_cstr(reason: &str) -> *const c_char {
+    match reason {
+        "user-app-override" => c"user-app-override".as_ptr(),
+        "unknown-app-policy" => c"unknown-app-policy".as_ptr(),
+        "program-list" => c"program-list".as_ptr(),
+        "browser" => c"browser".as_ptr(),
+        "chat" => c"chat".as_ptr(),
+        _ => c"prose".as_ptr(),
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn smartkey_engine_classify_app_override(
     engine: *const SmartKeyEngineHandle,
@@ -374,6 +385,29 @@ pub unsafe extern "C" fn smartkey_engine_classify_app_override(
             .classify_override(app)
             .map(encode_profile)
             .unwrap_or(SMARTKEY_PROFILE_NONE)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_classify_app(
+    engine: *const SmartKeyEngineHandle,
+    app_utf8: *const c_char,
+    out_reason_utf8: *mut *const c_char,
+) -> u8 {
+    if !out_reason_utf8.is_null() {
+        *out_reason_utf8 = c"prose".as_ptr();
+    }
+    let app = if app_utf8.is_null() {
+        ""
+    } else {
+        CStr::from_ptr(app_utf8).to_str().unwrap_or("")
+    };
+    with_engine_ref(engine, SMARTKEY_PROFILE_PROSE, |eng| {
+        let (prof, reason) = eng.store().compiled().app_profiles.classify_app(app);
+        if !out_reason_utf8.is_null() {
+            *out_reason_utf8 = static_reason_cstr(reason);
+        }
+        encode_profile(prof)
     })
 }
 
@@ -659,4 +693,56 @@ pub unsafe extern "C" fn smartkey_mobile_on_untouched_commit(
             let _ = sess.inner.on_mobile_untouched_commit(eng, word);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{CStr, CString};
+
+    #[test]
+    fn ffi_classify_app_respects_builtins_overrides_and_unknown_policy() {
+        let dir = std::env::temp_dir().join(format!("smartkey_ffi_app_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rules = dir.join("rules.toml");
+        std::fs::write(
+            &rules,
+            "[app_profiles]\nunknown_app_policy = \"bypass\"\nprose = [\"obsidian\"]\n",
+        )
+        .unwrap();
+
+        let state = dir.join("state.json");
+        let c_rules = CString::new(rules.to_str().unwrap()).unwrap();
+        let c_state = CString::new(state.to_str().unwrap()).unwrap();
+        let eng = unsafe {
+            smartkey_engine_new(c_rules.as_ptr(), c_state.as_ptr(), SMARTKEY_PRESET_BALANCED)
+        };
+        assert!(!eng.is_null());
+
+        let check = |app: &str, expected_prof: u8, expected_reason: &str| {
+            let c_app = CString::new(app).unwrap();
+            let mut reason_ptr: *const c_char = std::ptr::null();
+            let prof =
+                unsafe { smartkey_engine_classify_app(eng, c_app.as_ptr(), &mut reason_ptr) };
+            assert_eq!(prof, expected_prof, "unexpected profile for {app:?}");
+            assert!(!reason_ptr.is_null());
+            let reason = unsafe { CStr::from_ptr(reason_ptr) }.to_str().unwrap();
+            assert_eq!(reason, expected_reason, "unexpected reason for {app:?}");
+        };
+
+        check("zcode", SMARTKEY_PROFILE_BYPASS, "program-list");
+        check("firefox", SMARTKEY_PROFILE_BROWSER, "browser");
+        check("vesktop", SMARTKEY_PROFILE_CHAT, "chat");
+        check("obsidian", SMARTKEY_PROFILE_PROSE, "user-app-override");
+        check(
+            "my-unlisted-app",
+            SMARTKEY_PROFILE_BYPASS,
+            "unknown-app-policy",
+        );
+        check("", SMARTKEY_PROFILE_BYPASS, "unknown-app-policy");
+
+        unsafe { smartkey_engine_free(eng) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

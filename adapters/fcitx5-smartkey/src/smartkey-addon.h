@@ -96,7 +96,7 @@ inline uint8_t classifyProgramName(std::string_view rawProgram) {
             "blackbox", "xterm", "urxvt", "st", "tilix", "terminator",
             "xfce4-terminal", "yakuake", "warp", "tabby", "rio",
             "code", "code-oss", "codium", "vscodium", "cursor", "windsurf",
-            "zed", "zed-editor", "nvim", "nvim-qt", "neovide", "vim",
+            "zcode", "zed", "zed-editor", "nvim", "nvim-qt", "neovide", "vim",
             "gvim", "emacs", "helix", "sublime_text", "sublimetext", "subl",
             "idea", "clion", "pycharm", "rustrover", "goland", "webstorm",
             "datagrip", "phpstorm", "rider", "rubymine", "aqua", "fleet",

@@ -273,28 +273,31 @@ uint8_t SmartKeyAddon::classifyProfile(InputContext *ic,
         return SMARTKEY_PROFILE_BYPASS;
     }
 
-    if (engine_ != nullptr) {
-        const std::string appStr(appName);
-        const uint8_t userOverride =
-            smartkey_engine_classify_app_override(engine_, appStr.c_str());
-        if (userOverride != SMARTKEY_PROFILE_NONE) {
-            setReason(appName.empty() ? "unknown-app-policy" : "user-app-override");
-            return userOverride;
-        }
+    // GTK4's `libim-fcitx5.so` (`frontend:dbus` when `GTK_IM_MODULE=fcitx` is exported)
+    // reports an empty program name and implements DBus `ForwardKey` as a hard no-op (`ret`).
+    // If `SurroundingText` is also invalid (e.g. a GTK4 terminal or raw surface), replacement
+    // cannot delete the original word and would duplicate text (`orig + replacement`).
+    // Run this guard before `unknown_app_policy` so `unknown_app_policy = "prose"` cannot
+    // expose unsafe DBus surfaces without valid surrounding text.
+    const std::string_view rawProg = ic->program();
+    if (rawProg.empty() &&
+        ic->frontendName() == std::string_view("dbus") &&
+        (!flags.test(CapabilityFlag::SurroundingText) ||
+         !ic->surroundingText().isValid())) {
+        setReason("dbus-no-surrounding-text");
+        return SMARTKEY_PROFILE_BYPASS;
     }
 
-    const std::string_view rawProg = ic->program();
+    if (engine_ != nullptr) {
+        const std::string appStr(appName);
+        const char *ffiReason = "prose";
+        const uint8_t prof =
+            smartkey_engine_classify_app(engine_, appStr.c_str(), &ffiReason);
+        setReason(ffiReason != nullptr ? ffiReason : "prose");
+        return prof;
+    }
+
     if (rawProg.empty()) {
-        // GTK4's `libim-fcitx5.so` (`frontend:dbus` when `GTK_IM_MODULE=fcitx` is exported)
-        // reports an empty program name and implements DBus `ForwardKey` as a hard no-op (`ret`).
-        // If `SurroundingText` is also invalid (e.g. a GTK4 terminal or raw surface), replacement
-        // cannot delete the original word and would duplicate text (`orig + replacement`).
-        if (ic->frontendName() == std::string_view("dbus") &&
-            (!flags.test(CapabilityFlag::SurroundingText) ||
-             !ic->surroundingText().isValid())) {
-            setReason("dbus-no-surrounding-text");
-            return SMARTKEY_PROFILE_BYPASS;
-        }
         setReason("prose");
         return SMARTKEY_PROFILE_PROSE;
     }
@@ -486,8 +489,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
     const char *reason = "prose";
     const uint8_t profile = classifyProfile(ic, appName, &reason);
     smartkey_session_set_profile(state->session(), profile);
-    if (state->shouldLogProfileTransition(profile, reason) &&
-        profile == SMARTKEY_PROFILE_BYPASS) {
+    if (state->shouldLogProfileTransition(profile, reason)) {
         smartkey_engine_log_app_event(engine_, appName.c_str(), profile, reason);
     }
     if (profile == SMARTKEY_PROFILE_BYPASS) {
@@ -671,8 +673,7 @@ void SmartKeyAddon::onPostKeyEvent(KeyEvent &keyEvent) {
     const char *reason = "prose";
     const uint8_t profile = classifyProfile(ic, appName, &reason);
     smartkey_session_set_profile(state->session(), profile);
-    if (state->shouldLogProfileTransition(profile, reason) &&
-        profile == SMARTKEY_PROFILE_BYPASS) {
+    if (state->shouldLogProfileTransition(profile, reason)) {
         smartkey_engine_log_app_event(engine_, appName.c_str(), profile, reason);
     }
     if (profile == SMARTKEY_PROFILE_BYPASS) {
@@ -839,7 +840,12 @@ void SmartKeyAddon::onSurroundingTextUpdated(Event &event) {
     }
     auto &icEvent = static_cast<InputContextEvent &>(event);
     auto *ic = icEvent.inputContext();
-    if (ic == nullptr || !isEnglishKeyboardActive(ic)) {
+    if (ic == nullptr) {
+        return;
+    }
+    const bool englishActive = isEnglishKeyboardActive(ic);
+    const bool lotusActive = !englishActive && isLotusActive(ic);
+    if (!englishActive && !lotusActive) {
         return;
     }
     if (!ic->capabilityFlags().test(CapabilityFlag::SurroundingText) ||
@@ -850,10 +856,16 @@ void SmartKeyAddon::onSurroundingTextUpdated(Event &event) {
     if (state == nullptr || state->session() == nullptr) {
         return;
     }
+    const uint64_t nowMs = monotonicNowMs();
+    if (state->isSelfCommitting() ||
+        (lotusActive &&
+         (state->isInLotusBurst(nowMs) || state->hasPendingBoundary()))) {
+        return;
+    }
     const auto &st = ic->surroundingText();
     smartkey_session_reconcile_surrounding(state->session(), engine_,
                                            st.text().c_str(), st.cursor(),
-                                           monotonicNowMs());
+                                           nowMs);
 }
 
 } // namespace fcitx::smartkey

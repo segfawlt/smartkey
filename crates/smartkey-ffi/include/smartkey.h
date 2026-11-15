@@ -103,13 +103,24 @@ void smartkey_engine_log_app_event(
 );
 
 /*
- * Returns a `SMARTKEY_PROFILE_*` override from `[app_profiles]` in `rules.toml`
- * (including `unknown_app_policy` when `app_utf8` is `""` or `NULL`), or
- * `SMARTKEY_PROFILE_NONE` (`255`) when no user override matches.
+ * Legacy override-only helper retained for ABI compatibility.
+ * Prefer `smartkey_engine_classify_app` for unified app classification.
  */
 uint8_t smartkey_engine_classify_app_override(
     const SmartKeyEngineHandle* engine,
     const char* app_utf8
+);
+
+/*
+ * Classifies `app_utf8` using `[app_profiles]` overrides, built-in desktop app lists,
+ * and `unknown_app_policy`, returning `SMARTKEY_PROFILE_*`.
+ * When `out_reason_utf8 != NULL`, writes a static NUL-terminated reason string
+ * (`"user-app-override"`, `"unknown-app-policy"`, `"program-list"`, `"browser"`, `"chat"`, or `"prose"`).
+ */
+uint8_t smartkey_engine_classify_app(
+    const SmartKeyEngineHandle* engine,
+    const char* app_utf8,
+    const char** out_reason_utf8
 );
 
 /* Desktop keystroke stream (`fcitx5-lotus` / X11 / Wayland) */
