@@ -381,3 +381,47 @@ fn test_vi_lotus_host_contract_filtered_boundaries_macros_off_mode_and_options()
     assert_eq!(sp.action, SessionAction::PassThrough);
     let _ = &mut buf;
 }
+
+#[test]
+fn test_vi_lotus_uinput_restore_class_rescue_and_unknown_learning() {
+    let (mut engine, mut session) = make_vi_engine_and_session();
+
+    // 1. Single tone/mark key substitution across the filtered-boundary commit (`duongx ` ->
+    //    runic `duõng` on screen -> uinput restore burst commits `ongx ` -> SmartKey deletes the
+    //    6-char raw word + boundary and commits `dương `):
+    let (buf, _) = type_sequence(&mut session, &mut engine, "duongx ");
+    assert_eq!(buf, "dương ");
+
+    // 2. Restore-class word with NO rescue candidate (`duonxg `): screen stays raw ASCII, but the
+    //    word must no longer be silently dropped — it feeds `log_unfixed_unknown` and stages the
+    //    untouched unknown (`3x -> [lang.vi].personal_dict`), flush confirmed by `reset`.
+    let (buf2, _) = type_sequence(&mut session, &mut engine, "duonxg ");
+    assert_eq!(buf2, "duonxg ");
+    let _ = session.reset(&mut engine);
+    assert!(
+        engine
+            .store()
+            .state()
+            .untouched_unknowns
+            .contains_key("vi:duonxg"),
+        "restore-class unknown must be staged: {:?}",
+        engine.store().state().untouched_unknowns
+    );
+
+    // 3. Live-English-fallback words in the same screen/token mismatch class (`feeel ` renders
+    //    `feel` on screen) keep `do_not_learn` — valid English words are never staged into the
+    //    Vietnamese dictionary:
+    let (buf3, _) = type_sequence(&mut session, &mut engine, "feeel ");
+    assert_eq!(buf3, "feel ");
+    let _ = session.reset(&mut engine);
+    assert!(!engine
+        .store()
+        .state()
+        .untouched_unknowns
+        .contains_key("vi:feeel"));
+    assert!(!engine
+        .store()
+        .state()
+        .untouched_unknowns
+        .contains_key("feeel"));
+}

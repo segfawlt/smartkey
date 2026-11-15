@@ -292,10 +292,7 @@ pub fn analyze_token(
     if CASING_EXCLUSIONS.contains(&inner) {
         let alpha_count = inner.chars().filter(|c| c.is_alphabetic()).count();
         if alpha_count >= 4
-            && !matches!(
-                inner,
-                "mRNA" | "tRNA" | "rRNA" | "dsRNA" | "ssRNA" | "cDNA"
-            )
+            && !matches!(inner, "mRNA" | "tRNA" | "rRNA" | "dsRNA" | "ssRNA" | "cDNA")
         {
             return TokenAnalysis::MixedCaseWord {
                 leading_quotes: leading_q.to_string(),

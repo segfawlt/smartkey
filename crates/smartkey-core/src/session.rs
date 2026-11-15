@@ -264,8 +264,10 @@ impl SmartKeyEngine {
         //     phrase back to the raw shorthand trigger (`is_snippet = true` when expansion contains spaces).
         if self.store.scorer_config().expand_shorthand {
             let char_len = token.chars().count();
-            let is_all_caps_acronym =
-                char_len >= 2 && token.chars().all(|c| !c.is_alphabetic() || c.is_uppercase());
+            let is_all_caps_acronym = char_len >= 2
+                && token
+                    .chars()
+                    .all(|c| !c.is_alphabetic() || c.is_uppercase());
             // For 1-char Vietnamese shorthand (`j -> gì`, `k -> không`, `h -> giờ`, `r -> rồi`, `uh / u -> ừ`),
             // skip uppercase single letters mid-sentence (`J`, `S`, `H`) so middle initials are untouched.
             let is_single_upper_initial = char_len == 1
@@ -325,7 +327,8 @@ impl SmartKeyEngine {
             }
             return EvalOutcome::Unchanged {
                 reason: MatchKind::ValidWord,
-                do_not_learn: (lotus_composing && (sim.is_valid_vietnamese || sim.is_composed_vietnamese))
+                do_not_learn: (lotus_composing
+                    && (sim.is_valid_vietnamese || sim.is_composed_vietnamese))
                     || crate::vi_telex::is_vietnamese_dict_word(&lower)
                     || crate::vi_telex::is_vietnamese_slang_word(&lower)
                     || self.store.is_personal_word(&lower),
@@ -370,15 +373,14 @@ impl SmartKeyEngine {
         //    Lotus commit even in active Uinput mode (`sim.preedit_before_break == token && !sim.is_composed_vietnamese`),
         //    so rescue remains eligible whenever either `lotus_composing` is true OR `sim` itself expected
         //    zero mid-word mutations!
-        let can_rescue_vi = lotus_composing
-            || (!sim.is_composed_vietnamese && sim.preedit_before_break == token);
+        let can_rescue_vi =
+            lotus_composing || (!sim.is_composed_vietnamese && sim.preedit_before_break == token);
         let shield_from_vi_rescue = is_lexicon_english_raw
             || is_lexicon_english_screen
             || self.store.is_lang_only_personal_word("vi", &lower)
             || (lotus_composing && self.store.is_lang_only_personal_word("vi", &screen_lower));
         if can_rescue_vi && !shield_from_vi_rescue {
-            if let Some(rescue) =
-                crate::vi_telex::rescue_telex_typo_with_options(token, lotus_opts)
+            if let Some(rescue) = crate::vi_telex::rescue_telex_typo_with_options(token, lotus_opts)
             {
                 if !self
                     .store
@@ -395,7 +397,10 @@ impl SmartKeyEngine {
         }
 
         // If Lotus's 3x mark undo changed the on-screen character count (`tieeeng` or `feeel -> feel`),
-        // do not run fuzzy English guesses on the raw keystrokes.
+        // do not run fuzzy English guesses on the raw keystrokes. But when the token is not a known
+        // English word, still let it be learned/logged (`do_not_learn: false`) so uinput-restore
+        // words that no rescue candidate matched (e.g. `duonxg`) feed `log_unfixed_unknown` and
+        // `3x -> personal_dict` staging exactly like the forwarded-gibberish path does.
         if lotus_composing && sim.screen_chars != token.chars().count() {
             return EvalOutcome::Unchanged {
                 reason: if is_known_english {
@@ -403,7 +408,7 @@ impl SmartKeyEngine {
                 } else {
                     MatchKind::Bypass
                 },
-                do_not_learn: true,
+                do_not_learn: is_known_english,
             };
         }
 
@@ -915,7 +920,12 @@ impl SmartKeySession {
                 buf,
             } => {
                 if !buf.is_empty() {
-                    self.maybe_record_vi_passthrough_repair(&mut engine.store, &orig_word, &buf, events);
+                    self.maybe_record_vi_passthrough_repair(
+                        &mut engine.store,
+                        &orig_word,
+                        &buf,
+                        events,
+                    );
                     let ev = record_manual_edit(
                         &mut engine.store,
                         lex,
@@ -1628,14 +1638,14 @@ impl SmartKeySession {
         }
         let opts = store.lotus_options();
         let buf_sim = crate::vi_telex::simulate_lotus_word_with_options(new_buf, opts);
-        let cand_ascii = if !buf_sim.is_composed_vietnamese && buf_sim.preedit_before_break.is_ascii()
-        {
-            buf_sim.preedit_before_break.as_str()
-        } else if new_buf.is_ascii() {
-            new_buf
-        } else {
-            return;
-        };
+        let cand_ascii =
+            if !buf_sim.is_composed_vietnamese && buf_sim.preedit_before_break.is_ascii() {
+                buf_sim.preedit_before_break.as_str()
+            } else if new_buf.is_ascii() {
+                new_buf
+            } else {
+                return;
+            };
         if cand_ascii.len() < 2 {
             return;
         }
@@ -1854,8 +1864,7 @@ impl SmartKeySession {
             profile: self.profile,
         };
 
-        let is_vi_lotus =
-            self.lang.as_str() == "vi" && engine.store.compiled().vi_lotus_enabled;
+        let is_vi_lotus = self.lang.as_str() == "vi" && engine.store.compiled().vi_lotus_enabled;
         let lotus_opts = engine.store.lotus_options();
         let vi_sim = if is_vi_lotus && self.lotus_composing {
             let sim = crate::vi_telex::simulate_lotus_word_with_options(&word, lotus_opts);

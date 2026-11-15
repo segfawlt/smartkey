@@ -49,16 +49,7 @@ const LAST_CONSONANT_ROWS: &[&[&str]] = &[
     &["c"],
 ];
 
-const VC_MATRIX: &[&[usize]] = &[
-    &[0, 2],
-    &[0, 1, 2],
-    &[1, 2],
-    &[1, 2],
-    &[],
-    &[],
-    &[3],
-    &[4],
-];
+const VC_MATRIX: &[&[usize]] = &[&[0, 2], &[0, 1, 2], &[1, 2], &[1, 2], &[], &[], &[3], &[4]];
 
 fn vi_dict() -> &'static Vec<&'static str> {
     static DICT: OnceLock<Vec<&'static str>> = OnceLock::new();
@@ -318,55 +309,56 @@ fn telex_rules() -> &'static Vec<Rule> {
             Tone::Tilde,
         ];
 
-        let add_mark_dsl = |rules: &mut Vec<Rule>, key: char, effective_ons: &[char], results: &[char]| {
-            for (&eff_on, &res) in effective_ons.iter().zip(results.iter()) {
-                let Some(fam) = mark_family(res) else {
-                    continue;
-                };
-                let Some(mark_idx) = fam.iter().position(|&c| c == res) else {
-                    continue;
-                };
-                let effect = match mark_idx {
-                    1 => Mark::Hat,
-                    2 => Mark::Breve,
-                    3 => Mark::Horn,
-                    4 => Mark::Dash,
-                    _ => Mark::None,
-                };
-                let Some(eff_fam) = mark_family(eff_on) else {
-                    continue;
-                };
-                for &cp in &eff_fam {
-                    if cp == '_' {
+        let add_mark_dsl =
+            |rules: &mut Vec<Rule>, key: char, effective_ons: &[char], results: &[char]| {
+                for (&eff_on, &res) in effective_ons.iter().zip(results.iter()) {
+                    let Some(fam) = mark_family(res) else {
                         continue;
-                    }
-                    if cp == res {
-                        rules.push(Rule {
-                            key,
-                            effect_type: EffectType::MarkTransformation(Mark::None),
-                            effect_on: res,
-                            result: eff_on,
-                        });
-                    } else if is_vowel(cp) {
-                        for &tone in &tone_order {
+                    };
+                    let Some(mark_idx) = fam.iter().position(|&c| c == res) else {
+                        continue;
+                    };
+                    let effect = match mark_idx {
+                        1 => Mark::Hat,
+                        2 => Mark::Breve,
+                        3 => Mark::Horn,
+                        4 => Mark::Dash,
+                        _ => Mark::None,
+                    };
+                    let Some(eff_fam) = mark_family(eff_on) else {
+                        continue;
+                    };
+                    for &cp in &eff_fam {
+                        if cp == '_' {
+                            continue;
+                        }
+                        if cp == res {
+                            rules.push(Rule {
+                                key,
+                                effect_type: EffectType::MarkTransformation(Mark::None),
+                                effect_on: res,
+                                result: eff_on,
+                            });
+                        } else if is_vowel(cp) {
+                            for &tone in &tone_order {
+                                rules.push(Rule {
+                                    key,
+                                    effect_type: EffectType::MarkTransformation(effect),
+                                    effect_on: add_tone_to_char(cp, tone),
+                                    result: add_tone_to_char(res, tone),
+                                });
+                            }
+                        } else {
                             rules.push(Rule {
                                 key,
                                 effect_type: EffectType::MarkTransformation(effect),
-                                effect_on: add_tone_to_char(cp, tone),
-                                result: add_tone_to_char(res, tone),
+                                effect_on: cp,
+                                result: res,
                             });
                         }
-                    } else {
-                        rules.push(Rule {
-                            key,
-                            effect_type: EffectType::MarkTransformation(effect),
-                            effect_on: cp,
-                            result: res,
-                        });
                     }
                 }
-            }
-        };
+            };
 
         add_mark_dsl(&mut rules, 'a', &['a'], &['â']);
         add_mark_dsl(&mut rules, 'd', &['d'], &['đ']);
@@ -537,7 +529,13 @@ fn find_root_target(composition: &[Transformation], target_id: usize) -> usize {
     cur
 }
 
-fn extract_cvc_appending(appending: &[Transformation]) -> (Vec<Transformation>, Vec<Transformation>, Vec<Transformation>) {
+fn extract_cvc_appending(
+    appending: &[Transformation],
+) -> (
+    Vec<Transformation>,
+    Vec<Transformation>,
+    Vec<Transformation>,
+) {
     let n = appending.len();
     if n == 0 {
         return (Vec::new(), Vec::new(), Vec::new());
@@ -585,7 +583,13 @@ fn extract_cvc_appending(appending: &[Transformation]) -> (Vec<Transformation>, 
     (fc, vo, lc)
 }
 
-fn extract_cvc_trans(composition: &[Transformation]) -> (Vec<Transformation>, Vec<Transformation>, Vec<Transformation>) {
+fn extract_cvc_trans(
+    composition: &[Transformation],
+) -> (
+    Vec<Transformation>,
+    Vec<Transformation>,
+    Vec<Transformation>,
+) {
     if composition.is_empty() {
         return (Vec::new(), Vec::new(), Vec::new());
     }
@@ -1303,13 +1307,9 @@ impl LotusSimEngine {
                     let mut new_comp = self.composition.clone();
                     new_comp.extend(transformations.iter().cloned());
                     if !is_valid_composition(&new_comp, true) {
-                        if let Some((v_target, mut v_rule)) = find_target(
-                            &new_comp,
-                            &rules,
-                            std_style,
-                            free_marking,
-                            self.next_id,
-                        ) {
+                        if let Some((v_target, mut v_rule)) =
+                            find_target(&new_comp, &rules, std_style, free_marking, self.next_id)
+                        {
                             v_rule.key = '\0';
                             transformations.push(Transformation {
                                 id: self.alloc_id(),
@@ -1345,13 +1345,9 @@ impl LotusSimEngine {
                         };
                         let mut with_eff = self.composition.clone();
                         with_eff.push(clear_eff.clone());
-                        if let Some((new_target, new_rule)) = find_target(
-                            &with_eff,
-                            &rules,
-                            std_style,
-                            free_marking,
-                            self.next_id,
-                        ) {
+                        if let Some((new_target, new_rule)) =
+                            find_target(&with_eff, &rules, std_style, free_marking, self.next_id)
+                        {
                             if new_target != v0_id {
                                 transformations.push(clear_eff);
                                 transformations.push(Transformation {
@@ -1604,6 +1600,14 @@ fn is_tone_or_horn_key(b: u8) -> bool {
     matches!(b, b's' | b'f' | b'r' | b'x' | b'j' | b'w')
 }
 
+/// Telex tone (`s f r x j z`) + mark (`a e o d w`) keys — the only final key the substitution
+/// rescue (strategy 5) may rewrite, and the only characters it may be rewritten to.
+const TELEX_FUNCTIONAL_KEYS: &[u8] = b"sfrxjzwaeod";
+
+fn is_telex_functional_key(b: u8) -> bool {
+    TELEX_FUNCTIONAL_KEYS.contains(&b)
+}
+
 /// Collapses all 3x mark keys (`eee -> ee`, `ddd -> dd`, `ooo -> oo`, `aaa -> aa`) and
 /// 2x non-mark keys (`tt -> t`, `ss -> s`, `ww -> w`, `nn -> n`, etc.) in a single pass.
 fn collapse_telex_chatter(lower: &str) -> String {
@@ -1734,6 +1738,38 @@ pub fn rescue_telex_typo_with_options(raw_keys: &str, opts: LotusOptions) -> Opt
         }
     }
 
+    // 5. Final tone/mark key substitution (`duongx -> duongw -> dương`, `duongj -> duongw -> dương`):
+    //    only when Lotus itself composed runes mid-word and `mustFallbackToEnglish()` restored the
+    //    raw keys (`needs_uinput_restore_on_break`) — a strong prior that the user WAS typing
+    //    Vietnamese but hit one wrong FINAL tone/mark key. Only the last key participates, and only
+    //    when it is itself a Telex tone/mark key: substituting mid-word positions lets a phantom
+    //    tone stack onto an existing vowel (`duongx -> dufngx -> dũng` via grave-then-tilde
+    //    override) and "rescue" nonsense sequences into dict words, and rewriting plain consonants
+    //    would change the word instead of fixing a slip. The same `try_candidate_repair`
+    //    confidence guards apply (valid dict syllable + composed runes + coda/diphthong or
+    //    mark+tone). Pure English words never compose runes mid-word, so they never enter this
+    //    strategy.
+    if orig_sim.needs_uinput_restore_on_break {
+        if let Some(&last) = bytes.last() {
+            if is_telex_functional_key(last) {
+                for &sub in TELEX_FUNCTIONAL_KEYS {
+                    if sub == last {
+                        continue;
+                    }
+                    let mut cand = bytes.to_vec();
+                    cand[n - 1] = sub;
+                    if let Ok(cand_str) = std::str::from_utf8(&cand) {
+                        if let Some(rescued) =
+                            try_candidate_repair(cand_str, raw_keys, screen_chars, opts)
+                        {
+                            return Some(rescued);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -1858,18 +1894,9 @@ mod tests {
         assert_eq!(r16.replacement, "thánh");
 
         // Casing preservation:
-        assert_eq!(
-            rescue_telex_typo("Ttieengs").unwrap().replacement,
-            "Tiếng"
-        );
-        assert_eq!(
-            rescue_telex_typo("TTieengs").unwrap().replacement,
-            "Tiếng"
-        );
-        assert_eq!(
-            rescue_telex_typo("TTIEENGS").unwrap().replacement,
-            "TIẾNG"
-        );
+        assert_eq!(rescue_telex_typo("Ttieengs").unwrap().replacement, "Tiếng");
+        assert_eq!(rescue_telex_typo("TTieengs").unwrap().replacement, "Tiếng");
+        assert_eq!(rescue_telex_typo("TTIEENGS").unwrap().replacement, "TIẾNG");
     }
 
     #[test]
@@ -1886,5 +1913,38 @@ mod tests {
                 "English word {word:?} should not be falsely converted to Vietnamese"
             );
         }
+    }
+
+    #[test]
+    fn test_rescue_single_key_substitution_on_uinput_restore() {
+        // `duongx`: Lotus composes runic `duõng` mid-word, `mustFallbackToEnglish()` restores the
+        // raw keys at the break (`needs_uinput_restore_on_break`). The user hit ONE wrong tone key
+        // (`x` instead of `w`); substituting within Telex-functional keys reaches `duongw -> dương`.
+        let r1 = rescue_telex_typo("duongx").expect("should rescue duongx -> dương");
+        assert_eq!(r1.replacement, "dương");
+        assert_eq!(r1.screen_chars, 5);
+
+        // Casing preservation for the substitution class:
+        assert_eq!(rescue_telex_typo("Duongx").unwrap().replacement, "Dương");
+
+        // Restore-class words whose only fix is a wrong tone/mark key stay rescueable:
+        assert_eq!(rescue_telex_typo("duongj").unwrap().replacement, "dương");
+    }
+
+    #[test]
+    fn test_no_substitution_rescue_outside_restore_class() {
+        // Words Lotus never composed mid-word (no runes on screen, `needs_uinput_restore_on_break`
+        // == false) must never enter the substitution strategy — the user may be typing English
+        // or slang deliberately:
+        assert_eq!(rescue_telex_typo("was"), None);
+        assert_eq!(rescue_telex_typo("helo"), None);
+        assert_eq!(rescue_telex_typo("ax"), None);
+        // Already-valid dict words never rescue:
+        assert_eq!(rescue_telex_typo("chàng"), None);
+        assert_eq!(rescue_telex_typo("changf"), None);
+        // Non-functional consonant positions are never rewritten (`duongj` rescues only via its
+        // `j` tone key, never by rewriting the `g`), and no substitution may reach a dict word
+        // from a non-restore token:
+        assert_eq!(rescue_telex_typo("heloj"), None);
     }
 }

@@ -161,9 +161,7 @@ pub fn date_string(epoch_ms: u64) -> String {
 }
 
 fn parse_event_filename_days(file_name: &str) -> Option<i64> {
-    let stem = file_name
-        .strip_prefix("events-")?
-        .strip_suffix(".jsonl")?;
+    let stem = file_name.strip_prefix("events-")?.strip_suffix(".jsonl")?;
     let mut parts = stem.split('-');
     let y_str = parts.next()?;
     let m_str = parts.next()?;
