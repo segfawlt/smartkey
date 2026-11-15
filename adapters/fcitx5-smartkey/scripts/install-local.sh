@@ -24,8 +24,11 @@ if [ -f "${HOME}/.cargo/bin/smartkey" ]; then
 fi
 
 echo "Building fcitx5-smartkey addon..."
-if [ -f "${BUILD_DIR}/CMakeCache.txt" ] && grep -q 'CMAKE_INSTALL_PREFIX:PATH=/usr' "${BUILD_DIR}/CMakeCache.txt"; then
-    rm -rf "${BUILD_DIR}"
+if [ -f "${BUILD_DIR}/CMakeCache.txt" ]; then
+    CACHED_SRC=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "${BUILD_DIR}/CMakeCache.txt" | head -n1 || true)
+    if grep -q 'CMAKE_INSTALL_PREFIX:PATH=/usr' "${BUILD_DIR}/CMakeCache.txt" || [ "${CACHED_SRC:-}" != "${ADAPTER_DIR}" ]; then
+        rm -rf "${BUILD_DIR}"
+    fi
 fi
 cmake -S "${ADAPTER_DIR}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -45,6 +48,12 @@ echo "  ${DICT_DIR}/en.skdict"
 
 if command -v busctl >/dev/null 2>&1 && command -v fcitx5-remote >/dev/null 2>&1 && fcitx5-remote --check >/dev/null 2>&1; then
     busctl --user call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1 Restart >/dev/null 2>&1 || true
+    for _ in $(seq 1 10); do
+        if fcitx5-remote --check >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
     echo "Restarted running Fcitx5 daemon in-place via DBus."
 else
     echo "Restart Fcitx5 in your desktop session to activate: fcitx5 -r -d"
@@ -53,3 +62,5 @@ fi
 echo ""
 "${BIN_DIR}/smartkey" --version
 echo "Source: $(git -C "${ROOT_DIR}" describe --always --tags --dirty 2>/dev/null || echo 'no git checkout')"
+echo ""
+"${BIN_DIR}/smartkey" status || true

@@ -16,9 +16,9 @@ SmartKey brings **phone-grade, privacy-first, 100% on-device autocorrect to phys
 Unlike touchscreens, physical desktop keyboards suffer from distinct typing errors: physical key chatter, 10-finger rolling transpositions (`teh`, `chagnes`), pinky slips on punctuation (`don;t`, `situatioN:`), and thumb-spacebar collisions (`inbthe`). Most existing desktop spellcheckers either show slow red squiggly popups or blindly overwrite code, URLs, and variable names.
 
 SmartKey is designed from the ground up for desktop environments:
-1. **Sub-20 µs Latency & 0% False Positives on Code:** Powered by pure Rust with an embedded compressed finite-state transducer (FST), 96,000+ real-world keyboard smashes, and character-multiset rescue. It automatically steps aside in code editors, terminals, passwords, and URLs.
+1. **Sub-millisecond Latency (~1 µs median, `< 1 ms` p99) & 0% False Positives on Code:** Powered by pure Rust with a zero-copy embedded compressed finite-state transducer (FST), 96,000+ real-world keyboard smashes, and character-multiset rescue. It automatically steps aside in code editors, terminals, passwords (where forwarded by the frontend), and URLs.
 2. **Deterministic Learning Through Your Backspace:** It learns from what you actually do without machine learning or cloud telemetry:
-   - **1x Backspace:** Immediately reverts an unwanted suggestion back to what you literally typed.
+   - **1x Backspace (within `5 s` window):** Reverts an unwanted suggestion back to what you literally typed; trailing spaces extend the `undo_window_ms` (`5000 ms` default).
    - **2x Fix:** Fixing the same typo twice promotes your fix permanently to your personal dictionary and learned rules.
    - **Plain-text Brain:** All learned preferences live in a human-readable, comment-preserving `~/.config/smartkey/rules.toml` that you can inspect, edit, or sync with Git.
 3. **Seamless Bilingual Coexistence (`vi-lotus` Bridge):** Runs as a lightweight Fcitx5 module addon on standard English layouts (`keyboard-us`), includes an optional zero-fork **`vi-lotus`** bridge for `fcitx5-lotus` (rescuing broken Telex smashes like `nuowcss → nước` and shielding English prose momentum like `type of → type of`), and steps aside cleanly on `fcitx5-bamboo` or when `fcitx5-lotus` is in `Off`/macro mode.
@@ -27,7 +27,7 @@ SmartKey is designed from the ground up for desktop environments:
 
 ## Highlights
 
-- **Layer 1 — Phone-Grade PC Autocorrect (`< 20 µs`):**
+- **Layer 1 — Phone-Grade PC Autocorrect (`< 1 µs` median, `< 1 ms` p99):**
   - `95,924` curated real-world keyboard smashes (`crate-ci/typos`) + compressed `fst` lexicon + Damerau–Levenshtein automata (`levenshtein-automata`) + `POPCNT` character-multiset smash rescue (`hstiautoin → situation`).
   - Tuned for physical 10-finger keyboards: transpositions (`chagnes → changes`, `soemtimes → sometimes`), switch bounces (`thhe → the`, `nnext → next`), pinky `;` contractions (`don;t → don't`, `doesnt → doesn't`, `im → I'm`), Shift/CapsLock slips (`THat's → That's`, `situatioN: → situation:`, `tHIS → This`), and thumb-spacebar clips (`inbthe → in the`).
   - **Respects user casing & developer tokens:** Never nag-capitalizes lowercase brands (`github` stays `github`), never touches mid-sentence capitals (`Apple`, `GitHub`), and shields CLI/Linux/code tokens, URLs, and expressive stretches (`soooo`, `trờiiii`).
@@ -47,7 +47,7 @@ SmartKey is designed from the ground up for desktop environments:
 
 - **`crates/smartkey-core`** — Pure-Rust Layer 1 scorer, `SmartKeySession` shadow-buffer learner, diagnostic event logger, and comment-preserving `toml_edit` `RuleStore` (zero OS/C-sys/`$HOME` dependencies).
 - **`crates/smartkey-ffi`** — Panic-safe `extern "C"` ABI (`include/smartkey.h`) for desktop input method modules (`fcitx5`) and portable word-level JNI hooks for Android `HeliBoard`.
-- **`crates/smartkey-cli`** — Control CLI (`smartkey`: `status`, `toggle`, `reload`, `log`, `rules`, `config`, `plugin`, `dict`, `explain`, `init`, `repl`; aliased as `smartkeyctl`) and developer corpus tools (`smartkey-dev`: `eval`, `build-lexicon`).
+- **`crates/smartkey-cli`** — Control CLI (`smartkey`: `status`, `toggle`, `reload`, `log`, `rules`, `config`, `app`, `plugin`, `dict`, `explain`, `init`, `repl`; aliased as `smartkeyctl`) and developer corpus tools (`smartkey-dev`: `eval`, `build-lexicon`).
 - **`adapters/fcitx5-smartkey`** — Standalone C++20 `fcitx5` module addon (`Category=Module`, requires `fcitx5 >= 5.0.20`, zero `sudo` user-local install to `~/.local`) that runs English autocorrect on `keyboard-*` layouts, bridges `fcitx5-lotus` (`vi-lotus` plugin), and steps aside automatically on other CJK/Vietnamese input engines.
 
 ## Prerequisites & Desktop IM Environment
@@ -70,12 +70,12 @@ Run `smartkey status` at any time to verify Fcitx5 daemon state, addon library d
 #### Arch Linux (`.pkg.tar.zst`)
 ```bash
 # 1. Download latest release package and checksum
-curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst
-curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst.sha256
-sha256sum -c fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst.sha256
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.2-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.2-1-x86_64.pkg.tar.zst.sha256
+sha256sum -c fcitx5-smartkey-0.1.2-1-x86_64.pkg.tar.zst.sha256
 
 # 2. Install local package
-sudo pacman -U ./fcitx5-smartkey-0.1.1-1-x86_64.pkg.tar.zst
+sudo pacman -U ./fcitx5-smartkey-0.1.2-1-x86_64.pkg.tar.zst
 
 # 3. Restart Fcitx5 and check status
 fcitx5 -r -d
@@ -87,11 +87,11 @@ smartkey status
 
 ```bash
 # Download, verify checksum, and unpack portable bundle
-curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst
-curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst.sha256
-sha256sum -c fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst.sha256
-zstd -d -c fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst | tar -xf -
-cd fcitx5-smartkey-0.1.1-linux-x86_64
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.2-linux-x86_64.tar.zst
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.1.2-linux-x86_64.tar.zst.sha256
+sha256sum -c fcitx5-smartkey-0.1.2-linux-x86_64.tar.zst.sha256
+zstd -d -c fcitx5-smartkey-0.1.2-linux-x86_64.tar.zst | tar -xf -
+cd fcitx5-smartkey-0.1.2-linux-x86_64
 
 # Install to ~/.local (no sudo required)
 ./install.sh
@@ -128,7 +128,7 @@ sudo pacman -U dist/fcitx5-smartkey-*.pkg.tar.zst
 ```bash
 # Host build (or pass --container to build inside Debian 12 for glibc >= 2.36 portability):
 ./scripts/package-portable.sh --container
-# Outputs dist/fcitx5-smartkey-0.1.1-linux-x86_64.tar.zst (+ .sha256)
+# Outputs dist/fcitx5-smartkey-0.1.2-linux-x86_64.tar.zst (+ .sha256)
 ```
 
 ## Quick Start & CLI Usage
@@ -168,15 +168,31 @@ smartkey explain "implementintion"
 smartkey explain --prev "over" "ther"
 smartkey explain --lang vi "nuowcss"
 
+# Inspect or customize per-app classification (`[app_profiles]`)
+smartkey app list
+smartkey app classify zcode
+smartkey app add bypass my-custom-ide
+smartkey app remove my-custom-ide
+
 # Launch interactive terminal typing + live backspace-learning sandbox
 smartkey repl
 ```
 
+Status panel widget: see [contrib/waybar/smartkey.jsonc](./contrib/waybar/smartkey.jsonc) (`smartkey status --json`).
+
 ### App Context Profiles (`fcitx5-smartkey`)
 
-- **Bypass (`100%` hands-off):** Password/PIN/URL/email/numeric fields (`CapabilityFlags`), terminals (`kitty`, `alacritty`, `foot`, `ghostty`, `wezterm`, `konsole`, `gnome-terminal`, `xterm`, etc.), and code editors/IDEs (`code`, `codium`, `cursor`, `windsurf`, `zed`, `sublime_text`, `nvim`, `vim`, `emacs`, `helix`, `jetbrains-*`, `idea`, `clion`, `pycharm`, `rustrover`, etc.).
+- **Bypass (`100%` hands-off):** Password/PIN/URL/email/numeric fields (`CapabilityFlags`), terminals (`kitty`, `alacritty`, `foot`, `ghostty`, `wezterm`, `konsole`, `gnome-terminal`, `xterm`, etc.), and code editors/IDEs (`code`, `codium`, `cursor`, `windsurf`, `zcode`, `zed`, `sublime_text`, `nvim`, `vim`, `emacs`, `helix`, `jetbrains-*`, `idea`, `clion`, `pycharm`, `rustrover`, etc.).
 - **Active (`keyboard-*` + optional `vi-lotus`):** Browsers (`firefox`, `zen`, `librewolf`, `floorp`, `vivaldi`, `opera`, `thorium`, `chromium`, `brave`, `epiphany`, `qutebrowser` — including Flatpak reverse-DNS IDs), chat apps (`discord`, `vesktop`, `telegram`, `slack`, `signal`), and general prose/text editors (`gnome-text-editor`, `kate`, `kwrite`, `gedit`, `obsidian`, `libreoffice`).
-- **Custom Overrides (`[app_profiles]` in `rules.toml`):** Override any application name or Flatpak ID (`bypass = ["my-custom-ide"]`, `chat = ["element"]`, `browser = [...]`, `prose = [...]`, or `unknown_app_policy = "bypass"` for strict allowlist-only activation).
+- **Custom Overrides (`[app_profiles]` in `rules.toml` / `smartkey app`):** Override any application name or Flatpak ID via `smartkey app add <bypass|browser|chat|prose> <program_id>`, or set `smartkey config set app_profiles.unknown_app_policy bypass` for strict allowlist-only activation (applies to both empty program IDs and unlisted app names).
+
+### Behavior Boundaries & Security Caveats
+
+- **`Enter` never autocorrects:** Intentional anti-surprise rule so pressing `Enter` in chat or search bars never mutates your final word right before sending.
+- **ALL-CAPS stays untouched:** Uppercase tokens (`DONT`, `API`, CapsLock runs) are never rewritten by design.
+- **Real words are shielded by default:** Valid-word confusion pairs (`form -> from`, `quiet -> quite`) stay untouched unless you add or 2×-teach a context rule (`[context_corrections]`).
+- **`dialect = "mixed"` output bias:** Accepts both US and UK spellings untouched; unknown typos normalize toward US spelling (`smartkey config set dialect en_GB` for British output).
+- **X11 / XIM password fields:** Password suppression relies on Fcitx5 `CapabilityFlag::PasswordOrSensitive`, which legacy X11 XIM frontends do not forward. On Wayland `text-input-v3` or native GTK/Qt IM modules it works automatically; on legacy X11 XIM apps, pause with `smartkey toggle` or set `unknown_app_policy = "bypass"`.
 
 ## License
 

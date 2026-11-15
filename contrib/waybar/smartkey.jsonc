@@ -1,0 +1,13 @@
+// Waybar custom module consuming `smartkey status --json` (`text` + `tooltip`).
+// Add `"custom/smartkey"` to your Waybar `modules-right` (or include this file).
+{
+  "custom/smartkey": {
+    "exec": "smartkey status --json",
+    "return-type": "json",
+    "interval": 5,
+    "on-click": "smartkey toggle",
+    "on-click-right": "smartkey plugin toggle vi-lotus",
+    "format": "{}",
+    "tooltip": true
+  }
+}
