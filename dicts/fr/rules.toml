@@ -10,6 +10,9 @@ function_words = [
   "ton", "tu", "un", "une", "vos", "vous", "y",
 ]
 
+bigram_boosts = []
+replacements = []
+
 [clitics]
 suffixes = []
 prefixes = ["l", "d", "j", "m", "t", "s", "c", "n", "qu", "jusqu", "lorsqu", "puisqu"]
@@ -21,6 +24,3 @@ abbreviations = [
   "vol", "fig", "chap", "art", "éd", "p", "pp", "tel", "tél", "approx",
 ]
 exclusions = []
-
-bigram_boosts = []
-replacements = []
