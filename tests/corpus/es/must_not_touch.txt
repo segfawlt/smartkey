@@ -1,0 +1,69 @@
+# SmartKey Hard 0%-False-Positive Corpus (Spanish — es)
+# Every entry here MUST remain 100% unchanged under default settings.
+
+# Accented & ñ Spanish valid words
+canción
+español
+año
+también
+más
+qué
+corazón
+mañana
+niño
+acción
+información
+teléfono
+rápido
+fácil
+difícil
+música
+público
+árbol
+café
+país
+países
+después
+además
+aquí
+ahí
+así
+pequeño
+señor
+señora
+otoño
+montaña
+cumpleaños
+vergüenza
+pingüino
+
+# Lowercase days, months & standalone 'i' (capitalize_standalone_i = false)
+lunes
+martes
+enero
+febrero
+i
+
+# Already-capitalized proper nouns
+España
+Madrid
+Barcelona
+
+# Spanish slang & chat shields
+jaja
+jajaja
+jeje
+porfa
+wey
+compa
+chido
+finde
+profe
+compu
+
+# Acronyms, URLs & technical tokens
+API
+TODO
+config.json
+@segfawlt
+#general

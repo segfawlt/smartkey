@@ -1,0 +1,59 @@
+# SmartKey Golden Must-Fix Corpus (French — fr)
+# Columns (tab-separated): prev_word ('-' for none, '^' for sentence start) | typed_token | boundary_punct ('-' for Space) | expected_output
+
+# --- Unambiguous French keyboard typos ---
+-	toujorus	-	toujours
+-	beacuoup	-	beaucoup
+-	maintennat	-	maintenant
+-	qeulque	-	quelque
+-	pourqoui	-	pourquoi
+-	commnet	-	comment
+-	ensemlbe	-	ensemble
+-	improtant	-	important
+-	exmeple	-	exemple
+-	mometn	-	moment
+-	gouvernemnt	-	gouvernement
+-	histiore	-	histoire
+-	perosnne	-	personne
+-	nouveua	-	nouveau
+-	pendnat	-	pendant
+-	devnat	-	devant
+-	vraimnet	-	vraiment
+-	seulemnet	-	seulement
+-	possilbe	-	possible
+-	quesiton	-	question
+-	inforamtique	-	informatique
+-	ordianteur	-	ordinateur
+-	servcie	-	service
+-	proejt	-	projet
+-	avce	-	avec
+-	chsoe	-	chose
+-	temsp	-	temps
+-	familel	-	famille
+-	travial	-	travail
+
+# --- Mechanical switch chatter & key bounces ---
+-	bbien	-	bien
+-	ttoujours	-	toujours
+-	vraimment	-	vraiment
+-	travaill	-	travail
+-	langagee	-	langage
+-	danss	-	dans
+-	pluss	-	plus
+-	mondee	-	monde
+
+# --- Unambiguous proper nouns ---
+-	france	-	France
+-	paris	-	Paris
+-	lyon	-	Lyon
+
+# --- French shorthand auto-expansions ---
+-	bjr	-	bonjour
+-	bsr	-	bonsoir
+-	bcp	-	beaucoup
+-	tjr	-	toujours
+-	svp	-	s'il vous plaît
+-	stp	-	s'il te plaît
+-	ajd	-	aujourd'hui
+-	dsl	-	désolé
+-	rdv	-	rendez-vous

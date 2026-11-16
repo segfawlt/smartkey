@@ -1,0 +1,40 @@
+# SmartKey English Shorthand Auto-Expansions — EXTENDED (opt-in), v1.1
+# Low-frequency or variant triggers removed from the default shorthand_en.tsv.
+# Enable only for users who want maximum coverage; every entry here passed the
+# Rule 1/Rule 2 curation bars and was cut purely on frequency grounds.
+# Format: trigger<TAB>expansion. Lines starting with '#' are comments.
+
+# --- Group A: single-word shortenings (SMS-flavored variants & workplace) ---
+thxs	thanks
+srry	sorry
+msgs	messages
+tomoz	tomorrow
+bcuz	because
+abt	about
+rly	really
+btwn	between
+appt	appointment
+dept	department
+
+# --- Group B: multi-word initialisms (variants, niche or seasonal) ---
+tbqh	to be quite honest
+brt	be right there
+bbl	be back later
+bfn	bye for now
+tyt	take your time
+gws	get well soon
+hny	happy new year
+hru	how are you
+stg	I swear to God
+idr	I don't remember
+idts	I don't think so
+idgi	I don't get it
+idrc	I don't really care
+afaict	as far as I can tell
+wym	what do you mean
+iykwim	if you know what I mean
+wsp	what's up
+wsg	what's good
+wya	where you at
+ilysm	I love you so much
+tyvm	thank you very much

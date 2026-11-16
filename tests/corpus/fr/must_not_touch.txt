@@ -1,0 +1,77 @@
+# SmartKey Hard 0%-False-Positive Corpus (French — fr)
+# Every entry here MUST remain 100% unchanged under default settings.
+
+# Accented & ligature French valid words
+français
+être
+déjà
+café
+très
+après
+où
+là
+ça
+garçon
+leçon
+façon
+reçu
+fenêtre
+forêt
+hôtel
+hôpital
+château
+gâteau
+noël
+naïf
+problème
+système
+cœur
+sœur
+œuvre
+bientôt
+aussitôt
+plutôt
+
+# Elided French tokens (direct wordlist + clitics.prefixes stripping)
+l'homme
+qu'il
+d'accord
+c'est
+j'ai
+n'est
+aujourd'hui
+jusqu'à
+s'il
+l'on
+qu'elle
+lorsqu'arrive
+puisqu'existe
+t'explique
+
+# Lowercase days, months & standalone 'i' (capitalize_standalone_i = false)
+lundi
+janvier
+i
+
+# Already-capitalized proper nouns
+France
+Paris
+Lyon
+
+# French slang & chat shields
+mdr
+ptdr
+lol
+jsp
+jpp
+osef
+chelou
+wesh
+cimer
+
+# Acronyms, URLs & technical tokens
+API
+TODO
+config.json
+@segfawlt
+#general

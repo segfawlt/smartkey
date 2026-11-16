@@ -1,0 +1,79 @@
+# SmartKey · shorthand_vi.tsv — Vietnamese Shorthand Auto-Expansions
+# Format: trigger<TAB>expansion<TAB>#notes
+# - Lines starting with '#' are comments (category headers / provenance).
+# - Triggers are lowercase; SmartKey matches case-insensitively and mirrors
+#   capitalization onto the expansion (Ko -> Không, KO -> KHÔNG).
+# - Expansion fires on Space or punctuation; one Backspace restores the raw trigger.
+# - Telex (fcitx5-lotus): keys s f r x j w are tone/mark modifiers ONLY after a
+#   vowel inside the same word; 'dd' composes to 'đ'. Flags used below:
+#     telex:compose   trigger is usually consumed by lotus before SmartKey sees it
+#     telex:safe      contains a modifier key but cannot compose here (no vowel before it)
+# - Curated from ViSoLex NSW dictionary (dict/dictionary.json, 3,091 entries),
+#   ViLexNorm (EACL 2024, 10,467 pairs) and everyday VN chat usage review.
+# - Curation bar: one unambiguous expansion, >90% of real usage; anything
+#   polysemous is shielded in slang_vi.txt + audit_ambiguous.tsv instead.
+
+# === 1. Core verbs, negations, and particles ===
+ko	không
+dc	được
+đc	được
+ddc	được
+cx	cũng
+ms	mới
+nx	nữa
+kp	không phải
+kdc	không được
+kcj	không có gì
+chx	chưa
+ns	nói
+nma	nhưng mà
+nhma	nhưng mà
+j	gì
+gj	gì
+s	sao
+
+# === 2. Pronouns and people ===
+mk	mình
+mn	mọi người
+mng	mọi người
+ng	người
+ngta	người ta
+ny	người yêu
+nyc	người yêu cũ
+vk	vợ
+cj	chị
+
+# === 3. Time, question, and connector phrases ===
+ntn	như thế nào
+trc	trước
+bh	bây giờ
+hqua	hôm qua
+hnay	hôm nay
+bnh	bao nhiêu
+tg	thời gian
+tgian	thời gian
+ncl	nói chung là
+
+# === 4. Everyday phrases, study, work, and communication ===
+bth	bình thường
+bthg	bình thường
+vv	vui vẻ
+yy	yêu
+sn	sinh nhật
+sk	sức khỏe
+bs	bác sĩ
+sdt	số điện thoại
+sđt	số điện thoại
+cty	công ty
+kd	kinh doanh
+ql	quản lý
+sl	số lượng
+sd	sử dụng
+qc	quảng cáo
+kq	kết quả
+klq	không liên quan
+mxh	mạng xã hội
+cskh	chăm sóc khách hàng
+vn	Việt Nam
+nt	nhắn tin
+trl	trả lời

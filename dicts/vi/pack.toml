@@ -1,0 +1,36 @@
+[pack]
+code = "vi"
+name = "Vietnamese"
+version = "0.2.0"
+format_version = 3
+tier = "ime_bridge"
+maintainer = "segfawlt"
+description = "Official Vietnamese shorthand expansions, slang shields, and syllable dictionary fallback for SmartKey (fcitx5-lotus)"
+license = "GPL-3.0-or-later"
+
+[variants.vi]
+freq_slot = 0
+default = true
+
+[sources.lotus_dict]
+format = "fcitx_cm_dict"
+path = "vietnamese.cm.dict"
+decompress = "none"
+sha256 = "b7dbecb78a27f9cd9ed27146e037868fcd3ca6371423dea4f50af9573c3ae820"
+license = "GPL-3.0-or-later"
+variants = ["vi"]
+capture_bigrams = false
+
+[overlays]
+shorthand = ["shorthand.tsv"]
+slang = ["slang.txt"]
+proper_nouns = []
+dev_terms = []
+rules = []
+
+[build]
+bigram_top_n = 90000
+smash_min_freq = 105
+proper_noun_freq = 160
+tech_freq = 172
+syllable_dict = true

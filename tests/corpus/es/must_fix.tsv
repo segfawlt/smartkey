@@ -1,0 +1,53 @@
+# SmartKey Golden Must-Fix Corpus (Spanish — es)
+# Columns (tab-separated): prev_word ('-' for none, '^' for sentence start) | typed_token | boundary_punct ('-' for Space) | expected_output
+
+# --- Unambiguous Spanish keyboard typos ---
+-	porblema	-	problema
+-	gobeirno	-	gobierno
+-	improtante	-	importante
+-	necesairo	-	necesario
+-	moemnto	-	momento
+-	siemrpe	-	siempre
+-	poruqe	-	porque
+-	cuadno	-	cuando
+-	tiemop	-	tiempo
+-	perosna	-	persona
+-	sisetma	-	sistema
+-	palarba	-	palabra
+-	verdda	-	verdad
+-	mientars	-	mientras
+-	entnoces	-	entonces
+-	cualqueir	-	cualquier
+-	desarollo	-	desarrollo
+-	progarma	-	programa
+-	compuatdora	-	computadora
+-	escirbir	-	escribir
+-	difernete	-	diferente
+-	seguirdad	-	seguridad
+-	respeusta	-	respuesta
+-	pregutna	-	pregunta
+-	histroia	-	historia
+-	serviico	-	servicio
+-	proeycto	-	proyecto
+-	nacinoal	-	nacional
+-	sociedda	-	sociedad
+
+# --- Mechanical switch chatter & key bounces ---
+-	ciuddad	-	ciudad
+-	ssiempre	-	siempre
+-	ppalabra	-	palabra
+-	prooblema	-	problema
+-	reallidad	-	realidad
+-	munndo	-	mundo
+
+# --- Unambiguous proper nouns ---
+-	españa	-	España
+-	madrid	-	Madrid
+-	barcelona	-	Barcelona
+
+# --- Spanish shorthand auto-expansions ---
+-	xq	-	porque
+-	tmb	-	también
+-	tqm	-	te quiero mucho
+-	msj	-	mensaje
+-	ntp	-	no te preocupes

@@ -1,0 +1,169 @@
+# SmartKey · audit_ambiguous.tsv — Ambiguous / Excluded Vietnamese Shorthand Audit
+# Format: trigger<TAB>verdict<TAB>candidate meanings<TAB>reason
+# verdict: shield = added to slang_vi.txt (kept verbatim) | dropped = not in any list
+# Evidence: ViSoLex NSW dictionary (github.com/HaDung2002/visolex, dict/dictionary.json)
+# where a "ViSoLex:" tag is present; otherwise everyday-usage review.
+đk	shield	đăng ký / điều kiện / được không	polysemous; same for dk and Telex form ddk
+dk	shield	đăng ký / điều kiện / được không	ASCII twin of đk
+ddk	shield	đăng ký / điều kiện / được không	Telex form (dd -> đ)
+đt	shield	điện thoại / đội tuyển / dân tộc / data	polysemous; same for dt
+dt	shield	điện thoại / đội tuyển / dân tộc / data	ASCII twin of đt
+tk	shield	tài khoản / thiết kế	polysemous (work vs tech contexts)
+hs	shield	học sinh / hồ sơ	polysemous (school vs paperwork)
+sv	shield	sinh viên / (rarely) khác	role-abbreviation; kept readable as-is per spec
+gv	shield	giáo viên / giúp việc	polysemous (teacher vs domestic help)
+nv	shield	nhân viên / nhiệm vụ	polysemous (person vs task)
+gd	shield	gia đình / giao dịch	polysemous; marked form gđ dropped for low usage
+bm	shield	bố mẹ / bộ môn	polysemous (family vs academic)
+vs	shield	với / versus	English collision + VN preposition
+k	shield	không / (letter K, kilo)	single letter; expanding would fire on ordinary typing
+r	shield	rồi / (letter r) / Telex sắc key	single letter + Telex modifier key
+v	shield	với / vậy / versus (ViSoLex: với, vậy)	single letter, 2 VN readings
+w	shield	với / (letter w) / Telex ươi-ương key	ViSoLex: với; letter is a Telex key
+x	shield	xong? / (letter x) / Telex hỏi key	single letter + Telex modifier key
+f	shield	phải? / (letter f) / Telex huyền key	single letter + Telex modifier key
+z	shield	vậy (ViSoLex: vậy) / (letter z)	particle shield; expanding to vậy risks letter-typing
+u	shield	ừ / uống (ViSoLex: uống) / (letter u)	single letter, 2 VN readings
+kh	shield	không / khách hàng	polysemous (chat negation vs business)
+kg	shield	không / kilôgram	polysemous (negation vs unit)
+hn	shield	hôm nay / Hà Nội	polysemous (time vs city)
+hq	shield	hôm qua / Hàn Quốc / hải quân	polysemous (ViSoLex confirms)
+tc	shield	tài chính / tổ chức / tình cảm (ViSoLex: tình cảm)	polysemous
+td	shield	thể dục / tiến độ / tự do (ViSoLex: thể dục)	polysemous
+hd	shield	hướng dẫn / hành động / high-definition	polysemous (3 real readings)
+tb	shield	thông báo / tân binh / trung bình (ViSoLex: trung bình)	polysemous
+vp	shield	văn phòng / vật phẩm	polysemous (office vs gaming)
+cv	shield	công việc / curriculum vitae (CV)	polysemous
+hp	shield	hạnh phúc / Hải Phòng / học phí / hit points (ViSoLex: 3 readings)	polysemous
+mb	shield	máy bay / megabyte	polysemous
+km	shield	khuyến mãi / kilômét	polysemous (shopping vs unit)
+bd	shield	bóng đá / birthday / Bình Dương	polysemous
+bq	shield	bỏ qua / bình quân / bảo quản (ViSoLex: bảo quản)	polysemous
+bl	shield	bình luận / block / Bạc Liêu	polysemous ("bl t" is genuinely 2-way)
+cb	shield	chuẩn bị / cán bộ / cơ bản / các bạn (ViSoLex: 4 readings)	polysemous
+nc	shield	nước / nói chuyện (ViSoLex: both)	OVERRIDES spec example "nc -> nói chuyện"; corpus shows real 2-way split
+tn	shield	thế nào / tin nhắn / trắc nghiệm (ViSoLex: 4 readings)	polysemous
+bn	shield	bạn / bao nhiêu / bệnh nhân (ViSoLex: 4 readings)	polysemous
+nn	shield	ngủ ngon / nghỉ ngơi / ngôn ngữ / người nước ngoài (ViSoLex: ngôn ngữ)	polysemous
+nch	shield	nói chung / nói chuyện (ViSoLex: both)	polysemous
+qt	shield	quan trọng / quá trình / quốc tế / quan tâm (ViSoLex: 2)	polysemous
+qtr	shield	quá trời / quá trình / quan trọng (ViSoLex: quá trời, quan trọng)	polysemous
+cn	shield	chủ nhật / công nghệ (ViSoLex: both)	polysemous
+dh	shield	đại học / đơn hàng	polysemous (student vs seller chat); same for đh
+đh	shield	đại học / đơn hàng	Telex twin of dh
+đg	shield	đang / đường	polysemous; same for dg, dag
+dg	shield	đang / đường (ViSoLex: both)	ASCII twin of đg
+dag	shield	đang / đường (ViSoLex: đường)	ASCII variant; corpus prefers đường
+dd	shield	địa điểm / (Telex đ residue)	polysemous; usually consumed by Telex anyway
+đr	shield	đúng rồi / được rồi	polysemous
+xd	shield	xác định / "XD" emoticon	lowercase XD emoticon collides; marked xđ dropped as low-usage
+vt	shield	viết / vô tri (ViSoLex: viết)	corpus says viết but "vt thật" (vô tri) is live slang
+vc	shield	vợ chồng / vãi cả / việc / vụ (ViSoLex: 4 readings)	polysemous
+tx	shield	thanks / tài xế (ViSoLex: tài xế)	polysemous
+ths	shield	thanks / thông số	polysemous
+ty	shield	thank you / tỉ / tình yêu (ViSoLex: tình yêu)	polysemous
+cm	shield	cảm ơn / comment / centimet / chứng minh / chúng mày (ViSoLex: 4)	polysemous
+ct	shield	chi tiết / chương trình / chia tay (ViSoLex: chia tay, chương trình)	polysemous
+pb	shield	phiên bản / playboy	polysemous
+cs	shield	chăm sóc / cuộc sống / Counter-Strike (ViSoLex: cuộc sống)	polysemous
+xh	shield	xã hội / xuất hiện (ViSoLex: xã hội)	polysemous
+ht	shield	hiện tại / hệ thống / hết (ViSoLex: hết)	polysemous
+ts	shield	trà sữa / tiến sĩ / tới / tự sướng (ViSoLex: 3 readings)	polysemous
+tm	shield	thôi mà / trademark / tạm	polysemous + letter pair is also an English mark
+pm	shield	phần mềm / private message	polysemous
+bv	shield	bệnh viện / bảo vệ (ViSoLex: both)	polysemous
+kc	shield	không có / kiểm soát	polysemous
+hx	shield	hàng xóm / hồi xưa (ViSoLex: hàng xóm)	polysemous
+wa	shield	qua / quá / WhatsApp (ViSoLex: quá, qua)	polysemous + brand
+zj	shield	gì / vậy (ViSoLex: gì; "sao zj" = sao vậy)	2-way particle
+rj	shield	gì / rồi (rì)	particle; verbatim-safe
+wj	shield	vậy / vì	particle; verbatim-safe
+zị	shield	vậy (variant)	z-substitution particle
+zô	shield	vô (variant; also zo)	z-substitution particle
+nh	shield	nhỉ / nhé	particle; verbatim-safe
+nhe	shield	nhé (ASCII spelling)	protect from English corrector
+ne	shield	nhé (variant)	valid VN syllable kept verbatim
+ui	shield	ui (ui trời) / (user-forbidden English trigger)	interjection shield
+ks	shield	khách sạn / kỹ sư (ViSoLex: both)	2-way; below expansion bar
+sp	shield	sản phẩm / sư phạm (ViSoLex: both)	2-way; below expansion bar
+bx	shield	bà xã / bến xe (ViSoLex: bến xe)	2-way; below expansion bar
+lm	shield	làm / lắm (ViSoLex: both)	"đẹp lm" (lắm) vs "lm gì" (làm); below expansion bar
+bjo	shield	bây giờ / bao giờ (ViSoLex: bao giờ)	2-way; below expansion bar
+bt	shield	bình thường / biết / bài tập (ViSoLex: 3 readings)	OVERRIDES spec example; corpus shows real 3-way split
+cmn	shield	chúc mừng / con mẹ nó (ViSoLex: con mẹ nó)	expansion would inject profanity into birthday wishes
+nc2	dropped	(them; nc shielded above)	placeholder removed
+sg	shield	Sài Gòn (place code)	proper-noun code kept verbatim
+hcm	shield	Hồ Chí Minh (place code)	proper-noun code kept verbatim
+dn	shield	Đà Nẵng (place code)	proper-noun code kept verbatim
+pq	shield	Phú Quốc (place code)	proper-noun code kept verbatim
+dl	shield	Đà Lạt (place code) / download	proper-noun code kept verbatim
+bk	shield	Bách Khoa / bảo kê / book (ViSoLex absent)	polysemous
+bc	shield	bồ cũ / bình chọn	polysemous
+cp	shield	chi phí / couple / cặp đôi	polysemous
+mon	shield	môn (ASCII spelling)	protect from English corrector (moon/mon)
+ls	shield	lịch sử / Linux ls	polysemous; Linux collision on a Linux host
+hđ	shield	hoạt động / hợp đồng	polysemous
+cđ	shield	cao đẳng / cuộc đời	polysemous; same for cd
+cd	shield	cao đẳng / cuộc đời / CD disc	polysemous
+tnao	shield	thế nào / tên nào	2-way; below expansion bar
+e	dropped	em / English "e"	single letter; "e.g." false positive + too generic
+a	dropped	anh / English article "a"	hard English collision
+i	dropped	(English "i")	English pronoun collision
+t	dropped	tôi / thằng / tớ / tao / tuổi (ViSoLex: 8 readings)	single letter with many readings; too risky to expand
+m	dropped	mày / mình / mẹ / má / mi (ViSoLex: 6 readings)	single letter with many readings; too risky to expand
+b	dropped	bạn? / bố? / (letter b)	single letter, no dominant reading
+d	dropped	đi? / (Telex đ key)	single letter + Telex key
+g	dropped	gì? / (letter g)	single letter, weak dominance
+h	dropped	giờ? ("5h") / (letter h)	unit-style usage; single letter
+n	dropped	nhé? / (letter n)	single letter, no dominant reading
+p	dropped	phút? ("5p") / (letter p)	unit-style usage; single letter
+q	dropped	quá? / (letter q)	single letter, weak dominance
+iu	dropped	yêu	cringe baby-talk (Rule 3)
+ik	dropped	(í/cười)	cringe baby-talk (Rule 3)
+khum	dropped	không	cringe baby-talk (Rule 3)
+hok	dropped	không	cringe baby-talk (Rule 3)
+hem	dropped	không	cringe baby-talk (Rule 3)
+hong	dropped	không	informal-baby register; excluded (Rule 3)
+hum	dropped	hôm	cringe baby-talk (Rule 3)
+bít	dropped	biết	cringe baby-talk (Rule 3)
+rùi	dropped	rồi	cringe eye-dialect (Rule 3)
+lun	dropped	luôn	cringe eye-dialect (Rule 3)
+quài	dropped	hoài	cringe eye-dialect (Rule 3)
+zậy	dropped	vậy	cringe z-substitution (Rule 3)
+dzậy	dropped	vậy	cringe dz-substitution (Rule 3)
+zn	dropped	zận	cringe z-substitution (Rule 3)
+zui	dropped	vui	cringe z-substitution (Rule 3)
+dzui	dropped	vui	cringe dz-substitution (Rule 3)
+wá	dropped	quá	cringe w-substitution (Rule 3)
+qá	dropped	quá	cringe q-substitution (Rule 3)
+thui	dropped	thôi	cringe eye-dialect (Rule 3)
+nhìu	dropped	nhiều	cringe eye-dialect (Rule 3)
+zê	dropped	vui (vê)	cringe z-substitution (Rule 3)
+jz	dropped	vậy / gì z	cringe j/z-substitution (Rule 3)
+trk	dropped	trước	duplicate of trc; lower usage
+nta	dropped	người ta	duplicate of ngta; lower usage
+mih	dropped	mình	duplicate of mk; lower usage
+kcg	dropped	không có gì	duplicate of kcj; lower usage
+bjh	dropped	bây giờ	duplicate of bh/bjo; lower usage
+dth	dropped	điện thoại / dễ thương (ViSoLex: dễ thương)	below usage bar + 2-way
+đth	dropped	điện thoại	duplicate of sdt family; below usage bar
+gt	dropped	giới thiệu	corpus-clean but below usage bar (lean dict)
+pv	dropped	phỏng vấn	corpus-clean but below usage bar (lean dict)
+yk	dropped	ý kiến	below usage bar (lean dict)
+stk	dropped	số tài khoản	corpus-clean but below usage bar (lean dict)
+tkb	dropped	thời khóa biểu	student-niche; below usage bar (lean dict)
+gvcn	dropped	giáo viên chủ nhiệm	school-niche; below usage bar (lean dict)
+thpt	dropped	trung học phổ thông	school-niche; below usage bar (lean dict)
+thcs	dropped	trung học cơ sở	school-niche; below usage bar (lean dict)
+cmnd	dropped	chứng minh nhân dân	official form jargon; below usage bar
+cccd	dropped	căn cước công dân	official form jargon; below usage bar
+gpkd	dropped	giấy phép kinh doanh	business jargon; below usage bar
+hdsd	dropped	hướng dẫn sử dụng	manual jargon; below usage bar
+qtv	dropped	quản trị viên	forum jargon; below usage bar
+bds	dropped	bất động sản	seller jargon; below usage bar
+xly	dropped	xử lý	work jargon; below usage bar
+qd	dropped	quyết định	below usage bar; same for qđ
+qg	dropped	quốc gia	below usage bar
+cq	dropped	cơ quan	below usage bar
+gđ	dropped	gia đình	ASCII form gd is ambiguous; marked form low usage
+xđ	dropped	xác định	ASCII form xd shielded; marked form low usage

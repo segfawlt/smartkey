@@ -1,0 +1,24 @@
+# SmartKey Spanish Language Rules
+
+capitalize_standalone_i = false
+
+function_words = [
+  "a", "al", "con", "de", "del", "el", "en", "es", "la", "las", "lo", "los",
+  "me", "mi", "no", "o", "para", "por", "que", "se", "sin", "su", "sus", "te",
+  "tu", "un", "una", "y",
+]
+
+[clitics]
+suffixes = []
+prefixes = []
+
+[casing]
+leading_apostrophes = []
+abbreviations = [
+  "sr", "sra", "srta", "dr", "dra", "prof", "etc", "ej", "pág", "págs",
+  "tel", "núm", "aprox", "vol", "cap", "art", "ud", "uds", "vd", "vds",
+]
+exclusions = []
+
+bigram_boosts = []
+replacements = []
