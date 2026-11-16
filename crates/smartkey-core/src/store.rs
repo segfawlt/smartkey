@@ -1555,15 +1555,16 @@ impl RuleStore {
                     return;
                 }
                 let lang = self.active_lang.as_str();
-                if lang != "en"
-                    && self
-                        .compiled
-                        .lang_corrections
-                        .get(lang)
-                        .is_some_and(|m| m.contains_key(&typed_core))
+                if self
+                    .compiled
+                    .lang_corrections
+                    .get(lang)
+                    .is_some_and(|m| m.contains_key(&typed_core))
                 {
                     self.record_rule_hit_by_key(Self::stat_key_fix(lang, &typed_core), now);
-                } else if self.compiled.corrections.contains_key(&typed_core) {
+                } else if (lang == "en" || lang.is_empty())
+                    && self.compiled.corrections.contains_key(&typed_core)
+                {
                     self.record_rule_hit_by_key(Self::stat_key_fix("en", &typed_core), now);
                 }
             }
@@ -4100,20 +4101,23 @@ impl UserRuleView for RuleStore {
 
     fn lookup_correction(&self, typed_lower: &str) -> Option<&str> {
         let lang = self.active_lang.as_str();
-        if lang != "en" {
-            if let Some(target) = self
-                .compiled
-                .lang_corrections
-                .get(lang)
-                .and_then(|m| m.get(typed_lower))
-            {
-                return Some(target.as_str());
-            }
-        }
-        self.compiled
-            .corrections
-            .get(typed_lower)
+        if let Some(target) = self
+            .compiled
+            .lang_corrections
+            .get(lang)
+            .and_then(|m| m.get(typed_lower))
             .map(String::as_str)
+        {
+            return Some(target);
+        }
+        if lang == "en" || lang.is_empty() {
+            self.compiled
+                .corrections
+                .get(typed_lower)
+                .map(String::as_str)
+        } else {
+            None
+        }
     }
 
     fn is_personal_word(&self, lower_word: &str) -> bool {
@@ -4592,5 +4596,42 @@ fomr = \"from\"
         assert!(raw.contains("# keep user header"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lookup_correction_scopes_top_level_table_to_en_and_keeps_snippets_global() {
+        let mut store = RuleStore::in_memory(Preset::Balanced);
+        store.add_correction(&LangId::en(), "r", "or");
+        store.add_correction(&LangId::vi(), "dak", "Đắk");
+        store
+            .add_correction(&LangId("es".to_string()), "xqtypo", "porque");
+        store.set_snippet(";sig", "Best regards").unwrap();
+
+        // Active lang "en" sees top-level [corrections], not [lang.vi.corrections] / [lang.es.corrections]
+        store.set_active_lang(LangId::en());
+        assert_eq!(store.lookup_correction("r"), Some("or"));
+        assert_eq!(store.lookup_correction("dak"), None);
+        assert_eq!(store.lookup_correction("xqtypo"), None);
+        assert_eq!(store.lookup_snippet(";sig"), Some("Best regards"));
+
+        // Empty lang falls back to top-level [corrections]
+        store.set_active_lang(LangId(String::new()));
+        assert_eq!(store.lookup_correction("r"), Some("or"));
+        assert_eq!(store.lookup_correction("dak"), None);
+        assert_eq!(store.lookup_snippet(";sig"), Some("Best regards"));
+
+        // Active lang "vi" sees [lang.vi.corrections] ONLY, never top-level English [corrections]
+        store.set_active_lang(LangId::vi());
+        assert_eq!(store.lookup_correction("r"), None);
+        assert_eq!(store.lookup_correction("dak"), Some("Đắk"));
+        assert_eq!(store.lookup_correction("xqtypo"), None);
+        assert_eq!(store.lookup_snippet(";sig"), Some("Best regards"));
+
+        // Active lang "es" sees [lang.es.corrections] ONLY
+        store.set_active_lang(LangId("es".to_string()));
+        assert_eq!(store.lookup_correction("r"), None);
+        assert_eq!(store.lookup_correction("dak"), None);
+        assert_eq!(store.lookup_correction("xqtypo"), Some("porque"));
+        assert_eq!(store.lookup_snippet(";sig"), Some("Best regards"));
     }
 }

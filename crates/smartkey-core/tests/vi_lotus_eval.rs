@@ -469,3 +469,88 @@ fn test_vi_lotus_sentence_start_english_passthrough_and_surrounding_undo_guard()
     let bs_after_click = session.process_key(&mut engine, KeyInput::BackSpace, 2_050);
     assert_eq!(bs_after_click.action, SessionAction::PassThrough);
 }
+
+#[test]
+fn test_vi_lotus_english_corrections_isolated_while_vi_corrections_and_snippets_work() {
+    let (mut engine, mut session) = make_vi_engine_and_session();
+
+    fn type_direct(
+        session: &mut SmartKeySession,
+        engine: &mut SmartKeyEngine,
+        text: &str,
+    ) -> String {
+        let mut buf = String::new();
+        let mut now_ms = 10_000u64;
+        for ch in text.chars() {
+            now_ms += 30;
+            let key = KeyInput::Char(ch);
+            let out = session.process_key(engine, key, now_ms);
+            apply_key_to_buffer(&mut buf, key, &out.action);
+        }
+        buf
+    }
+
+    // 1. Top-level English `[corrections]` (`r = "or"`) must NOT fire when `lang == "vi"`,
+    //    preserving Vietnamese shorthand `"r"` (*"rồi"*) in both precomposed and Telex flows,
+    //    while still firing normally when switched to `lang == "en"`.
+    engine.store_mut().add_correction(&LangId::en(), "r", "or");
+
+    session.set_lang(LangId::vi());
+    let _ = session.reset(&mut engine);
+    assert_eq!(
+        type_direct(&mut session, &mut engine, "b cứ hỏi "),
+        "b cứ hỏi "
+    );
+    let _ = session.reset(&mut engine);
+    assert_eq!(
+        type_direct(&mut session, &mut engine, "mấy tuần r "),
+        "mấy tuần r "
+    );
+    let _ = session.reset(&mut engine);
+    let (telex_ask, _) = type_sequence(&mut session, &mut engine, "b cuws hoir ");
+    assert_eq!(telex_ask, "b cứ hỏi ");
+    let _ = session.reset(&mut engine);
+    let (telex_weeks, _) = type_sequence(&mut session, &mut engine, "maays tuaanf r ");
+    assert_eq!(telex_weeks, "mấy tuần r ");
+
+    session.set_lang(LangId::en());
+    let _ = session.reset(&mut engine);
+    assert_eq!(type_direct(&mut session, &mut engine, "r "), "or ");
+    let _ = session.reset(&mut engine);
+    assert_eq!(
+        type_direct(&mut session, &mut engine, "this r that "),
+        "this or that "
+    );
+
+    // 2. `[lang.vi.corrections]` fires when `lang == "vi"` and NOT when `lang == "en"`.
+    engine
+        .store_mut()
+        .add_correction(&LangId::vi(), "vntypo", "Việt Nam");
+
+    session.set_lang(LangId::vi());
+    let _ = session.reset(&mut engine);
+    let (vi_corr_buf, _) = type_sequence(&mut session, &mut engine, "vntypo ");
+    assert_eq!(vi_corr_buf, "Việt Nam ");
+
+    session.set_lang(LangId::en());
+    let _ = session.reset(&mut engine);
+    assert_eq!(type_direct(&mut session, &mut engine, "vntypo "), "vntypo ");
+
+    // 3. `[snippets]` remains global across both `"en"` and `"vi"`.
+    engine
+        .store_mut()
+        .set_snippet(";addr", "123 Lê Lợi")
+        .unwrap();
+
+    session.set_lang(LangId::vi());
+    let _ = session.reset(&mut engine);
+    let (vi_snip_buf, _) = type_sequence(&mut session, &mut engine, ";addr ");
+    assert_eq!(vi_snip_buf, "123 Lê Lợi ");
+
+    session.set_lang(LangId::en());
+    let _ = session.reset(&mut engine);
+    assert_eq!(
+        type_direct(&mut session, &mut engine, ";addr "),
+        "123 Lê Lợi "
+    );
+}
