@@ -10,42 +10,23 @@ use serde::{Deserialize, Serialize};
 use crate::keyboard::ascii_letter_mask;
 use crate::types::Dialect;
 
-const RAW_EN_SHORTHAND: &str = include_str!("../../../data/shorthand_en.tsv");
-
-fn en_shorthand_map() -> &'static Vec<(&'static str, &'static str)> {
-    static MAP: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut pairs: Vec<(&'static str, &'static str)> = RAW_EN_SHORTHAND
-            .lines()
-            .filter_map(|line| {
-                let s = line.trim();
-                if s.is_empty() || s.starts_with('#') {
-                    return None;
-                }
-                let mut cols = s.split('\t');
-                let trig = cols.next()?.trim();
-                let exp = cols.next()?.trim();
-                if trig.is_empty() || exp.is_empty() {
-                    return None;
-                }
-                Some((trig, exp))
-            })
-            .collect();
-        pairs.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        pairs.dedup_by(|a, b| a.0 == b.0);
-        pairs
-    })
+#[cfg(feature = "bundled-en")]
+pub(crate) fn bundled_en_lexicon() -> Option<&'static EnglishLexicon> {
+    static BUNDLED_LEX: OnceLock<Option<EnglishLexicon>> = OnceLock::new();
+    BUNDLED_LEX
+        .get_or_init(|| EnglishLexicon::from_bundled().ok())
+        .as_ref()
 }
 
-/// Looks up a curated unambiguous English shorthand auto-expansion (`pls -> please`, `rn -> right now`).
+#[cfg(not(feature = "bundled-en"))]
+pub(crate) fn bundled_en_lexicon() -> Option<&'static EnglishLexicon> {
+    None
+}
+
+/// Looks up a curated unambiguous English shorthand auto-expansion (`pls -> please`, `rn -> right now`)
+/// from the bundled v3 English pack's `SHORTHAND` section.
 pub fn lookup_english_shorthand(lower_word: &str) -> Option<&'static str> {
-    if lower_word.is_empty() {
-        return None;
-    }
-    let map = en_shorthand_map();
-    map.binary_search_by(|(k, _)| (*k).cmp(lower_word))
-        .ok()
-        .map(|idx| map[idx].1)
+    bundled_en_lexicon()?.lookup_shorthand(lower_word)
 }
 
 pub const MAGIC_V1: &[u8; 8] = b"SKDICT01";
@@ -965,10 +946,39 @@ impl EnglishLexicon {
             .is_some_and(|m| self.is_valid_meta(m, dialect))
     }
 
+    /// Returns true if `lower_word` matches `prefix'stem` (or `prefix’stem`) where `prefix` is in
+    /// `rules.clitics.prefixes`, `stem` has at least 2 Unicode chars, and `stem` is valid in `dialect`.
+    #[inline]
+    pub fn is_valid_elided(&self, lower_word: &str, dialect: Dialect) -> bool {
+        let prefixes = &self.rules.clitics.prefixes;
+        if prefixes.is_empty() {
+            return false;
+        }
+        let Some((prefix, stem)) = lower_word
+            .split_once('\'')
+            .or_else(|| lower_word.split_once('’'))
+        else {
+            return false;
+        };
+        prefixes.iter().any(|p| p == prefix)
+            && stem.chars().count() >= 2
+            && self.contains_valid(stem, dialect)
+    }
+
+    #[inline]
+    pub fn contains_valid_or_elided(&self, lower_word: &str, dialect: Dialect) -> bool {
+        self.contains_valid(lower_word, dialect) || self.is_valid_elided(lower_word, dialect)
+    }
+
     #[inline]
     pub fn contains_any_variant(&self, lower_word: &str) -> bool {
         self.lookup_word(lower_word)
             .is_some_and(|m| m.is_valid_for_pack(self.header.variants.len(), Dialect::Mixed))
+    }
+
+    #[inline]
+    pub fn contains_any_variant_or_elided(&self, lower_word: &str) -> bool {
+        self.contains_any_variant(lower_word) || self.is_valid_elided(lower_word, Dialect::Mixed)
     }
 
     #[inline]
@@ -1260,6 +1270,204 @@ pub fn lint_proper_nouns(wordlists: &[&str], proper_nouns_tsv: &str) -> ProperNo
     out
 }
 
+fn load_temp_en_shorthand_tsv() -> Vec<(String, String)> {
+    let candidates = [
+        std::path::PathBuf::from("data/shorthand_en.tsv"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/shorthand_en.tsv"),
+    ];
+    let raw = candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    let mut pairs: Vec<(String, String)> = raw
+        .lines()
+        .filter_map(|line| {
+            let s = line.trim();
+            if s.is_empty() || s.starts_with('#') {
+                return None;
+            }
+            let mut cols = s.split('\t');
+            let trig = cols.next()?.trim();
+            let exp = cols.next()?.trim();
+            if trig.is_empty() || exp.is_empty() {
+                return None;
+            }
+            Some((trig.to_string(), exp.to_string()))
+        })
+        .collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    pairs.dedup_by(|a, b| a.0 == b.0);
+    pairs
+}
+
+fn english_default_rules() -> LanguageRules {
+    let s = |x: &str| x.to_string();
+    let rep = |typed: &str, fix: &str, kind: ReplacementKind| ReplacementRule {
+        typed: typed.to_string(),
+        fix: fix.to_string(),
+        kind,
+    };
+
+    let mut replacements = Vec::new();
+    for (t, f) in [
+        ("im", "I'm"),
+        ("i'm", "I'm"),
+        ("ive", "I've"),
+        ("i've", "I've"),
+        ("i'll", "I'll"),
+        ("i'd", "I'd"),
+        ("dont", "don't"),
+        ("doesnt", "doesn't"),
+        ("didnt", "didn't"),
+        ("cant", "can't"),
+        ("wont", "won't"),
+        ("isnt", "isn't"),
+        ("arent", "aren't"),
+        ("wasnt", "wasn't"),
+        ("werent", "weren't"),
+        ("hasnt", "hasn't"),
+        ("havent", "haven't"),
+        ("hadnt", "hadn't"),
+        ("wouldnt", "wouldn't"),
+        ("couldnt", "couldn't"),
+        ("shouldnt", "shouldn't"),
+        ("mustnt", "mustn't"),
+        ("neednt", "needn't"),
+        ("aint", "ain't"),
+        ("thats", "that's"),
+        ("whats", "what's"),
+        ("theres", "there's"),
+        ("heres", "here's"),
+        ("wheres", "where's"),
+        ("whos", "who's"),
+        ("hows", "how's"),
+        ("youre", "you're"),
+        ("theyre", "they're"),
+        ("youve", "you've"),
+        ("weve", "we've"),
+        ("theyve", "they've"),
+        ("youll", "you'll"),
+        ("they'll", "they'll"),
+        ("theyll", "they'll"),
+        ("youd", "you'd"),
+        ("theyd", "they'd"),
+        ("couldve", "could've"),
+        ("wouldve", "would've"),
+        ("shouldve", "should've"),
+        ("mightve", "might've"),
+        ("mustve", "must've"),
+    ] {
+        replacements.push(rep(t, f, ReplacementKind::Contraction));
+    }
+    for (t, f) in [
+        ("do'nt", "don't"),
+        ("does'nt", "doesn't"),
+        ("did'nt", "didn't"),
+        ("ca'nt", "can't"),
+        ("wo'nt", "won't"),
+        ("is'nt", "isn't"),
+        ("are'nt", "aren't"),
+        ("was'nt", "wasn't"),
+        ("were'nt", "weren't"),
+        ("has'nt", "hasn't"),
+        ("have'nt", "haven't"),
+        ("hav'nt", "haven't"),
+        ("had'nt", "hadn't"),
+        ("would'nt", "wouldn't"),
+        ("could'nt", "couldn't"),
+        ("should'nt", "shouldn't"),
+        ("must'nt", "mustn't"),
+        ("ai'nt", "ain't"),
+    ] {
+        replacements.push(rep(t, f, ReplacementKind::TransposedApostrophe));
+    }
+    for (t, f) in [
+        ("alot", "a lot"),
+        ("aswell", "as well"),
+        ("atleast", "at least"),
+        ("infront", "in front"),
+        ("eachother", "each other"),
+        ("infact", "in fact"),
+        ("incase", "in case"),
+        ("noone", "no one"),
+        ("thankyou", "thank you"),
+    ] {
+        replacements.push(rep(t, f, ReplacementKind::UnmergedCompound));
+    }
+    for (t, f) in [
+        ("preventation", "prevention"),
+        ("apdater", "adapter"),
+        ("apdapter", "adapter"),
+    ] {
+        replacements.push(rep(t, f, ReplacementKind::TypoOverride));
+    }
+
+    LanguageRules {
+        capitalize_standalone_i: true,
+        function_words: [
+            "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "for", "from",
+            "had", "has", "have", "he", "her", "his", "if", "in", "into", "is", "it", "me", "my",
+            "no", "not", "of", "on", "or", "our", "out", "she", "so", "than", "that", "the",
+            "their", "them", "then", "there", "these", "they", "this", "to", "up", "us", "was",
+            "we", "were", "what", "when", "where", "which", "who", "will", "with", "would", "you",
+            "your",
+        ]
+        .into_iter()
+        .map(s)
+        .collect(),
+        clitics: CliticRules {
+            suffixes: ["t", "s", "m", "d", "ll", "ve", "re"]
+                .into_iter()
+                .map(s)
+                .collect(),
+            prefixes: Vec::new(),
+        },
+        casing: CasingRules {
+            leading_apostrophes: [
+                "'em", "'cause", "'til", "'90s", "'80s", "'70s", "'60s", "'round", "'n'", "'tis",
+                "'twas",
+            ]
+            .into_iter()
+            .map(s)
+            .collect(),
+            abbreviations: [
+                "e.g", "eg", "i.e", "ie", "etc", "vs", "mr", "mrs", "ms", "dr", "prof", "inc",
+                "ltd", "jr", "sr", "st", "ave", "approx", "dept", "fig", "vol", "al", "jan",
+                "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+            ]
+            .into_iter()
+            .map(s)
+            .collect(),
+            exclusions: Vec::new(),
+        },
+        bigram_boosts: [
+            ("over", "there", 248),
+            ("out", "there", 245),
+            ("right", "there", 245),
+            ("up", "there", 242),
+            ("down", "there", 242),
+            ("in", "their", 248),
+            ("of", "their", 245),
+            ("for", "their", 242),
+            ("with", "their", 242),
+            ("too", "much", 250),
+            ("so", "much", 248),
+            ("very", "much", 248),
+            ("sent", "from", 245),
+            ("away", "from", 245),
+            ("apart", "from", 245),
+        ]
+        .into_iter()
+        .map(|(p, n, score)| BigramBoost {
+            prev: p.to_string(),
+            next: n.to_string(),
+            score,
+        })
+        .collect(),
+        replacements,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compile_skdict_from_sources(
     en_us_combined: &str,
@@ -1412,7 +1620,8 @@ pub fn compile_skdict_from_sources(
 
     // Also shield all English shorthand triggers (`shorthand_en.tsv`) so that if `expand_shorthand = false`
     // or a shorthand pair is in `blocklist`, the trigger remains shielded as a valid word.
-    for &(trig, _) in en_shorthand_map() {
+    let shorthand_pairs = load_temp_en_shorthand_tsv();
+    for (trig, _) in &shorthand_pairs {
         let lower = trig.to_lowercase();
         let entry = words.entry(lower).or_default();
         entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_SHIELD;
@@ -1554,14 +1763,15 @@ pub fn compile_skdict_from_sources(
         typos_map.insert(typo, targets.join("\n"));
     }
 
+    let en_rules = english_default_rules();
+
     // Curated morphological & motor overrides where upstream `crate-ci/typos` has wrong/missing mappings
-    let curated_typo_overrides: &[(&str, &str)] = &[
-        ("preventation", "prevention"),
-        ("apdater", "adapter"),
-        ("apdapter", "adapter"),
-    ];
-    for &(bad, good) in curated_typo_overrides {
-        typos_map.insert(bad.to_string(), good.to_string());
+    for r in en_rules
+        .replacements
+        .iter()
+        .filter(|r| r.kind == ReplacementKind::TypoOverride)
+    {
+        typos_map.insert(r.typed.clone(), r.fix.clone());
     }
 
     let mut typos_builder = MapBuilder::memory();
@@ -1620,27 +1830,10 @@ pub fn compile_skdict_from_sources(
     }
 
     // Curated spoken/chat locative & grammar disambiguators where raw web 2-grams have right-context bias
-    let curated_boosts: &[(&str, &str, u8)] = &[
-        ("over", "there", 248),
-        ("out", "there", 245),
-        ("right", "there", 245),
-        ("up", "there", 242),
-        ("down", "there", 242),
-        ("in", "their", 248),
-        ("of", "their", 245),
-        ("for", "their", 242),
-        ("with", "their", 242),
-        ("too", "much", 250),
-        ("so", "much", 248),
-        ("very", "much", 248),
-        ("sent", "from", 245),
-        ("away", "from", 245),
-        ("apart", "from", 245),
-    ];
-    for &(p, n, sc) in curated_boosts {
-        if let (Some(&pid), Some(&nid)) = (word_ids.get(p), word_ids.get(n)) {
+    for b in &en_rules.bigram_boosts {
+        if let (Some(&pid), Some(&nid)) = (word_ids.get(&b.prev), word_ids.get(&b.next)) {
             let key = ((pid as u32) << 16) | (nid as u32);
-            bigram_map.insert(key, sc);
+            bigram_map.insert(key, b.score);
         }
     }
 
@@ -1670,9 +1863,9 @@ pub fn compile_skdict_from_sources(
         bigrams: &bigram_map,
         smash_entries: &smash_entries,
         proper_nouns: &proper_nouns,
-        shorthand: &[],
+        shorthand: &shorthand_pairs,
         slang_set: &[],
-        rules: None,
+        rules: Some(&en_rules),
         syllable_dict: &[],
         source_manifest: &[],
     })

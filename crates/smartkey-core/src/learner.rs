@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::casing::is_expressive_stretch;
 use crate::keyboard::damerau_levenshtein_chars;
 use crate::lexicon::EnglishLexicon;
-use crate::scorer::{is_staged_rejection_pair, UserRuleView};
+use crate::scorer::{is_staged_rejection_pair_for, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::LangId;
 
@@ -162,11 +162,12 @@ const CONTRACTION_REJECT_STALE_AFTER_ACCEPTS: u32 = 10;
 /// Returns `true` when the pair is (now) permanently blocked.
 fn reject_pair_permanently(
     store: &mut RuleStore,
+    lexicon: Option<&EnglishLexicon>,
     lang: &LangId,
     typed_lower: &str,
     rejected_lower: &str,
 ) -> bool {
-    if is_staged_rejection_pair(typed_lower, rejected_lower) {
+    if is_staged_rejection_pair_for(lexicon, lang.as_str(), typed_lower, rejected_lower) {
         let key = format!("{}:{}->{}", lang.as_str(), typed_lower, rejected_lower);
         store.sync_state_before_write();
         let applied_now = store
@@ -206,7 +207,13 @@ fn reject_pair_permanently(
 /// always outrank earlier — possibly accidental — rejections; without this, a stale block both
 /// shadows the graduated correction in the scorer and makes the next `add_permanent_block`
 /// erase it again, deadlocking recovery by typing.
-fn clear_pair_rejection(store: &mut RuleStore, lang: &LangId, typed_lower: &str, fixed: &str) {
+fn clear_pair_rejection(
+    store: &mut RuleStore,
+    lexicon: Option<&EnglishLexicon>,
+    lang: &LangId,
+    typed_lower: &str,
+    fixed: &str,
+) {
     let _ = store.remove_blocklist_pair(typed_lower, fixed);
     let key = format!(
         "{}:{}->{}",
@@ -217,7 +224,7 @@ fn clear_pair_rejection(store: &mut RuleStore, lang: &LangId, typed_lower: &str,
     let state = store.state_mut();
     state.staged_contraction_reject_applied_at.remove(&key);
     if state.staged_contraction_rejects.remove(&key).is_some()
-        || is_staged_rejection_pair(typed_lower, &fixed.to_lowercase())
+        || is_staged_rejection_pair_for(lexicon, lang.as_str(), typed_lower, &fixed.to_lowercase())
     {
         // The 2x-blocked path leaves a persisted undo-keep key that `is_undo_shielded` reads as a
         // cross-session shield; graduation must lift it too.
@@ -233,6 +240,7 @@ fn clear_pair_rejection(store: &mut RuleStore, lang: &LangId, typed_lower: &str,
 /// - `2x`: Permanently promotes `typed` to `personal_dict` in `rules.toml`.
 pub fn record_undo_keep_verbatim(
     store: &mut RuleStore,
+    lexicon: Option<&EnglishLexicon>,
     lang: &LangId,
     typed_raw: &str,
     rejected: &str,
@@ -250,7 +258,7 @@ pub fn record_undo_keep_verbatim(
     store.add_session_word_shield(&typed_lower);
     store.add_session_pair_block(&typed_lower, &rejected_lower);
     store.sync_state_before_write();
-    if !reject_pair_permanently(store, lang, &typed_lower, &rejected_lower) {
+    if !reject_pair_permanently(store, lexicon, lang, &typed_lower, &rejected_lower) {
         // `1x` rejection of a curated contraction pair: session shield only, nothing permanent.
         // Must return BEFORE touching `staged_undo_keep`: `RuleStore::is_undo_shielded` treats any
         // persisted `staged_undo_keep` key for the word as a cross-session shield, which would
@@ -329,7 +337,9 @@ pub fn resolve_restored_edit(
     // Row 2: Kept verbatim (`"hok " -> "hot " -> BS -> "hok "`)
     if final_is_raw {
         store.resolve_pending_undo_log(raw_typed, rejected, UndoResolution::KeptVerbatim);
-        return vec![record_undo_keep_verbatim(store, lang, raw_typed, rejected)];
+        return vec![record_undo_keep_verbatim(
+            store, lexicon, lang, raw_typed, rejected,
+        )];
     }
 
     // Row 1: Deliberately edited to a 3rd word (`"fomr " -> "foam " -> BS -> "form "`).
@@ -358,7 +368,7 @@ pub fn resolve_restored_edit(
     // Curated contraction pairs stage their rejection (`2x` -> permanent); other pairs keep the
     // immediate `1x` block. Editing to a 3rd word (`"dont" -> "don't" -> BS -> "donut "`) is weak
     // evidence against the contraction — it may simply have been a different intended word.
-    let pair_blocked = reject_pair_permanently(store, lang, &raw_lower, &rej_lower);
+    let pair_blocked = reject_pair_permanently(store, lexicon, lang, &raw_lower, &rej_lower);
     let rej_in_lexicon =
         lang.as_str() == "en" && lexicon.is_some_and(|l| l.contains_any_english(&rej_lower));
     if !rej_in_lexicon && store.is_explicit_personal_word(lang, &rej_lower) {
@@ -517,7 +527,18 @@ fn record_manual_edit_inner(
                     *e
                 };
                 if count >= 2 {
-                    clear_pair_rejection(store, &effective_lang, &fixed_lower, fixed_trimmed);
+                    let eff_lex = if effective_lang == *lang {
+                        lexicon
+                    } else {
+                        None
+                    };
+                    clear_pair_rejection(
+                        store,
+                        eff_lex,
+                        &effective_lang,
+                        &fixed_lower,
+                        fixed_trimmed,
+                    );
                     store.state_mut().staged_undo_keep.remove(&format!(
                         "{}:{fixed_lower}->{fixed_lower}",
                         effective_lang.as_str()
@@ -794,7 +815,12 @@ fn record_manual_edit_inner(
             store.add_correction(&effective_lang, &orig_lower, &target_to_save);
             // Graduation is strictly stronger evidence than any earlier rejection of the same
             // pair — clear its blocklist entry so the new rule actually fires.
-            clear_pair_rejection(store, &effective_lang, &orig_lower, &target_to_save);
+            let eff_lex = if effective_lang == *lang {
+                lexicon
+            } else {
+                None
+            };
+            clear_pair_rejection(store, eff_lex, &effective_lang, &orig_lower, &target_to_save);
             let _ = store.flush_state();
             return LearnEvent::GraduatedCorrection {
                 lang: effective_lang.0,
@@ -854,7 +880,12 @@ fn record_manual_edit_inner(
         store.add_context_correction(&prev_lower, &orig_lower, &fixed_lower);
         // Same as the plain graduation above: a stale rejection of this pair must not shadow
         // the newly graduated context correction.
-        clear_pair_rejection(store, &effective_lang, &orig_lower, &fixed_lower);
+        let eff_lex = if effective_lang == *lang {
+            lexicon
+        } else {
+            None
+        };
+        clear_pair_rejection(store, eff_lex, &effective_lang, &orig_lower, &fixed_lower);
         let _ = store.flush_state();
         LearnEvent::GraduatedContextCorrection {
             prev: prev_lower,

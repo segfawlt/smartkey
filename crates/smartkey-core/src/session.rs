@@ -2255,7 +2255,8 @@ impl SmartKeySession {
         engine
             .store
             .log_backspace_undo(raw_typed, rejected, UndoResolution::KeptVerbatim);
-        record_undo_keep_verbatim(&mut engine.store, &self.lang, raw_typed, rejected)
+        let lex = engine.scorer.as_ref().map(|s| s.lexicon());
+        record_undo_keep_verbatim(&mut engine.store, lex, &self.lang, raw_typed, rejected)
     }
 
     /// HeliBoard hook: called when a user reverts an auto-commit and edits/commits `final_word`,
