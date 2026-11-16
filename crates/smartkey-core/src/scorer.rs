@@ -4,7 +4,7 @@ use crate::casing::{analyze_token_with_rules, project_case, TokenAnalysis};
 use crate::keyboard::{
     ascii_letter_mask, damerau_levenshtein_chars, multiset_overlap, weighted_keyboard_cost,
 };
-use crate::lexicon::{EnglishLexicon, ReplacementKind};
+use crate::lexicon::{PackLexicon, ReplacementKind};
 use crate::types::{
     Aggressiveness, AppProfile, Candidate, EvalOutcome, Explanation, MatchKind, ScorerConfig,
 };
@@ -109,7 +109,7 @@ pub fn is_unconditional_contraction_pair(typed_lower: &str, expanded_lower: &str
 /// True when `(typed_lower, rejected_lower)` requires `2x` rejection evidence for the given pack:
 /// curated contractions from `lexicon.rules()` (`dont -> don't`) and case-only corrections (`polish -> Polish`).
 pub fn is_staged_rejection_pair_for(
-    lexicon: Option<&EnglishLexicon>,
+    lexicon: Option<&PackLexicon>,
     lang: &str,
     typed_lower: &str,
     rejected_lower: &str,
@@ -131,22 +131,25 @@ pub fn is_staged_rejection_pair(typed_lower: &str, rejected_lower: &str) -> bool
     typed_lower == rejected_lower || is_unconditional_contraction_pair(typed_lower, rejected_lower)
 }
 
-/// Layer 1 PC-first scorer backed by `EnglishLexicon`.
-pub struct EnglishScorer {
-    lexicon: EnglishLexicon,
+/// Layer 1 PC-first scorer backed by `PackLexicon`.
+pub struct LatinScorer {
+    lexicon: PackLexicon,
 }
 
-impl EnglishScorer {
-    pub fn new(lexicon: EnglishLexicon) -> Self {
+/// Backwards-compatible alias for [`LatinScorer`].
+pub type EnglishScorer = LatinScorer;
+
+impl LatinScorer {
+    pub fn new(lexicon: PackLexicon) -> Self {
         Self { lexicon }
     }
 
     #[cfg(feature = "bundled-en")]
     pub fn new_bundled() -> Result<Self, crate::lexicon::LexiconError> {
-        Ok(Self::new(EnglishLexicon::from_bundled()?))
+        Ok(Self::new(PackLexicon::from_bundled()?))
     }
 
-    pub fn lexicon(&self) -> &EnglishLexicon {
+    pub fn lexicon(&self) -> &PackLexicon {
         &self.lexicon
     }
 
@@ -1269,7 +1272,7 @@ impl EnglishScorer {
     }
 }
 
-impl LanguageScorer for EnglishScorer {
+impl LanguageScorer for LatinScorer {
     fn evaluate(
         &self,
         token: &str,
@@ -1377,7 +1380,7 @@ mod tests {
         proper_nouns: &[(&str, &str)],
         shorthand: &[(&str, &str)],
         rules: LanguageRules,
-    ) -> EnglishLexicon {
+    ) -> PackLexicon {
         let mut sorted_words = words.to_vec();
         sorted_words.sort_by(|a, b| a.0.cmp(b.0));
         let mut wb = MapBuilder::memory();
@@ -1421,7 +1424,7 @@ mod tests {
             syllable_dict: &[],
             source_manifest: &[],
         });
-        EnglishLexicon::from_owned_bytes(bytes).expect("valid synthetic v3 pack")
+        PackLexicon::from_owned_bytes(bytes).expect("valid synthetic v3 pack")
     }
 
     #[test]
@@ -1442,7 +1445,7 @@ mod tests {
             &[("xq", "porque")],
             LanguageRules::default(),
         );
-        let scorer = EnglishScorer::new(lex);
+        let scorer = LatinScorer::new(lex);
         let cfg = ScorerConfig::default();
         let ctx = EvalContext::default();
 
@@ -1492,7 +1495,7 @@ mod tests {
             &[],
             LanguageRules::default(),
         );
-        let scorer = EnglishScorer::new(lex);
+        let scorer = LatinScorer::new(lex);
         let cfg = ScorerConfig::default();
         let ctx = EvalContext::default();
 
@@ -1570,7 +1573,7 @@ mod tests {
                 ..LanguageRules::default()
             },
         );
-        let scorer = EnglishScorer::new(lex);
+        let scorer = LatinScorer::new(lex);
         let cfg = ScorerConfig::default();
         let ctx = EvalContext::default();
 
@@ -1616,7 +1619,7 @@ mod tests {
                 ..LanguageRules::default()
             },
         );
-        let scorer = EnglishScorer::new(lex);
+        let scorer = LatinScorer::new(lex);
         let cfg = ScorerConfig {
             auto_capitalize_i: true,
             ..ScorerConfig::default()

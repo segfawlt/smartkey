@@ -2,7 +2,9 @@ use std::fs;
 use std::path::Path;
 
 use smartkey_core::{
-    Dialect, EmptyUserRules, EnglishScorer, EvalContext, EvalOutcome, LanguageScorer, ScorerConfig,
+    build_pack_from_dir, sha256_hex, Dialect, EmptyUserRules, EnglishLexicon, EnglishScorer,
+    EvalContext, EvalOutcome, LanguageScorer, LatinScorer, MatchKind, PackBuildOptions,
+    PackLexicon, ScorerConfig,
 };
 
 #[test]
@@ -13,7 +15,7 @@ fn golden_corpus_must_fix_and_zero_false_positives() {
         .parent()
         .unwrap();
 
-    let scorer = EnglishScorer::new_bundled().expect("bundled English lexicon must load");
+    let scorer = LatinScorer::new_bundled().expect("bundled English lexicon must load");
     let config = ScorerConfig::default();
 
     // 1. Hard 0% false-positive gate (`must_not_touch.txt`)
@@ -101,7 +103,7 @@ fn golden_corpus_must_fix_and_zero_false_positives() {
 
 #[test]
 fn dialect_modes_mixed_us_and_gb_work() {
-    let scorer = EnglishScorer::new_bundled().expect("bundled English lexicon must load");
+    let scorer = LatinScorer::new_bundled().expect("bundled English lexicon must load");
     let ctx = EvalContext::default();
 
     // Mixed: both `colour` and `color` stay untouched; typo `beahviour` outputs US `behavior`
@@ -152,7 +154,7 @@ fn dialect_modes_mixed_us_and_gb_work() {
 
 #[test]
 fn shorthand_toggle_and_slang_zero_fuzzy_pollution() {
-    let scorer = EnglishScorer::new_bundled().expect("bundled English lexicon must load");
+    let scorer = LatinScorer::new_bundled().expect("bundled English lexicon must load");
     let ctx = EvalContext::default();
 
     // When `expand_shorthand = false`, shorthand triggers are still shielded as valid tokens
@@ -195,7 +197,7 @@ fn step5a_curated_typos_enforce_metadata_and_dialects_stay_green() {
         .unwrap()
         .parent()
         .unwrap();
-    let scorer = EnglishScorer::new_bundled().expect("bundled English lexicon must load");
+    let scorer = LatinScorer::new_bundled().expect("bundled English lexicon must load");
 
     // Verify `must_not_touch.txt` and `must_fix.tsv` remain 100% intact across `EnUs` and `EnGb`
     // (allowing the intentional cross-dialect spelling normalizations in each strict dialect).
@@ -274,18 +276,34 @@ fn step5a_curated_typos_enforce_metadata_and_dialects_stay_green() {
     }
 
     // Synthetic lexicon proving Step 5a skips offensive, zero-freq slang, wrong-dialect, and missing words:
-    let bytes = smartkey_core::compile_skdict_from_sources(
-        " word=cleanword,f=180\n word=badword,f=180,possibly_offensive=true\n",
-        " word=brituk,f=210\n",
-        "",
-        "slangzero\n",
-        "",
-        "clenaword,cleanword\nbadwrod,badword\nbirktu,brituk\nslngzero,slangzero\nmisswrod,nonexistentword\n",
-        "{}",
-        "",
+    let tmp_dir = std::env::temp_dir().join(format!("smartkey_syn_pack_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).unwrap();
+    let en_us = " word=cleanword,f=180\n word=badword,f=180,possibly_offensive=true\n";
+    let en_gb = " word=brituk,f=210\n";
+    let typos = "clenaword,cleanword\nbadwrod,badword\nbirktu,brituk\nslngzero,slangzero\nmisswrod,nonexistentword\n";
+    fs::write(tmp_dir.join("us.combined"), en_us).unwrap();
+    fs::write(tmp_dir.join("gb.combined"), en_gb).unwrap();
+    fs::write(tmp_dir.join("typos.csv"), typos).unwrap();
+    fs::write(tmp_dir.join("slang.txt"), "slangzero\n").unwrap();
+    let pack_toml = format!(
+        "[pack]\ncode = \"en\"\nversion = \"0.3.0\"\nformat_version = 3\ntier = \"data\"\nlicense = \"GPL-3.0-or-later\"\n\n\
+         [variants.en_US]\nfreq_slot = 0\ndefault = true\n\n\
+         [variants.en_GB]\nfreq_slot = 1\n\n\
+         [sources.en_us]\nformat = \"aosp_combined\"\npath = \"us.combined\"\nsha256 = \"{}\"\nlicense = \"Apache-2.0\"\nvariants = [\"en_US\"]\n\n\
+         [sources.en_gb]\nformat = \"aosp_combined\"\npath = \"gb.combined\"\nsha256 = \"{}\"\nlicense = \"Apache-2.0\"\nvariants = [\"en_GB\"]\n\n\
+         [sources.typos]\nformat = \"typos_csv\"\npath = \"typos.csv\"\nsha256 = \"{}\"\nlicense = \"MIT\"\n\n\
+         [overlays]\nslang = [\"slang.txt\"]\n",
+        sha256_hex(en_us.as_bytes()),
+        sha256_hex(en_gb.as_bytes()),
+        sha256_hex(typos.as_bytes()),
     );
-    let lex = smartkey_core::EnglishLexicon::from_owned_bytes(bytes).unwrap();
-    let syn_scorer = EnglishScorer::new(lex);
+    fs::write(tmp_dir.join("pack.toml"), pack_toml).unwrap();
+    let built = build_pack_from_dir(&tmp_dir, &PackBuildOptions::default()).unwrap();
+    let _ = fs::remove_dir_all(&tmp_dir);
+
+    let lex = PackLexicon::from_owned_bytes(built.bytes).unwrap();
+    let syn_scorer = LatinScorer::new(lex);
     let us_cfg = ScorerConfig {
         dialect: Dialect::EnUs,
         ..ScorerConfig::default()
@@ -312,5 +330,165 @@ fn step5a_curated_typos_enforce_metadata_and_dialects_stay_green() {
             ),
             "Step 5a must never propose {blocked:?} under EnUs"
         );
+    }
+}
+
+#[test]
+fn polish_and_latin_homographs_stay_unchanged_while_english_capitalizes() {
+    // Also exercise backwards-compat `EnglishScorer` / `EnglishLexicon` type aliases.
+    let scorer: EnglishScorer = EnglishScorer::new_bundled().expect("bundled English pack loads");
+    let _: &EnglishLexicon = scorer.lexicon();
+    let ctx = EvalContext::default();
+    let cfg = ScorerConfig::default();
+
+    for word in ["polish", "latin", "Polish", "Latin"] {
+        assert_eq!(
+            scorer.evaluate(word, &ctx, &cfg, &EmptyUserRules),
+            EvalOutcome::Unchanged {
+                reason: MatchKind::ValidWord,
+                do_not_learn: true,
+            },
+            "expected {word:?} to remain Unchanged(ValidWord)"
+        );
+    }
+
+    assert_eq!(
+        scorer.evaluate("english", &ctx, &cfg, &EmptyUserRules),
+        EvalOutcome::Autocorrect {
+            replacement: "English".to_string(),
+            kind: MatchKind::ProperNoun,
+            score: 4.5,
+            margin: 4.5,
+        }
+    );
+}
+
+#[test]
+fn compiled_es_and_fr_packs_pass_corpus_smash_ascii_lowercase_i_and_elisions() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let cache_dir = root.join("data/sources");
+    if !cache_dir.join("es/es_wordlist.combined").is_file()
+        || !cache_dir.join("fr/fr_wordlist.combined").is_file()
+    {
+        eprintln!(
+            "skipping compiled_es_and_fr_packs test: cached sources not present in {}",
+            cache_dir.display()
+        );
+        return;
+    }
+
+    let cfg = ScorerConfig::default();
+
+    for lang in ["es", "fr"] {
+        let pack_dir = root.join("dicts").join(lang);
+        let built = build_pack_from_dir(
+            &pack_dir,
+            &PackBuildOptions {
+                sources_cache_dir: Some(&cache_dir),
+                ..PackBuildOptions::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("build-pack {lang} failed: {e}"));
+
+        let lex = PackLexicon::from_owned_bytes(built.bytes)
+            .unwrap_or_else(|e| panic!("load {lang} pack failed: {e}"));
+
+        assert!(
+            lex.smash_entries().iter().all(|e| e.word.is_ascii()),
+            "{lang} SMASH_INDEX must contain ASCII-only words"
+        );
+
+        let scorer = LatinScorer::new(lex);
+
+        // `capitalize_standalone_i = false`: lowercase `"i"` stays untouched!
+        assert!(
+            matches!(
+                scorer.evaluate("i", &EvalContext::default(), &cfg, &EmptyUserRules),
+                EvalOutcome::Unchanged { .. }
+            ),
+            "{lang} must leave standalone lowercase 'i' unchanged"
+        );
+
+        // Evaluate `must_not_touch.txt`
+        let must_not = fs::read_to_string(root.join("tests/corpus").join(lang).join("must_not_touch.txt"))
+            .unwrap();
+        for (idx, line) in must_not.lines().enumerate() {
+            let tok = line.trim();
+            if tok.is_empty() || tok.starts_with('#') {
+                continue;
+            }
+            let out = scorer.evaluate(tok, &EvalContext::default(), &cfg, &EmptyUserRules);
+            assert!(
+                matches!(out, EvalOutcome::Unchanged { .. }),
+                "{lang} must_not_touch line {}: {tok:?} changed to {out:?}",
+                idx + 1
+            );
+        }
+
+        // Evaluate `must_fix.tsv`
+        let must_fix = fs::read_to_string(root.join("tests/corpus").join(lang).join("must_fix.tsv"))
+            .unwrap();
+        for (idx, line) in must_fix.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let cols: Vec<&str> = trimmed.split('\t').collect();
+            let prev_col = cols[0].trim();
+            let typed = cols[1].trim();
+            let punct_col = cols[2].trim();
+            let expected = cols[3].trim();
+            let ctx = EvalContext {
+                prev_word: if prev_col == "-" || prev_col == "^" {
+                    None
+                } else {
+                    Some(prev_col)
+                },
+                boundary_punct: if punct_col == "-" {
+                    None
+                } else {
+                    punct_col.chars().next()
+                },
+                at_sentence_start: prev_col == "^",
+                ..EvalContext::default()
+            };
+            let out = scorer.evaluate(typed, &ctx, &cfg, &EmptyUserRules);
+            let actual = match &out {
+                EvalOutcome::Autocorrect { replacement, .. } => replacement.as_str(),
+                EvalOutcome::Unchanged { .. } => typed,
+            };
+            assert_eq!(
+                actual,
+                expected,
+                "{lang} must_fix line {}: {typed:?}",
+                idx + 1
+            );
+        }
+
+        if lang == "es" {
+            for w in ["canción", "español", "también", "pingüino"] {
+                assert!(scorer.lexicon().contains_valid(w, Dialect::Mixed));
+            }
+        }
+        if lang == "fr" {
+            for w in ["français", "être", "cœur", "noël"] {
+                assert!(scorer.lexicon().contains_valid(w, Dialect::Mixed));
+            }
+            for elided in ["l'homme", "qu'il", "d'accord", "c'est", "lorsqu'arrive", "puisqu'existe"]
+            {
+                assert_eq!(
+                    scorer.evaluate(elided, &EvalContext::default(), &cfg, &EmptyUserRules),
+                    EvalOutcome::Unchanged {
+                        reason: MatchKind::ValidWord,
+                        do_not_learn: true,
+                    },
+                    "expected French elision shield for {elided:?}"
+                );
+            }
+        }
     }
 }

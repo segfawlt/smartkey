@@ -11,15 +11,15 @@ use crate::keyboard::ascii_letter_mask;
 use crate::types::Dialect;
 
 #[cfg(feature = "bundled-en")]
-pub(crate) fn bundled_en_lexicon() -> Option<&'static EnglishLexicon> {
-    static BUNDLED_LEX: OnceLock<Option<EnglishLexicon>> = OnceLock::new();
+pub(crate) fn bundled_en_lexicon() -> Option<&'static PackLexicon> {
+    static BUNDLED_LEX: OnceLock<Option<PackLexicon>> = OnceLock::new();
     BUNDLED_LEX
-        .get_or_init(|| EnglishLexicon::from_bundled().ok())
+        .get_or_init(|| PackLexicon::from_bundled().ok())
         .as_ref()
 }
 
 #[cfg(not(feature = "bundled-en"))]
-pub(crate) fn bundled_en_lexicon() -> Option<&'static EnglishLexicon> {
+pub(crate) fn bundled_en_lexicon() -> Option<&'static PackLexicon> {
     None
 }
 
@@ -549,7 +549,7 @@ pub fn peek_skdict_header_and_manifest(
 }
 
 /// Loaded language pack lexicon, known-smash table, variant rewriter, and bigram scorer.
-pub struct EnglishLexicon {
+pub struct PackLexicon {
     header: PackHeader,
     words_fst: Map<Cow<'static, [u8]>>,
     typos_fst: Map<Cow<'static, [u8]>>,
@@ -568,6 +568,9 @@ pub struct EnglishLexicon {
     lev2: LevenshteinAutomatonBuilder,
 }
 
+/// Backwards-compatible alias for [`PackLexicon`].
+pub type EnglishLexicon = PackLexicon;
+
 struct ParsedSections {
     header: PackHeader,
     wf_range: Option<(usize, usize)>,
@@ -585,7 +588,7 @@ struct ParsedSections {
     source_manifest: Vec<SourceManifestEntry>,
 }
 
-impl EnglishLexicon {
+impl PackLexicon {
     /// Loads the bundled English `.skdict` dictionary when compiled with `feature = "bundled-en"`.
     #[cfg(feature = "bundled-en")]
     pub fn from_bundled() -> Result<Self, LexiconError> {
@@ -1270,607 +1273,6 @@ pub fn lint_proper_nouns(wordlists: &[&str], proper_nouns_tsv: &str) -> ProperNo
     out
 }
 
-fn load_temp_en_shorthand_tsv() -> Vec<(String, String)> {
-    let candidates = [
-        std::path::PathBuf::from("data/shorthand_en.tsv"),
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/shorthand_en.tsv"),
-    ];
-    let raw = candidates
-        .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
-    let mut pairs: Vec<(String, String)> = raw
-        .lines()
-        .filter_map(|line| {
-            let s = line.trim();
-            if s.is_empty() || s.starts_with('#') {
-                return None;
-            }
-            let mut cols = s.split('\t');
-            let trig = cols.next()?.trim();
-            let exp = cols.next()?.trim();
-            if trig.is_empty() || exp.is_empty() {
-                return None;
-            }
-            Some((trig.to_string(), exp.to_string()))
-        })
-        .collect();
-    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    pairs.dedup_by(|a, b| a.0 == b.0);
-    pairs
-}
-
-fn english_default_rules() -> LanguageRules {
-    let s = |x: &str| x.to_string();
-    let rep = |typed: &str, fix: &str, kind: ReplacementKind| ReplacementRule {
-        typed: typed.to_string(),
-        fix: fix.to_string(),
-        kind,
-    };
-
-    let mut replacements = Vec::new();
-    for (t, f) in [
-        ("im", "I'm"),
-        ("i'm", "I'm"),
-        ("ive", "I've"),
-        ("i've", "I've"),
-        ("i'll", "I'll"),
-        ("i'd", "I'd"),
-        ("dont", "don't"),
-        ("doesnt", "doesn't"),
-        ("didnt", "didn't"),
-        ("cant", "can't"),
-        ("wont", "won't"),
-        ("isnt", "isn't"),
-        ("arent", "aren't"),
-        ("wasnt", "wasn't"),
-        ("werent", "weren't"),
-        ("hasnt", "hasn't"),
-        ("havent", "haven't"),
-        ("hadnt", "hadn't"),
-        ("wouldnt", "wouldn't"),
-        ("couldnt", "couldn't"),
-        ("shouldnt", "shouldn't"),
-        ("mustnt", "mustn't"),
-        ("neednt", "needn't"),
-        ("aint", "ain't"),
-        ("thats", "that's"),
-        ("whats", "what's"),
-        ("theres", "there's"),
-        ("heres", "here's"),
-        ("wheres", "where's"),
-        ("whos", "who's"),
-        ("hows", "how's"),
-        ("youre", "you're"),
-        ("theyre", "they're"),
-        ("youve", "you've"),
-        ("weve", "we've"),
-        ("theyve", "they've"),
-        ("youll", "you'll"),
-        ("they'll", "they'll"),
-        ("theyll", "they'll"),
-        ("youd", "you'd"),
-        ("theyd", "they'd"),
-        ("couldve", "could've"),
-        ("wouldve", "would've"),
-        ("shouldve", "should've"),
-        ("mightve", "might've"),
-        ("mustve", "must've"),
-    ] {
-        replacements.push(rep(t, f, ReplacementKind::Contraction));
-    }
-    for (t, f) in [
-        ("do'nt", "don't"),
-        ("does'nt", "doesn't"),
-        ("did'nt", "didn't"),
-        ("ca'nt", "can't"),
-        ("wo'nt", "won't"),
-        ("is'nt", "isn't"),
-        ("are'nt", "aren't"),
-        ("was'nt", "wasn't"),
-        ("were'nt", "weren't"),
-        ("has'nt", "hasn't"),
-        ("have'nt", "haven't"),
-        ("hav'nt", "haven't"),
-        ("had'nt", "hadn't"),
-        ("would'nt", "wouldn't"),
-        ("could'nt", "couldn't"),
-        ("should'nt", "shouldn't"),
-        ("must'nt", "mustn't"),
-        ("ai'nt", "ain't"),
-    ] {
-        replacements.push(rep(t, f, ReplacementKind::TransposedApostrophe));
-    }
-    for (t, f) in [
-        ("alot", "a lot"),
-        ("aswell", "as well"),
-        ("atleast", "at least"),
-        ("infront", "in front"),
-        ("eachother", "each other"),
-        ("infact", "in fact"),
-        ("incase", "in case"),
-        ("noone", "no one"),
-        ("thankyou", "thank you"),
-    ] {
-        replacements.push(rep(t, f, ReplacementKind::UnmergedCompound));
-    }
-    for (t, f) in [
-        ("preventation", "prevention"),
-        ("apdater", "adapter"),
-        ("apdapter", "adapter"),
-    ] {
-        replacements.push(rep(t, f, ReplacementKind::TypoOverride));
-    }
-
-    LanguageRules {
-        capitalize_standalone_i: true,
-        function_words: [
-            "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "for", "from",
-            "had", "has", "have", "he", "her", "his", "if", "in", "into", "is", "it", "me", "my",
-            "no", "not", "of", "on", "or", "our", "out", "she", "so", "than", "that", "the",
-            "their", "them", "then", "there", "these", "they", "this", "to", "up", "us", "was",
-            "we", "were", "what", "when", "where", "which", "who", "will", "with", "would", "you",
-            "your",
-        ]
-        .into_iter()
-        .map(s)
-        .collect(),
-        clitics: CliticRules {
-            suffixes: ["t", "s", "m", "d", "ll", "ve", "re"]
-                .into_iter()
-                .map(s)
-                .collect(),
-            prefixes: Vec::new(),
-        },
-        casing: CasingRules {
-            leading_apostrophes: [
-                "'em", "'cause", "'til", "'90s", "'80s", "'70s", "'60s", "'round", "'n'", "'tis",
-                "'twas",
-            ]
-            .into_iter()
-            .map(s)
-            .collect(),
-            abbreviations: [
-                "e.g", "eg", "i.e", "ie", "etc", "vs", "mr", "mrs", "ms", "dr", "prof", "inc",
-                "ltd", "jr", "sr", "st", "ave", "approx", "dept", "fig", "vol", "al", "jan",
-                "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
-            ]
-            .into_iter()
-            .map(s)
-            .collect(),
-            exclusions: Vec::new(),
-        },
-        bigram_boosts: [
-            ("over", "there", 248),
-            ("out", "there", 245),
-            ("right", "there", 245),
-            ("up", "there", 242),
-            ("down", "there", 242),
-            ("in", "their", 248),
-            ("of", "their", 245),
-            ("for", "their", 242),
-            ("with", "their", 242),
-            ("too", "much", 250),
-            ("so", "much", 248),
-            ("very", "much", 248),
-            ("sent", "from", 245),
-            ("away", "from", 245),
-            ("apart", "from", 245),
-        ]
-        .into_iter()
-        .map(|(p, n, score)| BigramBoost {
-            prev: p.to_string(),
-            next: n.to_string(),
-            score,
-        })
-        .collect(),
-        replacements,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn compile_skdict_from_sources(
-    en_us_combined: &str,
-    en_gb_combined: &str,
-    dev_terms: &str,
-    slang_terms: &str,
-    proper_nouns_tsv: &str,
-    typos_csv: &str,
-    british_to_american_json: &str,
-    count_2w_tsv: &str,
-) -> Vec<u8> {
-    #[derive(Default, Clone, Copy)]
-    struct RawWord {
-        freq0: u8,
-        freq1: u8,
-        variant_mask: u8,
-        flags: u8,
-    }
-
-    const VAR_US: u8 = 0x01;
-    const VAR_GB: u8 = 0x02;
-
-    let mut words: BTreeMap<String, RawWord> = BTreeMap::new();
-    let mut aosp_bigrams: Vec<(String, String, u8)> = Vec::new();
-
-    let mut parse_aosp = |content: &str, var_bit: u8, capture_bigrams: bool| {
-        let mut current_word: Option<String> = None;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("word=") {
-                current_word = None;
-                let mut raw_w = "";
-                let mut freq: u8 = 0;
-                let mut not_a_word = false;
-                let mut offensive = false;
-                let mut is_abbrev = false;
-
-                for part in rest.split(',') {
-                    if raw_w.is_empty() && !part.contains('=') {
-                        raw_w = part;
-                    } else if let Some(val) = part.strip_prefix("f=") {
-                        freq = val.parse::<u8>().unwrap_or(0);
-                    } else if part == "not_a_word=true" {
-                        not_a_word = true;
-                    } else if part == "possibly_offensive=true" {
-                        offensive = true;
-                    } else if let Some(fl) = part.strip_prefix("flags=") {
-                        if fl.contains("abbreviation") {
-                            is_abbrev = true;
-                        }
-                    }
-                }
-
-                if raw_w.is_empty() || not_a_word {
-                    continue;
-                }
-
-                // Skip ALL_CAPS abbreviations (`NCAA`, `FIFA`, `DVD`) from polluting lowercase typos;
-                // ALL_CAPS user tokens are already bypassed by `casing::analyze_token`.
-                let alpha: Vec<char> = raw_w.chars().filter(|c| c.is_alphabetic()).collect();
-                if alpha.is_empty() {
-                    continue;
-                }
-                if (is_abbrev || alpha.len() >= 2) && alpha.iter().all(|c| c.is_uppercase()) {
-                    continue;
-                }
-
-                // Allow pure lowercase or clean TitleCase (`English`, `Monday`) normalized to lowercase.
-                if !raw_w
-                    .chars()
-                    .all(|c| c.is_alphabetic() || c == '\'' || c == '-')
-                {
-                    continue;
-                }
-                if raw_w.contains('-') {
-                    continue;
-                }
-
-                let lower = raw_w.to_lowercase();
-                let entry = words.entry(lower.clone()).or_default();
-                if offensive || freq == 0 {
-                    entry.flags |= FLAG_OFFENSIVE;
-                } else {
-                    entry.variant_mask |= var_bit;
-                    if var_bit == VAR_US {
-                        entry.freq0 = entry.freq0.max(freq);
-                    } else {
-                        entry.freq1 = entry.freq1.max(freq);
-                    }
-                    if capture_bigrams {
-                        current_word = Some(lower);
-                    }
-                }
-            } else if capture_bigrams {
-                if let (Some(prev), Some(rest)) =
-                    (current_word.as_ref(), trimmed.strip_prefix("bigram="))
-                {
-                    let mut target = "";
-                    let mut rank: u8 = 3;
-                    for part in rest.split(',') {
-                        if target.is_empty() && !part.contains('=') {
-                            target = part;
-                        } else if let Some(fval) = part.strip_prefix("f=") {
-                            rank = fval.parse::<u8>().unwrap_or(3);
-                        }
-                    }
-                    if !target.is_empty() {
-                        // Note: in AOSP `.combined`, f=1 is top rank, f=3 is 3rd rank!
-                        let score = match rank {
-                            1 => 210,
-                            2 => 185,
-                            _ => 160,
-                        };
-                        aosp_bigrams.push((prev.clone(), target.to_lowercase(), score));
-                    }
-                }
-            }
-        }
-    };
-
-    parse_aosp(en_us_combined, VAR_US, true);
-    parse_aosp(en_gb_combined, VAR_GB, false);
-
-    // Merge curated developer / Linux / CLI vocabulary shield (`dev_terms.txt`)
-    for line in dev_terms.lines() {
-        let w = line.trim();
-        if w.is_empty() || w.starts_with('#') {
-            continue;
-        }
-        let lower = w.to_lowercase();
-        let entry = words.entry(lower).or_default();
-        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_SHIELD;
-        entry.variant_mask |= VAR_US | VAR_GB;
-        entry.freq0 = entry.freq0.max(172);
-        entry.freq1 = entry.freq1.max(172);
-    }
-
-    // Merge curated internet abbreviations & slang shield (`slang.txt`) as shield-only
-    // (leaving `freq0`/`freq1` untouched so pure slang is never proposed as a fuzzy target).
-    for line in slang_terms.lines() {
-        let w = line.trim();
-        if w.is_empty() || w.starts_with('#') {
-            continue;
-        }
-        let lower = w.to_lowercase();
-        let entry = words.entry(lower).or_default();
-        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_SHIELD;
-        entry.variant_mask |= VAR_US | VAR_GB;
-    }
-
-    // Also shield all English shorthand triggers (`shorthand_en.tsv`) so that if `expand_shorthand = false`
-    // or a shorthand pair is in `blocklist`, the trigger remains shielded as a valid word.
-    let shorthand_pairs = load_temp_en_shorthand_tsv();
-    for (trig, _) in &shorthand_pairs {
-        let lower = trig.to_lowercase();
-        let entry = words.entry(lower).or_default();
-        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_SHIELD;
-        entry.variant_mask |= VAR_US | VAR_GB;
-    }
-
-    // Parse curated unambiguous proper nouns (`proper_nouns.tsv`)
-    let mut proper_nouns: Vec<(String, String)> = Vec::new();
-    for line in proper_nouns_tsv.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (lower, proper) = if let Some((l, p)) = line.split_once('\t') {
-            (l.trim().to_lowercase(), p.trim().to_string())
-        } else {
-            (line.to_lowercase(), line.to_string())
-        };
-        if lower.is_empty() || proper.is_empty() || lower == proper {
-            continue;
-        }
-        let entry = words.entry(lower.clone()).or_default();
-        entry.flags &= !FLAG_OFFENSIVE;
-        entry.variant_mask |= VAR_US | VAR_GB;
-        entry.freq0 = entry.freq0.max(160);
-        entry.freq1 = entry.freq1.max(160);
-
-        proper_nouns.push((lower, proper));
-    }
-    proper_nouns.sort_unstable();
-    proper_nouns.dedup_by(|a, b| a.0 == b.0);
-
-    // Parse UK -> US spelling map (`british_to_american.json`)
-    let raw_uk_map: BTreeMap<String, String> =
-        serde_json::from_str(british_to_american_json).unwrap_or_default();
-    let mut uk_pairs: Vec<(String, String)> = Vec::new();
-    for (uk_raw, us_raw) in raw_uk_map {
-        let uk = uk_raw.to_lowercase();
-        let us = us_raw.to_lowercase();
-        if uk == us || uk.contains(' ') || us.contains(' ') || uk.contains('-') || us.contains('-')
-        {
-            continue;
-        }
-        // Propagate frequencies so both dialect forms are first-class valid words in their dialect
-        let us_f = words.get(&us).map(|w| w.freq0).unwrap_or(0);
-        let gb_f = words.get(&uk).map(|w| w.freq1).unwrap_or(0);
-        let shared_f = us_f.max(gb_f).max(120);
-        {
-            let uk_entry = words.entry(uk.clone()).or_default();
-            uk_entry.variant_mask |= VAR_GB;
-            uk_entry.freq1 = uk_entry.freq1.max(shared_f);
-        }
-        {
-            let us_entry = words.entry(us.clone()).or_default();
-            us_entry.variant_mask |= VAR_US;
-            us_entry.freq0 = us_entry.freq0.max(shared_f);
-        }
-        uk_pairs.push((uk, us));
-    }
-    uk_pairs.sort_unstable();
-    uk_pairs.dedup_by(|a, b| a.0 == b.0);
-
-    let mut us_to_uk_pairs: Vec<(String, String)> = uk_pairs
-        .iter()
-        .map(|(uk, us)| (us.clone(), uk.clone()))
-        .collect();
-    us_to_uk_pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    us_to_uk_pairs.dedup_by(|a, b| a.0 == b.0);
-
-    // Assign `word_id` (`1..=65535`) to the top 65,535 words by max frequency
-    let mut freq_rank: Vec<(&String, u8)> = words
-        .iter()
-        .filter(|(_, m)| (m.flags & FLAG_OFFENSIVE) == 0 && m.freq0.max(m.freq1) > 0)
-        .map(|(w, m)| (w, m.freq0.max(m.freq1)))
-        .collect();
-    freq_rank.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-
-    let mut word_ids: HashMap<String, u16> = HashMap::with_capacity(65535);
-    for (idx, (w, _)) in freq_rank.into_iter().take(65535).enumerate() {
-        word_ids.insert(w.clone(), (idx + 1) as u16);
-    }
-
-    // Build `words_fst` and `smash_entries`
-    let mut words_builder = MapBuilder::memory();
-    let mut smash_entries: Vec<(u32, u8, u8, String)> = Vec::new();
-    for (w, m) in &words {
-        let wid = word_ids.get(w).copied().unwrap_or(0);
-        let meta = WordMeta {
-            freq0: m.freq0,
-            freq1: m.freq1,
-            variant_mask: m.variant_mask,
-            flags: m.flags,
-            word_id: wid,
-        };
-        words_builder.insert(w.as_bytes(), meta.pack()).unwrap();
-
-        let max_f = m.freq0.max(m.freq1);
-        if (m.flags & FLAG_OFFENSIVE) == 0
-            && w.is_ascii()
-            && !w.contains('\'')
-            && (7..=16).contains(&w.len())
-            && max_f >= 105
-        {
-            smash_entries.push((ascii_letter_mask(w), w.len() as u8, max_f, w.clone()));
-        }
-    }
-    let words_fst_bytes = words_builder.into_inner().unwrap();
-
-    // Parse `typos_words.csv` (`crate-ci/typos`), strictly skipping any valid English or tech word!
-    let mut typos_map: BTreeMap<String, String> = BTreeMap::new();
-    for line in typos_csv.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split(',');
-        let Some(raw_typo) = parts.next() else {
-            continue;
-        };
-        let typo = raw_typo.trim().to_lowercase();
-        if typo.len() < 3 || !typo.chars().all(|c| c.is_alphabetic()) {
-            continue;
-        }
-        // NEVER override a valid dictionary/tech/offensive word in the unconditional typo map!
-        if let Some(existing) = words.get(&typo) {
-            if (existing.variant_mask & (VAR_US | VAR_GB)) != 0
-                || (existing.flags & (FLAG_SHIELD | FLAG_OFFENSIVE)) != 0
-            {
-                continue;
-            }
-        }
-        let targets: Vec<&str> = parts
-            .map(str::trim)
-            .filter(|t| !t.is_empty() && !t.contains(' '))
-            .collect();
-        if targets.is_empty() {
-            continue;
-        }
-        typos_map.insert(typo, targets.join("\n"));
-    }
-
-    let en_rules = english_default_rules();
-
-    // Curated morphological & motor overrides where upstream `crate-ci/typos` has wrong/missing mappings
-    for r in en_rules
-        .replacements
-        .iter()
-        .filter(|r| r.kind == ReplacementKind::TypoOverride)
-    {
-        typos_map.insert(r.typed.clone(), r.fix.clone());
-    }
-
-    let mut typos_builder = MapBuilder::memory();
-    let mut typo_pool: Vec<u8> = Vec::new();
-    for (typo, joined_targets) in &typos_map {
-        let offset = typo_pool.len() as u64;
-        let len = joined_targets.len() as u64;
-        typo_pool.extend_from_slice(joined_targets.as_bytes());
-        let packed = offset | (len << 32);
-        typos_builder.insert(typo.as_bytes(), packed).unwrap();
-    }
-    let typos_fst_bytes = typos_builder.into_inner().unwrap();
-
-    // Build calibrated prose bigrams from `count_2w.txt` + AOSP bigrams + locative boosts
-    let mut bigram_map: BTreeMap<u32, u8> = BTreeMap::new();
-
-    for (p, n, sc) in aosp_bigrams {
-        if let (Some(&pid), Some(&nid)) = (word_ids.get(&p), word_ids.get(&n)) {
-            let key = ((pid as u32) << 16) | (nid as u32);
-            let e = bigram_map.entry(key).or_insert(0);
-            *e = (*e).max(sc);
-        }
-    }
-
-    // Parse Norvig `count_2w.txt` (`<w1> <w2>\t<count>`)
-    // Aggregate case-insensitively first so `In their` + `in their` sum cleanly!
-    let mut raw_counts: HashMap<u32, u64> = HashMap::new();
-    for line in count_2w_tsv.lines() {
-        let Some((pair, count_str)) = line.split_once('\t') else {
-            continue;
-        };
-        let Some((w1, w2)) = pair.split_once(' ') else {
-            continue;
-        };
-        let Ok(cnt) = count_str.trim().parse::<u64>() else {
-            continue;
-        };
-        let l1 = w1.to_lowercase();
-        let l2 = w2.to_lowercase();
-        if let (Some(&pid), Some(&nid)) = (word_ids.get(&l1), word_ids.get(&l2)) {
-            let key = ((pid as u32) << 16) | (nid as u32);
-            *raw_counts.entry(key).or_insert(0) += cnt;
-        }
-    }
-
-    // Keep top 90,000 prose bigrams quantized to log-scale `u8` (`80..=255`)
-    let mut ranked_bg: Vec<(u32, u64)> = raw_counts.into_iter().collect();
-    ranked_bg.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
-    for (key, cnt) in ranked_bg.into_iter().take(90_000) {
-        // `cnt` typically ranges from ~80,000 (`ln ≈ 11.3`) to ~1,000,000,000 (`ln ≈ 20.7`)
-        let ln_val = (cnt as f64).ln();
-        let norm = ((ln_val - 10.5) / 10.0).clamp(0.0, 1.0);
-        let q = (80.0 + norm * 175.0).round() as u8;
-        let e = bigram_map.entry(key).or_insert(0);
-        *e = (*e).max(q);
-    }
-
-    // Curated spoken/chat locative & grammar disambiguators where raw web 2-grams have right-context bias
-    for b in &en_rules.bigram_boosts {
-        if let (Some(&pid), Some(&nid)) = (word_ids.get(&b.prev), word_ids.get(&b.next)) {
-            let key = ((pid as u32) << 16) | (nid as u32);
-            bigram_map.insert(key, b.score);
-        }
-    }
-
-    let header = PackHeader {
-        lang: "en".to_string(),
-        pack_version: [0, 3, 0],
-        tier: PackTier::Data,
-        variants: vec!["en_US".to_string(), "en_GB".to_string()],
-        freq_slots: vec![0x01, 0x02],
-        default_variant_idx: 0,
-        feature_flags: 0,
-    };
-    let mut variant_rewrites = Vec::new();
-    if !uk_pairs.is_empty() {
-        variant_rewrites.push((0u8, uk_pairs));
-    }
-    if !us_to_uk_pairs.is_empty() {
-        variant_rewrites.push((1u8, us_to_uk_pairs));
-    }
-
-    serialize_skdict_v3(&SkdictV3Payload {
-        header: &header,
-        words_fst: &words_fst_bytes,
-        typos_fst: &typos_fst_bytes,
-        typo_pool: &typo_pool,
-        variant_rewrites: &variant_rewrites,
-        bigrams: &bigram_map,
-        smash_entries: &smash_entries,
-        proper_nouns: &proper_nouns,
-        shorthand: &shorthand_pairs,
-        slang_set: &[],
-        rules: Some(&en_rules),
-        syllable_dict: &[],
-        source_manifest: &[],
-    })
-}
-
 fn compile_skdict_in_memory(
     words: &[(&str, u8)],
     typos: &[(&str, &str)],
@@ -2201,9 +1603,9 @@ dictionary=main:en_us,locale=en_US
         let (Ok(us), Ok(gb), Ok(tsv)) = (
             std::fs::read_to_string(root.join("data/sources/en_US.combined")),
             std::fs::read_to_string(root.join("data/sources/en_GB.combined")),
-            std::fs::read_to_string(root.join("data/proper_nouns.tsv")),
+            std::fs::read_to_string(root.join("dicts/en/proper_nouns.tsv")),
         ) else {
-            eprintln!("skipping: run scripts/fetch_sources.sh for the AOSP word lists");
+            eprintln!("skipping: run smartkey-dev build-pack en --fetch for the AOSP word lists");
             return;
         };
         let lint = lint_proper_nouns(&[&us, &gb], &tsv);
@@ -2212,6 +1614,23 @@ dictionary=main:en_us,locale=en_US
             "gap < {PROPER_NOUN_MIN_CASE_GAP}: {:?}",
             lint.errors
         );
+
+        for (lang, wl_rel) in [
+            ("es", "data/sources/es/es_wordlist.combined"),
+            ("fr", "data/sources/fr/fr_wordlist.combined"),
+        ] {
+            if let (Ok(wl), Ok(pn)) = (
+                std::fs::read_to_string(root.join(wl_rel)),
+                std::fs::read_to_string(root.join(format!("dicts/{lang}/proper_nouns.tsv"))),
+            ) {
+                let l = lint_proper_nouns(&[&wl], &pn);
+                assert!(
+                    l.errors.is_empty(),
+                    "{lang} proper_nouns gap < {PROPER_NOUN_MIN_CASE_GAP}: {:?}",
+                    l.errors
+                );
+            }
+        }
     }
 
     #[cfg(feature = "bundled-en")]
@@ -2219,7 +1638,7 @@ dictionary=main:en_us,locale=en_US
     fn from_static_bytes_borrows_fst_and_typo_pool_without_copy() {
         use std::borrow::Cow;
         static RAW: &[u8] = include_bytes!("../assets/en_lexicon.skdict");
-        let lex = super::EnglishLexicon::from_static_bytes(RAW).expect("bundled lexicon loads");
+        let lex = super::PackLexicon::from_static_bytes(RAW).expect("bundled lexicon loads");
         let range = RAW.as_ptr_range();
         assert!(matches!(lex.typo_pool, Cow::Borrowed(_)));
         assert!(range.contains(&lex.typo_pool.as_ptr()));
@@ -2242,7 +1661,7 @@ dictionary=main:en_us,locale=en_US
             Err(LexiconError::LegacyFormat(2))
         ));
         assert!(matches!(
-            EnglishLexicon::from_owned_bytes(b"SKDICT02xxxx".to_vec()),
+            PackLexicon::from_owned_bytes(b"SKDICT02xxxx".to_vec()),
             Err(LexiconError::LegacyFormat(2))
         ));
 
@@ -2288,7 +1707,7 @@ dictionary=main:en_us,locale=en_US
             source_manifest: &[],
         });
         assert!(matches!(
-            EnglishLexicon::from_owned_bytes(bad_img),
+            PackLexicon::from_owned_bytes(bad_img),
             Err(LexiconError::CorruptSection("WORDS_FST"))
         ));
 
@@ -2340,7 +1759,7 @@ dictionary=main:en_us,locale=en_US
         assert_eq!(peeked_hdr, es_hdr);
         assert_eq!(peeked_manifest, manifest);
 
-        let lex = EnglishLexicon::from_owned_bytes(img).unwrap();
+        let lex = PackLexicon::from_owned_bytes(img).unwrap();
         assert_eq!(lex.header(), &es_hdr);
         assert!(lex.contains_valid("hola", Dialect::EnGb));
         assert_eq!(

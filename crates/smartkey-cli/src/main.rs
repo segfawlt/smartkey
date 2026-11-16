@@ -9,10 +9,10 @@ use serde::Serialize;
 use smartkey_core::event_log::current_epoch_ms;
 use smartkey_core::{
     apply_key_to_buffer, normalize_program_id, peek_skdict_header_and_manifest, AppProfile,
-    ConfidenceTier, DiagnosticEvent, Dialect, EnglishScorer, EvalContext, EvalOutcome, EventLog,
-    KeyInput, LangId, LexiconError, LoggedDiagnosticRecord, MatchKind, PackHeader, PackTier,
-    Preset, PruneKinds, PruneOptions, RuleStore, SessionAction, SmartKeyEngine, SmartKeySession,
-    UndoResolution,
+    ConfidenceTier, DiagnosticEvent, Dialect, EvalContext, EvalOutcome, EventLog, KeyInput, LangId,
+    LatinScorer, LexiconError, LoggedDiagnosticRecord, MatchKind, PackHeader, PackLexicon,
+    PackTier, Preset, PruneKinds, PruneOptions, RuleStore, SessionAction, SmartKeyEngine,
+    SmartKeySession, UndoResolution,
 };
 
 /// Git state stamped at build time by `build.rs`: HEAD hash or tag (e.g.
@@ -2546,7 +2546,7 @@ fn cmd_explain(args: &[String]) -> CliResult {
         }
     }
     let aggr = engine.store().scorer_config().aggressiveness;
-    let (thresh_score, thresh_margin) = EnglishScorer::thresholds(aggr);
+    let (thresh_score, thresh_margin) = LatinScorer::thresholds(aggr);
     println!(
         "Configuration   : dialect={:?} | aggressiveness={:?} (min_score >= {:.2}, margin >= {:.2})",
         engine.store().scorer_config().dialect,
@@ -2586,7 +2586,7 @@ fn validate_and_install_skdict(
     expected_lang: &str,
 ) -> Result<PackHeader, CliError> {
     let bytes = fs::read(staged_path).map_err(|e| CliError::Runtime(e.to_string()))?;
-    let lex = match smartkey_core::EnglishLexicon::from_owned_bytes(bytes) {
+    let lex = match PackLexicon::from_owned_bytes(bytes) {
         Ok(lex) => lex,
         Err(err) => {
             let _ = fs::remove_file(staged_path);

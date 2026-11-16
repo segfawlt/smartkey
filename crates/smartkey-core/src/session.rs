@@ -8,8 +8,8 @@ use crate::learner::{
     record_manual_edit, record_telex_passthrough_repair, record_undo_keep_verbatim,
     record_untouched_unknown, resolve_restored_edit, LearnEvent,
 };
-use crate::lexicon::{EnglishLexicon, LexiconError, PackTier};
-use crate::scorer::{EnglishScorer, EvalContext, LanguageScorer, UserRuleView};
+use crate::lexicon::{LexiconError, PackLexicon, PackTier};
+use crate::scorer::{EvalContext, LanguageScorer, LatinScorer, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::{
     AppProfile, Candidate, EvalOutcome, Explanation, InputOrigin, LangId, MatchKind,
@@ -17,7 +17,7 @@ use crate::types::{
 
 /// Process-wide registry of loaded `.skdict` v3 packs keyed by language code (`"en"`, `"es"`, ...).
 pub struct LexiconRegistry {
-    packs: BTreeMap<String, EnglishScorer>,
+    packs: BTreeMap<String, LatinScorer>,
     disk_langs: BTreeSet<String>,
 }
 
@@ -93,12 +93,12 @@ impl LexiconRegistry {
                         continue;
                     }
                 };
-                match EnglishLexicon::from_owned_bytes(bytes) {
+                match PackLexicon::from_owned_bytes(bytes) {
                     Ok(lex) => {
                         let lang = lex.header().lang.clone();
                         if !reg.packs.contains_key(&lang) {
                             reg.disk_langs.insert(lang.clone());
-                            reg.packs.insert(lang, EnglishScorer::new(lex));
+                            reg.packs.insert(lang, LatinScorer::new(lex));
                         }
                     }
                     Err(LexiconError::LegacyFormat(ver)) => {
@@ -119,7 +119,7 @@ impl LexiconRegistry {
 
         if bundled_en_fallback && !reg.packs.contains_key("en") {
             #[cfg(feature = "bundled-en")]
-            if let Ok(scorer) = EnglishScorer::new_bundled() {
+            if let Ok(scorer) = LatinScorer::new_bundled() {
                 reg.packs.insert("en".to_string(), scorer);
             }
         }
@@ -132,16 +132,16 @@ impl LexiconRegistry {
         Self::scan_dirs(&Self::default_search_dirs(), cfg!(feature = "bundled-en"))
     }
 
-    pub fn insert(&mut self, lang: impl Into<String>, scorer: EnglishScorer) {
+    pub fn insert(&mut self, lang: impl Into<String>, scorer: LatinScorer) {
         self.packs.insert(lang.into(), scorer);
     }
 
-    pub fn scorer(&self, lang: &str) -> Option<&EnglishScorer> {
+    pub fn scorer(&self, lang: &str) -> Option<&LatinScorer> {
         self.packs.get(lang)
     }
 
-    pub fn lexicon(&self, lang: &str) -> Option<&EnglishLexicon> {
-        self.packs.get(lang).map(EnglishScorer::lexicon)
+    pub fn lexicon(&self, lang: &str) -> Option<&PackLexicon> {
+        self.packs.get(lang).map(LatinScorer::lexicon)
     }
 
     pub fn has_disk_pack(&self) -> bool {
@@ -161,7 +161,7 @@ pub struct SmartKeyEngine {
 }
 
 impl SmartKeyEngine {
-    pub fn new(scorer: Option<EnglishScorer>, store: RuleStore) -> Self {
+    pub fn new(scorer: Option<LatinScorer>, store: RuleStore) -> Self {
         let mut registry = LexiconRegistry::new();
         if let Some(s) = scorer {
             let lang = s.lexicon().header().lang.clone();
@@ -195,7 +195,7 @@ impl SmartKeyEngine {
 
     #[cfg(feature = "bundled-en")]
     pub fn new_bundled(store: RuleStore) -> Result<Self, crate::lexicon::LexiconError> {
-        let scorer = EnglishScorer::new_bundled()?;
+        let scorer = LatinScorer::new_bundled()?;
         Ok(Self::new(Some(scorer), store))
     }
 
@@ -231,19 +231,19 @@ impl SmartKeyEngine {
         &self.registry
     }
 
-    pub fn scorer(&self) -> Option<&EnglishScorer> {
+    pub fn scorer(&self) -> Option<&LatinScorer> {
         self.registry.scorer("en")
     }
 
-    pub fn lexicon(&self) -> Option<&EnglishLexicon> {
+    pub fn lexicon(&self) -> Option<&PackLexicon> {
         self.registry.lexicon("en")
     }
 
-    pub fn scorer_for(&self, lang: &str) -> Option<&EnglishScorer> {
+    pub fn scorer_for(&self, lang: &str) -> Option<&LatinScorer> {
         self.registry.scorer(lang)
     }
 
-    pub fn lexicon_for(&self, lang: &str) -> Option<&EnglishLexicon> {
+    pub fn lexicon_for(&self, lang: &str) -> Option<&PackLexicon> {
         self.registry.lexicon(lang)
     }
 
@@ -2287,7 +2287,7 @@ impl SmartKeySession {
                                     engine.store.scorer_config(),
                                     &engine.store,
                                 );
-                                let (thresh, _) = crate::scorer::EnglishScorer::thresholds(
+                                let (thresh, _) = crate::scorer::LatinScorer::thresholds(
                                     engine.store.scorer_config().aggressiveness,
                                 );
                                 let (cand, score) = match explanation.top_candidates.first() {
@@ -2737,7 +2737,7 @@ mod tests {
 
     #[test]
     fn multilang_session_routes_es_and_fr_packs_and_guards_learner() {
-        let es_lex = EnglishLexicon::from_owned_bytes(build_synthetic_v3_bytes(
+        let es_lex = PackLexicon::from_owned_bytes(build_synthetic_v3_bytes(
             "es",
             [0, 3, 0],
             &[
@@ -2770,7 +2770,7 @@ mod tests {
         ))
         .unwrap();
 
-        let fr_lex = EnglishLexicon::from_owned_bytes(build_synthetic_v3_bytes(
+        let fr_lex = PackLexicon::from_owned_bytes(build_synthetic_v3_bytes(
             "fr",
             [0, 3, 0],
             &[(
@@ -2795,8 +2795,8 @@ mod tests {
         .unwrap();
 
         let mut reg = LexiconRegistry::new();
-        reg.insert("es", EnglishScorer::new(es_lex));
-        reg.insert("fr", EnglishScorer::new(fr_lex));
+        reg.insert("es", LatinScorer::new(es_lex));
+        reg.insert("fr", LatinScorer::new(fr_lex));
 
         let mut engine = SmartKeyEngine::from_registry(reg, RuleStore::in_memory(Preset::Balanced));
         let mut session = SmartKeySession::new();

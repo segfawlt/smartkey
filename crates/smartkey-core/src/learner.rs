@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::casing::is_expressive_stretch;
 use crate::keyboard::damerau_levenshtein_chars;
-use crate::lexicon::EnglishLexicon;
+use crate::lexicon::PackLexicon;
 use crate::scorer::{is_staged_rejection_pair_for, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::LangId;
@@ -162,7 +162,7 @@ const CONTRACTION_REJECT_STALE_AFTER_ACCEPTS: u32 = 10;
 /// Returns `true` when the pair is (now) permanently blocked.
 fn reject_pair_permanently(
     store: &mut RuleStore,
-    lexicon: Option<&EnglishLexicon>,
+    lexicon: Option<&PackLexicon>,
     lang: &LangId,
     typed_lower: &str,
     rejected_lower: &str,
@@ -209,7 +209,7 @@ fn reject_pair_permanently(
 /// erase it again, deadlocking recovery by typing.
 fn clear_pair_rejection(
     store: &mut RuleStore,
-    lexicon: Option<&EnglishLexicon>,
+    lexicon: Option<&PackLexicon>,
     lang: &LangId,
     typed_lower: &str,
     fixed: &str,
@@ -240,7 +240,7 @@ fn clear_pair_rejection(
 /// - `2x`: Permanently promotes `typed` to `personal_dict` in `rules.toml`.
 pub fn record_undo_keep_verbatim(
     store: &mut RuleStore,
-    lexicon: Option<&EnglishLexicon>,
+    lexicon: Option<&PackLexicon>,
     lang: &LangId,
     typed_raw: &str,
     rejected: &str,
@@ -303,7 +303,7 @@ pub fn record_undo_keep_verbatim(
 ///   plus routes `(fomr -> form)` through the `2x` guarded manual-edit learner.
 pub fn resolve_restored_edit(
     store: &mut RuleStore,
-    lexicon: Option<&EnglishLexicon>,
+    lexicon: Option<&PackLexicon>,
     lang: &LangId,
     prev_word: Option<&str>,
     raw_typed: &str,
@@ -404,7 +404,7 @@ pub fn resolve_restored_edit(
 /// and logs the `1x, 2x, 3x+` manual backspace fix attempt.
 pub fn record_manual_edit(
     store: &mut RuleStore,
-    lexicon: Option<&EnglishLexicon>,
+    lexicon: Option<&PackLexicon>,
     lang: &LangId,
     prev_word: Option<&str>,
     orig_raw: &str,
@@ -449,7 +449,7 @@ fn is_intentional_cased_token(trimmed: &str) -> bool {
 
 fn record_manual_edit_inner(
     store: &mut RuleStore,
-    lexicon: Option<&EnglishLexicon>,
+    lexicon: Option<&PackLexicon>,
     lang: &LangId,
     prev_word: Option<&str>,
     orig_raw: &str,
@@ -914,7 +914,7 @@ fn record_manual_edit_inner(
 /// Row 5: Records an unknown word that the user typed and left untouched (`3x -> personal_dict`).
 pub fn record_untouched_unknown(
     store: &mut RuleStore,
-    lexicon: Option<&EnglishLexicon>,
+    lexicon: Option<&PackLexicon>,
     lang: &LangId,
     word_raw: &str,
 ) -> LearnEvent {

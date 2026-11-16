@@ -7,7 +7,7 @@ use std::ptr;
 use std::slice;
 
 use smartkey_core::{
-    AppProfile, EnglishLexicon, EnglishScorer, KeyInput, LangId, LearnEvent, Preset, RuleStore,
+    AppProfile, KeyInput, LangId, LatinScorer, LearnEvent, PackLexicon, Preset, RuleStore,
     SessionAction, SmartKeyEngine, SmartKeySession, UserRuleView,
 };
 
@@ -241,10 +241,10 @@ pub unsafe extern "C" fn smartkey_engine_new_with_lexicon_bytes(
         };
         let scorer = if !skdict_bytes.is_null() && skdict_len > 0 {
             let bytes = slice::from_raw_parts(skdict_bytes, skdict_len).to_vec();
-            let Ok(lex) = EnglishLexicon::from_owned_bytes(bytes) else {
+            let Ok(lex) = PackLexicon::from_owned_bytes(bytes) else {
                 return ptr::null_mut();
             };
-            Some(EnglishScorer::new(lex))
+            Some(LatinScorer::new(lex))
         } else {
             None
         };

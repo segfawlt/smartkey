@@ -3,6 +3,7 @@ pub mod event_log;
 pub mod keyboard;
 pub mod learner;
 pub mod lexicon;
+pub mod pack_builder;
 pub mod scorer;
 pub mod session;
 pub mod store;
@@ -15,12 +16,17 @@ pub use event_log::{
 };
 pub use learner::{LearnEvent, SkipReason};
 pub use lexicon::{
-    compile_skdict_from_sources, default_user_dict_dir, lookup_english_shorthand,
-    peek_skdict_header, peek_skdict_header_and_manifest, resolve_dict_path, BigramBoost,
-    CasingRules, CliticRules, EnglishLexicon, LanguageRules, LexiconError, PackHeader, PackTier,
+    default_user_dict_dir, lookup_english_shorthand, peek_skdict_header,
+    peek_skdict_header_and_manifest, resolve_dict_path, BigramBoost, CasingRules, CliticRules,
+    EnglishLexicon, LanguageRules, LexiconError, PackHeader, PackLexicon, PackTier,
     ReplacementKind, ReplacementRule, SourceManifestEntry, WordMeta,
 };
-pub use scorer::{EmptyUserRules, EnglishScorer, EvalContext, LanguageScorer, UserRuleView};
+pub use pack_builder::{
+    build_pack_from_dir, sha256_bytes, sha256_hex, BuiltPack, PackBuildOptions, PackRecipe,
+};
+pub use scorer::{
+    EmptyUserRules, EnglishScorer, EvalContext, LanguageScorer, LatinScorer, UserRuleView,
+};
 pub use session::{
     apply_key_to_buffer, KeyInput, LexiconRegistry, SessionAction, SessionOutput, SmartKeyEngine,
     SmartKeySession,
