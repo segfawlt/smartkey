@@ -1,0 +1,33 @@
+# SmartKey French Unambiguous Proper Nouns Auto-Capitalization TSV
+# Format: <lowercase> \t <ProperCase>
+# Excludes days of week, months, languages, and lowercase-homograph nouns/adjectives.
+france	France
+paris	Paris
+europe	Europe
+afrique	Afrique
+asie	Asie
+amérique	Amérique
+australie	Australie
+canada	Canada
+québec	Québec
+montréal	Montréal
+lyon	Lyon
+marseille	Marseille
+londres	Londres
+berlin	Berlin
+allemagne	Allemagne
+italie	Italie
+espagne	Espagne
+angleterre	Angleterre
+belgique	Belgique
+japon	Japon
+russie	Russie
+brésil	Brésil
+portugal	Portugal
+bruxelles	Bruxelles
+genève	Genève
+strasbourg	Strasbourg
+toulouse	Toulouse
+nantes	Nantes
+vietnam	Vietnam
+tokyo	Tokyo

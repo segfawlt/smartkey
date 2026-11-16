@@ -1,0 +1,486 @@
+# SmartKey English Language Rules (migrated from Rust const tables)
+
+capitalize_standalone_i = true
+
+function_words = [
+  "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "for", "from", "had",
+  "has", "have", "he", "her", "his", "if", "in", "into", "is", "it", "me", "my", "no", "not",
+  "of", "on", "or", "our", "out", "she", "so", "than", "that", "the", "their", "them", "then",
+  "there", "these", "they", "this", "to", "up", "us", "was", "we", "were", "what", "when",
+  "where", "which", "who", "will", "with", "would", "you", "your",
+]
+
+[clitics]
+suffixes = ["t", "s", "m", "d", "ll", "ve", "re"]
+prefixes = []
+
+[casing]
+leading_apostrophes = [
+  "'em", "'cause", "'til", "'90s", "'80s", "'70s", "'60s", "'round", "'n'", "'tis", "'twas",
+]
+abbreviations = [
+  "e.g", "eg", "i.e", "ie", "etc", "vs", "mr", "mrs", "ms", "dr", "prof", "inc", "ltd", "jr",
+  "sr", "st", "ave", "approx", "dept", "fig", "vol", "al", "jan", "feb", "mar", "apr", "jun",
+  "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+]
+exclusions = []
+
+# Curated spoken/chat locative & grammar disambiguators
+[[bigram_boosts]]
+prev = "over"
+next = "there"
+score = 248
+
+[[bigram_boosts]]
+prev = "out"
+next = "there"
+score = 245
+
+[[bigram_boosts]]
+prev = "right"
+next = "there"
+score = 245
+
+[[bigram_boosts]]
+prev = "up"
+next = "there"
+score = 242
+
+[[bigram_boosts]]
+prev = "down"
+next = "there"
+score = 242
+
+[[bigram_boosts]]
+prev = "in"
+next = "their"
+score = 248
+
+[[bigram_boosts]]
+prev = "of"
+next = "their"
+score = 245
+
+[[bigram_boosts]]
+prev = "for"
+next = "their"
+score = 242
+
+[[bigram_boosts]]
+prev = "with"
+next = "their"
+score = 242
+
+[[bigram_boosts]]
+prev = "too"
+next = "much"
+score = 250
+
+[[bigram_boosts]]
+prev = "so"
+next = "much"
+score = 248
+
+[[bigram_boosts]]
+prev = "very"
+next = "much"
+score = 248
+
+[[bigram_boosts]]
+prev = "sent"
+next = "from"
+score = 245
+
+[[bigram_boosts]]
+prev = "away"
+next = "from"
+score = 245
+
+[[bigram_boosts]]
+prev = "apart"
+next = "from"
+score = 245
+
+# Unconditional contractions (excludes valid homographs like its/were/lets/ill/id/well/hell/shed/wed)
+[[replacements]]
+typed = "im"
+fix = "I'm"
+kind = "contraction"
+
+[[replacements]]
+typed = "i'm"
+fix = "I'm"
+kind = "contraction"
+
+[[replacements]]
+typed = "ive"
+fix = "I've"
+kind = "contraction"
+
+[[replacements]]
+typed = "i've"
+fix = "I've"
+kind = "contraction"
+
+[[replacements]]
+typed = "i'll"
+fix = "I'll"
+kind = "contraction"
+
+[[replacements]]
+typed = "i'd"
+fix = "I'd"
+kind = "contraction"
+
+[[replacements]]
+typed = "dont"
+fix = "don't"
+kind = "contraction"
+
+[[replacements]]
+typed = "doesnt"
+fix = "doesn't"
+kind = "contraction"
+
+[[replacements]]
+typed = "didnt"
+fix = "didn't"
+kind = "contraction"
+
+[[replacements]]
+typed = "cant"
+fix = "can't"
+kind = "contraction"
+
+[[replacements]]
+typed = "wont"
+fix = "won't"
+kind = "contraction"
+
+[[replacements]]
+typed = "isnt"
+fix = "isn't"
+kind = "contraction"
+
+[[replacements]]
+typed = "arent"
+fix = "aren't"
+kind = "contraction"
+
+[[replacements]]
+typed = "wasnt"
+fix = "wasn't"
+kind = "contraction"
+
+[[replacements]]
+typed = "werent"
+fix = "weren't"
+kind = "contraction"
+
+[[replacements]]
+typed = "hasnt"
+fix = "hasn't"
+kind = "contraction"
+
+[[replacements]]
+typed = "havent"
+fix = "haven't"
+kind = "contraction"
+
+[[replacements]]
+typed = "hadnt"
+fix = "hadn't"
+kind = "contraction"
+
+[[replacements]]
+typed = "wouldnt"
+fix = "wouldn't"
+kind = "contraction"
+
+[[replacements]]
+typed = "couldnt"
+fix = "couldn't"
+kind = "contraction"
+
+[[replacements]]
+typed = "shouldnt"
+fix = "shouldn't"
+kind = "contraction"
+
+[[replacements]]
+typed = "mustnt"
+fix = "mustn't"
+kind = "contraction"
+
+[[replacements]]
+typed = "neednt"
+fix = "needn't"
+kind = "contraction"
+
+[[replacements]]
+typed = "aint"
+fix = "ain't"
+kind = "contraction"
+
+[[replacements]]
+typed = "thats"
+fix = "that's"
+kind = "contraction"
+
+[[replacements]]
+typed = "whats"
+fix = "what's"
+kind = "contraction"
+
+[[replacements]]
+typed = "theres"
+fix = "there's"
+kind = "contraction"
+
+[[replacements]]
+typed = "heres"
+fix = "here's"
+kind = "contraction"
+
+[[replacements]]
+typed = "wheres"
+fix = "where's"
+kind = "contraction"
+
+[[replacements]]
+typed = "whos"
+fix = "who's"
+kind = "contraction"
+
+[[replacements]]
+typed = "hows"
+fix = "how's"
+kind = "contraction"
+
+[[replacements]]
+typed = "youre"
+fix = "you're"
+kind = "contraction"
+
+[[replacements]]
+typed = "theyre"
+fix = "they're"
+kind = "contraction"
+
+[[replacements]]
+typed = "youve"
+fix = "you've"
+kind = "contraction"
+
+[[replacements]]
+typed = "weve"
+fix = "we've"
+kind = "contraction"
+
+[[replacements]]
+typed = "theyve"
+fix = "they've"
+kind = "contraction"
+
+[[replacements]]
+typed = "youll"
+fix = "you'll"
+kind = "contraction"
+
+[[replacements]]
+typed = "they'll"
+fix = "they'll"
+kind = "contraction"
+
+[[replacements]]
+typed = "theyll"
+fix = "they'll"
+kind = "contraction"
+
+[[replacements]]
+typed = "youd"
+fix = "you'd"
+kind = "contraction"
+
+[[replacements]]
+typed = "theyd"
+fix = "they'd"
+kind = "contraction"
+
+[[replacements]]
+typed = "couldve"
+fix = "could've"
+kind = "contraction"
+
+[[replacements]]
+typed = "wouldve"
+fix = "would've"
+kind = "contraction"
+
+[[replacements]]
+typed = "shouldve"
+fix = "should've"
+kind = "contraction"
+
+[[replacements]]
+typed = "mightve"
+fix = "might've"
+kind = "contraction"
+
+[[replacements]]
+typed = "mustve"
+fix = "must've"
+kind = "contraction"
+
+# Transposed apostrophe slips
+[[replacements]]
+typed = "do'nt"
+fix = "don't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "does'nt"
+fix = "doesn't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "did'nt"
+fix = "didn't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "ca'nt"
+fix = "can't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "wo'nt"
+fix = "won't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "is'nt"
+fix = "isn't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "are'nt"
+fix = "aren't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "was'nt"
+fix = "wasn't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "were'nt"
+fix = "weren't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "has'nt"
+fix = "hasn't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "have'nt"
+fix = "haven't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "hav'nt"
+fix = "haven't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "had'nt"
+fix = "hadn't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "would'nt"
+fix = "wouldn't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "could'nt"
+fix = "couldn't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "should'nt"
+fix = "shouldn't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "must'nt"
+fix = "mustn't"
+kind = "transposed_apostrophe"
+
+[[replacements]]
+typed = "ai'nt"
+fix = "ain't"
+kind = "transposed_apostrophe"
+
+# Unmerged two-word prose compounds
+[[replacements]]
+typed = "alot"
+fix = "a lot"
+kind = "unmerged_compound"
+
+[[replacements]]
+typed = "aswell"
+fix = "as well"
+kind = "unmerged_compound"
+
+[[replacements]]
+typed = "atleast"
+fix = "at least"
+kind = "unmerged_compound"
+
+[[replacements]]
+typed = "infront"
+fix = "in front"
+kind = "unmerged_compound"
+
+[[replacements]]
+typed = "eachother"
+fix = "each other"
+kind = "unmerged_compound"
+
+[[replacements]]
+typed = "infact"
+fix = "in fact"
+kind = "unmerged_compound"
+
+[[replacements]]
+typed = "incase"
+fix = "in case"
+kind = "unmerged_compound"
+
+[[replacements]]
+typed = "noone"
+fix = "no one"
+kind = "unmerged_compound"
+
+[[replacements]]
+typed = "thankyou"
+fix = "thank you"
+kind = "unmerged_compound"
+
+# Curated morphological & motor typo overrides
+[[replacements]]
+typed = "preventation"
+fix = "prevention"
+kind = "typo_override"
+
+[[replacements]]
+typed = "apdater"
+fix = "adapter"
+kind = "typo_override"
+
+[[replacements]]
+typed = "apdapter"
+fix = "adapter"
+kind = "typo_override"

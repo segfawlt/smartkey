@@ -1,0 +1,26 @@
+# SmartKey French Language Rules
+
+capitalize_standalone_i = false
+
+function_words = [
+  "a", "au", "aux", "avec", "ce", "ces", "dans", "de", "des", "du", "elle",
+  "en", "est", "et", "il", "ils", "je", "la", "le", "les", "leur", "lui",
+  "ma", "mais", "me", "mon", "ne", "nos", "nous", "on", "ou", "par", "pas",
+  "pour", "que", "qui", "sa", "se", "ses", "son", "sur", "ta", "te", "tes",
+  "ton", "tu", "un", "une", "vos", "vous", "y",
+]
+
+bigram_boosts = []
+replacements = []
+
+[clitics]
+suffixes = []
+prefixes = ["l", "d", "j", "m", "t", "s", "c", "n", "qu", "jusqu", "lorsqu", "puisqu"]
+
+[casing]
+leading_apostrophes = []
+abbreviations = [
+  "m", "mme", "mmes", "mlle", "dr", "prof", "etc", "ex", "cf", "env",
+  "vol", "fig", "chap", "art", "éd", "p", "pp", "tel", "tél", "approx",
+]
+exclusions = []

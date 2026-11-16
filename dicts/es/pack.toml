@@ -1,0 +1,37 @@
+[pack]
+code = "es"
+name = "Spanish"
+version = "0.1.0"
+format_version = 3
+tier = "data"
+maintainer = "segfawlt"
+description = "Official Spanish dictionary pack for SmartKey (es_ES)"
+license = "GPL-3.0-or-later"
+
+[variants.es_ES]
+freq_slot = 0
+default = true
+
+[sources.es_es]
+format = "aosp_combined"
+url = "https://raw.githubusercontent.com/openboard-team/openboard/v1.4.5/dictionaries/es_wordlist.combined.gz"
+cache_file = "es/es_wordlist.combined"
+decompress = "gzip"
+sha256 = "bfcc7dd558dbb2251647f2f97124af555247a7bf168f38aa9fa8bc0a925b93af"
+license = "Apache-2.0"
+variants = ["es_ES"]
+capture_bigrams = false
+
+[overlays]
+shorthand = ["shorthand.tsv"]
+slang = ["slang.txt"]
+proper_nouns = ["proper_nouns.tsv"]
+dev_terms = []
+rules = ["rules.toml"]
+
+[build]
+bigram_top_n = 90000
+smash_min_freq = 105
+proper_noun_freq = 160
+tech_freq = 172
+syllable_dict = false

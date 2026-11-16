@@ -1,0 +1,81 @@
+[pack]
+code = "en"
+name = "English"
+version = "0.3.0"
+format_version = 3
+tier = "data"
+maintainer = "segfawlt"
+description = "Official English dictionary pack for SmartKey (US/UK, shorthand expansions, slang shields, proper nouns, 96k smashes)"
+license = "GPL-3.0-or-later"
+
+[variants.en_US]
+freq_slot = 0
+default = true
+
+[variants.en_GB]
+freq_slot = 1
+default = false
+
+[sources.en_us]
+format = "aosp_combined"
+url = "https://raw.githubusercontent.com/openboard-team/openboard/v1.4.5/dictionaries/en_wordlist.combined.gz"
+cache_file = "en_US.combined"
+decompress = "gzip"
+sha256 = "73308519ff089c73baa35e08f25087bb62ed4a6bf2f96af3efb402187f7c9edb"
+license = "Apache-2.0"
+variants = ["en_US"]
+capture_bigrams = true
+
+[sources.en_gb]
+format = "aosp_combined"
+url = "https://raw.githubusercontent.com/openboard-team/openboard/v1.4.5/dictionaries/en_GB_wordlist.combined.gz"
+cache_file = "en_GB.combined"
+decompress = "gzip"
+sha256 = "4716c9ec06b579f2c9c78ccd114a61865eb117d6b8bf125f20cfd80ce4fe199b"
+license = "Apache-2.0"
+variants = ["en_GB"]
+capture_bigrams = false
+
+[sources.typos]
+format = "typos_csv"
+url = "https://raw.githubusercontent.com/crate-ci/typos/b41eb62e9a8096c9ba6636e2365d3f56018a203c/crates/typos-dict/assets/words.csv"
+cache_file = "typos_words.csv"
+decompress = "none"
+sha256 = "9f527a304e4ea717a4dc1b6fc5f3a4d50b8c872f17792097e28422bb595226db"
+license = "MIT OR Apache-2.0"
+variants = ["en_US", "en_GB"]
+capture_bigrams = false
+
+[sources.variant_map]
+format = "variant_map_json"
+url = "https://raw.githubusercontent.com/hyperreality/American-British-English-Translator/16ec8158bd31fd8fc13bf29a2a5165ca12c7dd3f/data/british_spellings.json"
+cache_file = "british_to_american.json"
+decompress = "none"
+sha256 = "7f1f3acfeb4e8bfa2219643972997566d42926f6df1978d3a3730b6dbcc6a5f5"
+license = "MIT"
+variants = ["en_US", "en_GB"]
+capture_bigrams = false
+
+[sources.bigram_counts]
+format = "bigram_counts"
+url = "https://norvig.com/ngrams/count_2w.txt"
+cache_file = "count_2w.txt"
+decompress = "none"
+sha256 = "781c0596c3eea532d30bef9f3dba1d5137d652f00376260822c761a7584dfb8c"
+license = "UNVERIFIED"
+variants = ["en_US", "en_GB"]
+capture_bigrams = false
+
+[overlays]
+shorthand = ["shorthand.tsv"]
+slang = ["slang.txt"]
+proper_nouns = ["proper_nouns.tsv"]
+dev_terms = ["dev_terms.txt"]
+rules = ["rules.toml"]
+
+[build]
+bigram_top_n = 90000
+smash_min_freq = 105
+proper_noun_freq = 160
+tech_freq = 172
+syllable_dict = false

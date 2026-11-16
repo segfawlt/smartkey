@@ -1,0 +1,27 @@
+# SmartKey Spanish Unambiguous Proper Nouns Auto-Capitalization TSV
+# Format: <lowercase> \t <ProperCase>
+# Excludes days of week, months, languages, and lowercase-homograph nouns/adjectives.
+españa	España
+méxico	México
+madrid	Madrid
+barcelona	Barcelona
+europa	Europa
+américa	América
+áfrica	África
+asia	Asia
+francia	Francia
+alemania	Alemania
+italia	Italia
+inglaterra	Inglaterra
+portugal	Portugal
+brasil	Brasil
+japón	Japón
+rusia	Rusia
+canadá	Canadá
+australia	Australia
+parís	París
+londres	Londres
+california	California
+venezuela	Venezuela
+perú	Perú
+bilbao	Bilbao

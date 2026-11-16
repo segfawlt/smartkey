@@ -1,0 +1,37 @@
+[pack]
+code = "fr"
+name = "French"
+version = "0.1.0"
+format_version = 3
+tier = "data"
+maintainer = "segfawlt"
+description = "Official French dictionary pack for SmartKey (fr_FR, prefix elision rules)"
+license = "GPL-3.0-or-later"
+
+[variants.fr_FR]
+freq_slot = 0
+default = true
+
+[sources.fr_fr]
+format = "aosp_combined"
+url = "https://raw.githubusercontent.com/openboard-team/openboard/v1.4.5/dictionaries/fr_wordlist.combined.gz"
+cache_file = "fr/fr_wordlist.combined"
+decompress = "gzip"
+sha256 = "cf976f548eb44015ffeef92f8474ded25c10f0469830279a547a47085c1ba9ec"
+license = "Apache-2.0"
+variants = ["fr_FR"]
+capture_bigrams = false
+
+[overlays]
+shorthand = ["shorthand.tsv"]
+slang = ["slang.txt"]
+proper_nouns = ["proper_nouns.tsv"]
+dev_terms = []
+rules = ["rules.toml"]
+
+[build]
+bigram_top_n = 90000
+smash_min_freq = 105
+proper_noun_freq = 160
+tech_freq = 172
+syllable_dict = false
