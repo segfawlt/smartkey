@@ -3,7 +3,7 @@
 > **Handoff doc.** Root-cause investigation of a false-positive proper-noun
 > autocapitalization, plus a measured, layered prevention strategy designed to hold up
 > as new language packs are added.
-> Status: **root cause verified against live logs; dictionary fix + guard design agreed; nothing changed yet.**
+> Status: **IMPLEMENTED (F1–F3 landed in `.skdict` v3 + `PackBuilder` + `dicts/en/proper_nouns.tsv`, 2026-11-16).**
 
 ## Symptom
 
@@ -75,10 +75,8 @@ language-independent: every future pack runs the same check against its own corp
 
 ## Agreed fix strategy (layered)
 
-### F1 — Immediate dictionary fix (both repos)
-Remove `polish → Polish` and `latin → Latin` from:
-- `smartkey-dicts/dicts/en/proper_nouns.tsv` (source of truth)
-- `smartkey/data/proper_nouns.tsv` (build-time mirror)
+### F1 — Immediate dictionary fix
+Remove `polish → Polish` and `latin → Latin` from `dicts/en/proper_nouns.tsv` (curated data migrated from `smartkey-dicts` and `data/proper_nouns.tsv`, which is now deleted).
 
 Then rebuild the FST (`smartkey-dev build-lexicon` → `crates/smartkey-core/assets/en_lexicon.skdict`),
 rebuild/install the addon + CLI, and reinstall the pack (`smartkey dict install`).
@@ -122,8 +120,8 @@ feature for unambiguous ones (`english`, `monday`, `january`, …).
 
 ## Open items
 
-- [ ] F1 dictionary removal + lexicon rebuild (10-minute change; needs a release/pack bump)
-- [ ] F2 lint in `smartkey-dev` + dicts CI
-- [ ] F3 `.skdict` v3 flag + scorer guard
-- [ ] Decide wordlist-only fallback rule for languages without bigram corpora (F2)
+- [x] F1 dictionary removal (`polish` & `latin` removed from `dicts/en/proper_nouns.tsv`, legacy `data/proper_nouns.tsv` deleted) + lexicon rebuild (`en_lexicon.skdict` v3)
+- [x] F2 lint in `smartkey-dev` (`smartkey-dev build-pack` / `lint_proper_nouns` with `PROPER_NOUN_MIN_CASE_GAP = 60` across AOSP case-sensitive wordlists)
+- [x] F3 `.skdict` v3 flag (`FLAG_AMBIGUOUS_PROPER = 0x04` in `WordMeta`) + scorer guard (Step 4b skips flagged entries)
+- [x] Decide wordlist-only fallback rule for languages without bigram corpora (F2: AOSP/HeliBoard case-sensitive `f=` gap check `proper_f - lower_f >= 60`, with `--allow-ambiguous` setting `FLAG_AMBIGUOUS_PROPER`)
 - [ ] Audit `proper_nouns.tsv` for non-language homographs as packs grow (lint makes this automatic)

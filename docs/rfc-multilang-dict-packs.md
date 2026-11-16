@@ -1,6 +1,6 @@
 # RFC: Multi-Language Dictionary Packs (`.skdict` v3 + generic builder)
 
-**Status:** APPROVED & LOCKED (2026-11-16). Decisions in §2 are finalized and propagated through §3–§10 and Appendix A.
+**Status:** IMPLEMENTED (2026-11-16). English & Vietnamese fallback packs embedded (v3), fully overridable by installed `.skdict` packs; Tier A packs (`es`, `fr`, etc.) built via `smartkey-dev build-pack`.
 **Date:** 2026-11-12 (updated 2026-11-16)
 **Scope:** `smartkey` (core/CLI/FFI/fcitx5) with `dicts/<lang>/` monorepo recipes (`smartkey-dicts` frozen at last v2 release)
 **Goal:** A contributor adds a language by writing `dicts/<lang>/pack.toml` (pinned upstream
@@ -108,7 +108,7 @@ Observed via repo fetch: dozens of languages in the **exact `.combined` format `
 4. **Zero-copy static load:** `PackLexicon::from_static_bytes` slices `WORDS_FST`, `TYPOS_FST`, and `typo_pool` as `Cow::Borrowed`.
 5. **Stronger Phase 1 gate:** before overwriting `en_lexicon.skdict`, dump every `(word, freq0, freq1, variant_mask, flags_remapped, word_id)`, every typo mapping, every UK↔US pair, every bigram, every smash entry, and every proper noun from v2 vs v3 and assert an **exact** match (0 differences).
 6. **Staged renames:** keep `EnglishLexicon` / `EnglishScorer` names in Phases 1–3; generalize to `PackLexicon` / `LatinScorer` (with deprecated type aliases) in Phase 4 once `es` works.
-7. **Norvig `count_2w.txt` stays `UNVERIFIED`:** mark `license = "UNVERIFIED"` in `dicts/en/pack.toml` (loud build warning + recorded in `SOURCE_MANIFEST`) and run a Phase 4 `--without-count2w` eval ablation to measure impact.
+7. **Norvig `count_2w.txt` stays `UNVERIFIED`:** mark `license = "UNVERIFIED"` in `dicts/en/pack.toml` (loud build warning + recorded in `SOURCE_MANIFEST`) and run a Phase 4 `--without-count2w` eval ablation to measure impact (**measured:** `92/95` = `96.8%` without `count_2w.txt` vs `95/95` = `100.0%` with it, losing the 3 missed-space / thumb-spacebar splits `inbthe`, `andnthe`, `ofthe`; `141/141` must-not-touch unchanged).
 8. **Clean baseline:** prior dirty changes in `casing.rs`, `event_log.rs`, `session.rs`, `vi_telex.rs` were already committed (`9ab2ef5`..`cae2c7e`), and `from_static_bytes` zero-copy (`Cow::Borrowed`) is already landed for v2 and preserved in v3.
 
 ---

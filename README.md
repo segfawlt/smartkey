@@ -45,10 +45,11 @@ SmartKey is designed from the ground up for desktop environments:
 
 ## Workspace Crates & Adapters
 
-- **`crates/smartkey-core`** — Pure-Rust Layer 1 scorer, `SmartKeySession` shadow-buffer learner, diagnostic event logger, and comment-preserving `toml_edit` `RuleStore` (zero OS/C-sys/`$HOME` dependencies).
+- **`crates/smartkey-core`** — Pure-Rust Layer 1 scorer (`LatinScorer` / `PackLexicon`), `.skdict` v3 `PackBuilder` & `LexiconRegistry`, `SmartKeySession` shadow-buffer learner, diagnostic event logger, and comment-preserving `toml_edit` `RuleStore` (zero OS/C-sys/`$HOME` dependencies).
 - **`crates/smartkey-ffi`** — Panic-safe `extern "C"` ABI (`include/smartkey.h`) for desktop input method modules (`fcitx5`) and portable word-level JNI hooks for Android `HeliBoard`.
-- **`crates/smartkey-cli`** — Control CLI (`smartkey`: `status`, `toggle`, `reload`, `log`, `rules`, `config`, `app`, `plugin`, `dict`, `explain`, `init`, `repl`; aliased as `smartkeyctl`) and developer corpus tools (`smartkey-dev`: `eval`, `build-lexicon`).
-- **`adapters/fcitx5-smartkey`** — Standalone C++20 `fcitx5` module addon (`Category=Module`, requires `fcitx5 >= 5.0.20`, zero `sudo` user-local install to `~/.local`) that runs English autocorrect on `keyboard-*` layouts, bridges `fcitx5-lotus` (`vi-lotus` plugin), and steps aside automatically on other CJK/Vietnamese input engines.
+- **`crates/smartkey-cli`** — Control CLI (`smartkey`: `status`, `toggle`, `reload`, `log`, `rules`, `config`, `app`, `plugin`, `dict`, `explain`, `init`, `repl`; aliased as `smartkeyctl`) and developer pack/corpus tools (`smartkey-dev`: `eval`, `build-pack`, `build-lexicon`).
+- **`adapters/fcitx5-smartkey`** — Standalone C++20 `fcitx5` module addon (`Category=Module`, requires `fcitx5 >= 5.0.20`, zero `sudo` user-local install to `~/.local`) that routes `keyboard-*` layouts by `InputMethodEntry::languageCode()`, bridges `fcitx5-lotus` (`vi-lotus` plugin), and steps aside automatically on other CJK/Vietnamese input engines.
+- **`dicts/`** — Language pack recipes (`dicts/<lang>/pack.toml`, `rules.toml`, and curated overlays). English & Vietnamese fallback packs embedded (v3), fully overridable by installed `.skdict` packs; Tier A packs (`es`, `fr`, etc.) built via `smartkey-dev build-pack`.
 
 ## Prerequisites & Desktop IM Environment
 
@@ -140,6 +141,11 @@ sudo pacman -U dist/fcitx5-smartkey-*.pkg.tar.zst
 cargo test --workspace
 cargo run --release -p smartkey-cli --bin smartkey-dev -- eval
 
+# Build or verify modular .skdict v3 packs (Tier A languages like es, fr, etc.)
+cargo run --release -p smartkey-cli --bin smartkey-dev -- build-pack es --fetch --verify
+smartkey dict list -v
+smartkey dict install es target/packs/es.skdict
+
 # Query status, daemon health, IM environment, and personal brain stats
 smartkey status
 
@@ -166,6 +172,7 @@ smartkey log --yesterday --json
 # Inspect how SmartKey scores and ranks candidates for a token
 smartkey explain "implementintion"
 smartkey explain --prev "over" "ther"
+smartkey explain --lang es "porblema"
 smartkey explain --lang vi "nuowcss"
 
 # Inspect or customize per-app classification (`[app_profiles]`)
