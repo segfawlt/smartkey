@@ -8,9 +8,11 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <unistd.h>
 
 #include <fcitx/addonmanager.h>
@@ -169,11 +171,89 @@ void verifyKeyboardLangNormalization() {
     assert(normalizeKeyboardLangCode("", "en") == "");
 }
 
+void verifyWaylandSurroundingSyncAndDelayedTimer() {
+    using fcitx::smartkey::isWaylandFrontend;
+    using fcitx::smartkey::SurroundingSyncTracker;
+
+    // Frontend classification
+    assert(isWaylandFrontend("wayland"));
+    assert(isWaylandFrontend("wayland_v2"));
+    assert(!isWaylandFrontend("xcb"));
+    assert(!isWaylandFrontend("x11"));
+    assert(!isWaylandFrontend("dbus"));
+    assert(!isWaylandFrontend("ibus"));
+    assert(!isWaylandFrontend("wayland_v3"));
+    assert(!isWaylandFrontend(""));
+
+    SurroundingSyncTracker sync{};
+    assert(!sync.surroundingSynced);
+
+    // Wayland unsynced: never trust potentially stale SurroundingText
+    assert(!sync.canUseDeleteSurrounding(true, true, 10, 5, "wayland_v2"));
+    assert(!sync.canUseDeleteSurrounding(true, true, 10, 5, "wayland"));
+
+    // X11 / DBus: allowed when SurroundingText is valid and cursor >= deleteChars
+    assert(sync.canUseDeleteSurrounding(true, true, 10, 5, "xcb"));
+    assert(sync.canUseDeleteSurrounding(true, true, 8, 3, "x11"));
+    assert(sync.canUseDeleteSurrounding(true, true, 5, 5, "dbus"));
+
+    // Wayland synced: allowed once fresh SurroundingTextUpdated arrives
+    sync.markSurroundingUpdated();
+    assert(sync.surroundingSynced);
+    assert(sync.canUseDeleteSurrounding(true, true, 10, 5, "wayland_v2"));
+    assert(sync.canUseDeleteSurrounding(true, true, 5, 5, "wayland"));
+
+    // Cursor bounds & capability/validity guards across all frontends
+    assert(!sync.canUseDeleteSurrounding(true, true, 4, 5, "wayland_v2"));
+    assert(!sync.canUseDeleteSurrounding(true, true, 0, 1, "wayland"));
+    assert(!sync.canUseDeleteSurrounding(true, true, 2, 3, "xcb"));
+    assert(!sync.canUseDeleteSurrounding(true, true, 0, 1, "dbus"));
+    assert(!sync.canUseDeleteSurrounding(false, true, 10, 5, "wayland_v2"));
+    assert(!sync.canUseDeleteSurrounding(true, false, 10, 5, "wayland_v2"));
+    assert(!sync.canUseDeleteSurrounding(false, true, 10, 5, "dbus"));
+    assert(!sync.canUseDeleteSurrounding(true, false, 10, 5, "xcb"));
+
+    // Client mutation invalidates Wayland surrounding sync until next update
+    sync.markClientMutated();
+    assert(!sync.surroundingSynced);
+    assert(!sync.canUseDeleteSurrounding(true, true, 10, 5, "wayland_v2"));
+    assert(!sync.canUseDeleteSurrounding(true, true, 10, 5, "wayland"));
+    assert(sync.canUseDeleteSurrounding(true, true, 10, 5, "dbus"));
+
+    // Context reset also clears Wayland surrounding sync
+    sync.markSurroundingUpdated();
+    assert(sync.canUseDeleteSurrounding(true, true, 6, 6, "wayland_v2"));
+    sync.reset();
+    assert(!sync.surroundingSynced);
+    assert(!sync.canUseDeleteSurrounding(true, true, 6, 6, "wayland_v2"));
+
+    // Verify 15ms EventSourceTime one-shot callback safely resets its owning unique_ptr
+    fcitx::EventLoop loop;
+    bool timerFired = false;
+    std::unique_ptr<fcitx::EventSourceTime> delayedTimer;
+    delayedTimer = loop.addTimeEvent(
+        CLOCK_MONOTONIC, fcitx::now(CLOCK_MONOTONIC) + 15000, 0,
+        [&](fcitx::EventSourceTime *, uint64_t) {
+            auto localTimer = std::move(delayedTimer);
+            if (localTimer) {
+                localTimer->setEnabled(false);
+            }
+            timerFired = true;
+            loop.exit();
+            return false;
+        });
+    assert(delayedTimer != nullptr);
+    assert(loop.exec());
+    assert(timerFired);
+    assert(delayedTimer == nullptr);
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
     verifyProfileClassification();
     verifyKeyboardLangNormalization();
+    verifyWaylandSurroundingSyncAndDelayedTimer();
     if (argc < 2) {
         std::cerr << "usage: addon_load_smoke <libsmartkey.so>\n";
         return 2;

@@ -8,11 +8,13 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <pwd.h>
 #include <string>
 #include <string_view>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include <fcitx-utils/capabilityflags.h>
@@ -201,7 +203,9 @@ void SmartKeyAddon::focusOutContext(InputContext *ic) {
     }
     auto *state = ic->propertyFor(&factory_);
     if (state != nullptr) {
+        flushPendingDelayedCommit(ic, state);
         state->resetLotusTracking();
+        state->resetSurroundingSync();
         if (state->session() != nullptr) {
             SmartKeyAction unused{};
             smartkey_session_process_key(state->session(), engine_,
@@ -217,7 +221,9 @@ void SmartKeyAddon::resetContext(InputContext *ic) {
     }
     auto *state = ic->propertyFor(&factory_);
     if (state != nullptr) {
+        state->cancelPendingDelayedCommit();
         state->resetLotusTracking();
+        state->resetSurroundingSync();
         if (state->session() != nullptr) {
             smartkey_session_reset(state->session(), engine_);
         }
@@ -437,27 +443,91 @@ bool decodeKeyEvent(const KeyEvent &keyEvent, bool &isShortcutReset,
 
 } // namespace
 
+void SmartKeyAddon::flushPendingDelayedCommit(InputContext *ic,
+                                              SmartKeyState *state) {
+    if (ic == nullptr || state == nullptr ||
+        !state->hasPendingDelayedCommit()) {
+        return;
+    }
+    const std::string text = state->takePendingDelayedCommit();
+    if (!text.empty()) {
+        ScopedSelfCommit guard(state);
+        state->markClientMutated();
+        ic->commitString(text);
+    }
+}
+
 void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
                                          const SmartKeyAction &act) {
+    flushPendingDelayedCommit(ic, state);
+
     // Note: `fcitx::SurroundingText::cursor()` and `InputContext::deleteSurroundingText`
     // both operate in Unicode character counts (`surroundingtext.h:40`), matching `act.delete_chars`.
+    // On Wayland (`wayland` / `wayland_v2`), only call `deleteSurroundingText` when
+    // `surroundingSynced` is true; otherwise fall back to `forwardKey(BackSpace)` and delay
+    // `commitString` by 15ms so `zwp_virtual_keyboard_v1` BackSpaces arrive in Gecko/Zen
+    // before `zwp_input_method_v2.commit_string`.
     if (act.delete_chars > 0) {
-        if (ic->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
-            ic->surroundingText().isValid() &&
-            ic->surroundingText().cursor() >= act.delete_chars) {
+        if (state->canUseDeleteSurrounding(
+                ic->capabilityFlags().test(CapabilityFlag::SurroundingText),
+                ic->surroundingText().isValid(),
+                ic->surroundingText().cursor(), act.delete_chars,
+                ic->frontendName())) {
             ic->deleteSurroundingText(-static_cast<int>(act.delete_chars),
                                       act.delete_chars);
+            state->markClientMutated();
+            if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
+                ScopedSelfCommit guard(state);
+                ic->commitString(
+                    std::string(act.insert_utf8, act.insert_byte_len));
+            }
         } else {
             const Key bsKey(FcitxKey_BackSpace);
             for (uint32_t i = 0; i < act.delete_chars; ++i) {
                 ic->forwardKey(bsKey, false);
                 ic->forwardKey(bsKey, true);
             }
+            state->markClientMutated();
+            if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
+                std::string insertStr(act.insert_utf8, act.insert_byte_len);
+                if (isWaylandFrontend(ic->frontendName()) &&
+                    instance_ != nullptr) {
+                    constexpr uint64_t kWaylandPostBackspaceDelayUsec = 15000;
+                    auto timer = instance_->eventLoop().addTimeEvent(
+                        CLOCK_MONOTONIC,
+                        fcitx::now(CLOCK_MONOTONIC) +
+                            kWaylandPostBackspaceDelayUsec,
+                        0,
+                        [this, icRef = ic->watch()](EventSourceTime *,
+                                                    uint64_t) {
+                            if (auto *liveIc = icRef.get()) {
+                                if (factory_.registered()) {
+                                    if (auto *st =
+                                            liveIc->propertyFor(&factory_)) {
+                                        flushPendingDelayedCommit(liveIc, st);
+                                    }
+                                }
+                            }
+                            return false;
+                        });
+                    if (timer) {
+                        state->setPendingDelayedCommit(std::move(insertStr),
+                                                       std::move(timer));
+                    } else {
+                        ScopedSelfCommit guard(state);
+                        state->markClientMutated();
+                        ic->commitString(insertStr);
+                    }
+                } else {
+                    ScopedSelfCommit guard(state);
+                    state->markClientMutated();
+                    ic->commitString(insertStr);
+                }
+            }
         }
-    }
-
-    if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
+    } else if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
         ScopedSelfCommit guard(state);
+        state->markClientMutated();
         ic->commitString(std::string(act.insert_utf8, act.insert_byte_len));
     }
 }
@@ -502,7 +572,9 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         smartkey_engine_log_app_event(engine_, appName.c_str(), profile, reason);
     }
     if (profile == SMARTKEY_PROFILE_BYPASS) {
+        state->cancelPendingDelayedCommit();
         state->resetLotusTracking();
+        state->resetSurroundingSync();
         return;
     }
 
@@ -544,24 +616,20 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
             return;
         }
 
-        if (isShortcutReset) {
-            state->resetLotusTracking();
-            SmartKeyAction unused{};
-            smartkey_session_process_key(state->session(), engine_,
-                                         SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
-                                         &unused);
-            return;
-        }
-
         // On Wayland compositors without echoFrontend, `LotusWlrVirtualKeyboard` emits
         // precomposed non-ASCII runes or ASCII chars mapped onto `kTextKeys[0..11]` (XKB 10..21).
-        // Never record those synthetic echoes into `SmartKeySession`; capture break-time
-        // boundary commits so `onPostKeyEvent` can evaluate the completed word on boundary delivery.
-        if (keyKind == SMARTKEY_KEY_CHAR &&
-            isSyntheticVkKey(static_cast<uint32_t>(rawKey.code()), codepoint) &&
-            (codepoint >= 0x80 || state->isInLotusBurst(nowMs))) {
-            state->markLotusActivity();
-            state->rearmLotusBurstEcho(nowMs);
+        // Always suppress those synthetic echoes so late post-Space ASCII echoes cannot leak
+        // into `SmartKeySession` as phantom leading letters on the next word; only re-arm burst
+        // tracking when `cp >= 0x80`, inside an active burst, or awaiting a boundary commit so
+        // fast `<250ms` user `BackSpace` undo on a completed word is preserved.
+        if (!isShortcutReset && keyKind == SMARTKEY_KEY_CHAR &&
+            isSyntheticVkKey(static_cast<uint32_t>(rawKey.code()), codepoint)) {
+            state->markClientMutated();
+            if (codepoint >= 0x80 || state->isInLotusBurst(nowMs) ||
+                state->hasPendingBoundary()) {
+                state->markLotusActivity();
+                state->rearmLotusBurstEcho(nowMs);
+            }
             if (state->hasPendingBoundary()) {
                 state->appendVkBoundaryCommit(encodeUtf8(codepoint));
                 if (codepoint == state->pendingBoundaryCp()) {
@@ -569,6 +637,18 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
                 }
             }
             state->setSuppressPostKey(true);
+            return;
+        }
+
+        flushPendingDelayedCommit(ic, state);
+
+        if (isShortcutReset) {
+            state->markClientMutated();
+            state->resetLotusTracking();
+            SmartKeyAction unused{};
+            smartkey_session_process_key(state->session(), engine_,
+                                         SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
+                                         &unused);
             return;
         }
 
@@ -584,6 +664,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
                     state->hasLotusActivityInWord()) {
                     state->armLotusBurst(nowMs);
                 }
+                state->markClientMutated();
                 state->setSuppressPostKey(true);
                 return;
             }
@@ -605,6 +686,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
                 state->hasLotusActivityInWord()) {
                 state->armLotusBurst(nowMs);
             }
+            state->markClientMutated();
             SmartKeyAction unused{};
             smartkey_session_process_key(state->session(), engine_,
                                          SMARTKEY_KEY_CHAR, codepoint, nowMs,
@@ -615,6 +697,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         // For word-break/lookahead chars (`Space`, `,`, `.`, `!`, `?`, etc.), `BackSpace`,
         // `Enter`, `Tab`, and cursor nav: defer to `onPostKeyEvent` (if Lotus forwards) or
         // `onCommitString` (if Lotus filters the boundary to restore/commit).
+        state->markClientMutated();
         if (keyKind == SMARTKEY_KEY_CHAR && isSmartKeyBoundaryChar(codepoint)) {
             state->armLotusBurst(nowMs);
             state->setPendingBoundary(codepoint);
@@ -626,6 +709,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
 
     // `directKeyboardActive` (`keyboard-*` with a resolved direct-keyboard language):
     if (instance_->isComposing(ic)) {
+        state->markClientMutated();
         return;
     }
     state->resetLotusTracking();
@@ -638,7 +722,10 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         return;
     }
 
+    flushPendingDelayedCommit(ic, state);
+
     if (isShortcutReset) {
+        state->markClientMutated();
         SmartKeyAction unused{};
         smartkey_session_process_key(state->session(), engine_,
                                      SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
@@ -649,11 +736,14 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
     SmartKeyAction act{};
     if (!smartkey_session_process_key(state->session(), engine_, keyKind,
                                       codepoint, nowMs, &act)) {
+        state->markClientMutated();
         return;
     }
 
     if (act.kind == SMARTKEY_ACTION_REPLACE) {
         applyReplaceAction(ic, state, keyEvent, act);
+    } else {
+        state->markClientMutated();
     }
 }
 
@@ -726,6 +816,8 @@ void SmartKeyAddon::onPostKeyEvent(KeyEvent &keyEvent) {
                 act.delete_chars -= 1;
             }
             applyReplaceAction(ic, state, keyEvent, act);
+        } else {
+            state->markClientMutated();
         }
         replayPostBoundaryChars(state, engine_, queuedChars, nowMs);
         return;
@@ -742,11 +834,14 @@ void SmartKeyAddon::onPostKeyEvent(KeyEvent &keyEvent) {
     SmartKeyAction act{};
     if (!smartkey_session_process_key(state->session(), engine_, keyKind,
                                       codepoint, nowMs, &act)) {
+        state->markClientMutated();
         return;
     }
 
     if (act.kind == SMARTKEY_ACTION_REPLACE) {
         applyReplaceAction(ic, state, keyEvent, act);
+    } else {
+        state->markClientMutated();
     }
 }
 
@@ -755,12 +850,16 @@ void SmartKeyAddon::onCommitString(CommitStringEvent &commitEvent) {
         return;
     }
     auto *ic = commitEvent.inputContext();
-    if (ic == nullptr || !isLotusActive(ic)) {
+    if (ic == nullptr) {
         return;
     }
     auto *state = ic->propertyFor(&factory_);
     if (state == nullptr || state->session() == nullptr ||
         state->isSelfCommitting()) {
+        return;
+    }
+    state->markClientMutated();
+    if (!isLotusActive(ic)) {
         return;
     }
 
@@ -857,12 +956,13 @@ void SmartKeyAddon::onSurroundingTextUpdated(Event &event) {
     if (!directKeyboardActive && !lotusActive) {
         return;
     }
-    if (!ic->capabilityFlags().test(CapabilityFlag::SurroundingText) ||
-        !ic->surroundingText().isValid()) {
-        return;
-    }
     auto *state = ic->propertyFor(&factory_);
     if (state == nullptr || state->session() == nullptr) {
+        return;
+    }
+    if (!ic->capabilityFlags().test(CapabilityFlag::SurroundingText) ||
+        !ic->surroundingText().isValid()) {
+        state->markClientMutated();
         return;
     }
     const uint64_t nowMs = monotonicNowMs();
@@ -871,6 +971,7 @@ void SmartKeyAddon::onSurroundingTextUpdated(Event &event) {
          (state->isInLotusBurst(nowMs) || state->hasPendingBoundary()))) {
         return;
     }
+    state->markSurroundingUpdated();
     const auto &st = ic->surroundingText();
     smartkey_session_reconcile_surrounding(state->session(), engine_,
                                            st.text().c_str(), st.cursor(),

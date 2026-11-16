@@ -12,8 +12,11 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include <fcitx-utils/event.h>
+#include <fcitx-utils/eventloopinterface.h>
 #include <fcitx-utils/handlertable.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addoninstance.h>
@@ -196,6 +199,32 @@ inline bool isSyntheticVkKey(uint32_t keycode, uint32_t cp) {
     return false;
 }
 
+inline bool isWaylandFrontend(std::string_view frontend) {
+    return frontend == "wayland" || frontend == "wayland_v2";
+}
+
+/// Tracks whether `InputContext::surroundingText()` has received a fresh
+/// client update since the last client-mutating key/commit event.
+/// On Wayland (`wayland` / `wayland_v2`), `SurroundingText` lags behind keys
+/// forwarded via `zwp_virtual_keyboard_v1`, so `deleteSurroundingText` is only
+/// safe when `surroundingSynced` is true.
+struct SurroundingSyncTracker {
+    bool surroundingSynced = false;
+
+    void markClientMutated() { surroundingSynced = false; }
+    void markSurroundingUpdated() { surroundingSynced = true; }
+    void reset() { surroundingSynced = false; }
+
+    bool canUseDeleteSurrounding(bool hasSurroundingCap,
+                                 bool isSurroundingValid, uint32_t cursor,
+                                 uint32_t deleteChars,
+                                 std::string_view frontend) const {
+        return hasSurroundingCap && isSurroundingValid &&
+               cursor >= deleteChars &&
+               (!isWaylandFrontend(frontend) || surroundingSynced);
+    }
+};
+
 /// Pure state machine tracking `fcitx5-lotus` uinput replacement bursts, synthetic echo suppression,
 /// and pending filtered word-break boundaries (`CommitStringEvent` deferred evaluation).
 struct LotusBridgeTracker {
@@ -292,6 +321,7 @@ class SmartKeyState final : public InputContextProperty {
 public:
     SmartKeyState() : session_(smartkey_session_new()) {}
     ~SmartKeyState() override {
+        cancelPendingDelayedCommit();
         if (session_ != nullptr) {
             smartkey_session_free(session_);
             session_ = nullptr;
@@ -317,7 +347,10 @@ public:
     uint32_t takePendingBoundary() { return lotus_.takeBoundary(); }
     void clearPendingBoundary() { lotus_.clearBoundary(); }
 
-    void markLotusActivity() { lotus_.markActivity(); }
+    void markLotusActivity() {
+        lotus_.markActivity();
+        surroundingSync_.markClientMutated();
+    }
     bool hasLotusActivityInWord() const { return lotus_.hasActivityInWord(); }
     bool takeLotusActivityInWord() { return lotus_.takeActivityInWord(); }
 
@@ -341,6 +374,44 @@ public:
 
     void resetLotusTracking() { lotus_.reset(); }
 
+    void markClientMutated() { surroundingSync_.markClientMutated(); }
+    void markSurroundingUpdated() { surroundingSync_.markSurroundingUpdated(); }
+    void resetSurroundingSync() { surroundingSync_.reset(); }
+    bool canUseDeleteSurrounding(bool hasSurroundingCap,
+                                 bool isSurroundingValid, uint32_t cursor,
+                                 uint32_t deleteChars,
+                                 std::string_view frontend) const {
+        return surroundingSync_.canUseDeleteSurrounding(
+            hasSurroundingCap, isSurroundingValid, cursor, deleteChars,
+            frontend);
+    }
+
+    void setPendingDelayedCommit(std::string text,
+                                 std::unique_ptr<EventSourceTime> timer) {
+        cancelPendingDelayedCommit();
+        pendingDelayedCommit_ = std::move(text);
+        delayedCommitTimer_ = std::move(timer);
+    }
+    bool hasPendingDelayedCommit() const {
+        return !pendingDelayedCommit_.empty();
+    }
+    std::string takePendingDelayedCommit() {
+        auto timer = std::move(delayedCommitTimer_);
+        if (timer) {
+            timer->setEnabled(false);
+        }
+        std::string out = std::move(pendingDelayedCommit_);
+        pendingDelayedCommit_.clear();
+        return out;
+    }
+    void cancelPendingDelayedCommit() {
+        auto timer = std::move(delayedCommitTimer_);
+        if (timer) {
+            timer->setEnabled(false);
+        }
+        pendingDelayedCommit_.clear();
+    }
+
     bool shouldLogProfileTransition(uint8_t profile, std::string_view reason) {
         if (lastLoggedProfile_ == profile && lastLoggedReason_ == reason) {
             return false;
@@ -353,6 +424,9 @@ public:
 private:
     SmartKeySessionHandle *session_ = nullptr;
     LotusBridgeTracker lotus_{};
+    SurroundingSyncTracker surroundingSync_{};
+    std::string pendingDelayedCommit_;
+    std::unique_ptr<EventSourceTime> delayedCommitTimer_;
     uint8_t lastLoggedProfile_ = 0xFF;
     std::string lastLoggedReason_;
 };
@@ -377,11 +451,12 @@ private:
     bool isLotusActive(InputContext *ic) const;
     uint8_t classifyProfile(InputContext *ic, std::string_view appName,
                             const char **outReason = nullptr) const;
-    static void applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
-                                     const SmartKeyAction &act);
-    static void applyReplaceAction(InputContext *ic, SmartKeyState *state,
-                                   KeyEvent &keyEvent,
-                                   const SmartKeyAction &act);
+    void flushPendingDelayedCommit(InputContext *ic, SmartKeyState *state);
+    void applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
+                              const SmartKeyAction &act);
+    void applyReplaceAction(InputContext *ic, SmartKeyState *state,
+                            KeyEvent &keyEvent,
+                            const SmartKeyAction &act);
 
     Instance *instance_ = nullptr;
     SmartKeyEngineHandle *engine_ = nullptr;
