@@ -1,12 +1,11 @@
 # RFC: Multi-Language Dictionary Packs (`.skdict` v3 + generic builder)
 
-**Status:** APPROVED WITH CHANGES (2026-11-12). Decisions resolved in §2 — §2 overrides any
-conflicting text in §3–§10 (fr→es, v2 reader removed, monorepo). Propagate before Phase 1.
-**Date:** 2026-11-12
-**Scope:** `smartkey` (core/CLI/FFI) + `smartkey-dicts` (recipes, CI)
+**Status:** APPROVED & LOCKED (2026-11-16). Decisions in §2 are finalized and propagated through §3–§10 and Appendix A.
+**Date:** 2026-11-12 (updated 2026-11-16)
+**Scope:** `smartkey` (core/CLI/FFI/fcitx5) with `dicts/<lang>/` monorepo recipes (`smartkey-dicts` frozen at last v2 release)
 **Goal:** A contributor adds a language by writing `dicts/<lang>/pack.toml` (pinned upstream
 sources + sha256 + license) plus small curated overlay files. The generic build tool emits a
-valid pack. Adding a Tier A language requires **zero Rust edits**.
+valid `.skdict` v3 pack. Adding a Tier A language requires **zero Rust edits**.
 
 ---
 
@@ -79,9 +78,9 @@ All facts below were re-verified by reading the code in this session unless mark
 ### 1.7 Toolchain facts relevant to the design
 
 - `toml_edit` (with `serde`) is already a workspace dependency → `pack.toml` parsing needs **no new dependency**.
-- No sha256 crate in the workspace → `sha2` is the **only** proposed new dependency.
+- Zero new external crates needed: SHA-256 verification uses an in-repo FIPS 180-4 implementation (~65 lines of pure safe Rust, keeping `Cargo.lock` unchanged for `--locked`/`--frozen` builds).
 - `smartkey-dev` already has `build-lexicon` (calls the 8-arg compiler) and `eval` (golden corpus gate) — `dev.rs`.
-- Sizes: en pack 5.0 MB; raw sources: en_US.combined 15 MB, en_GB.combined 6.6 MB, count_2w 5.4 MB, typos 2.0 MB.
+- Sizes: en pack ~5.0 MB; raw sources: en_US.combined 15 MB, en_GB.combined 6.6 MB, count_2w 5.4 MB, typos 2.0 MB.
 
 ### 1.8 Tier A upstream verified: Helium314/aosp-dictionaries (Codeberg)
 
@@ -89,34 +88,37 @@ Observed via repo fetch: dozens of languages in the **exact `.combined` format `
 
 ---
 
-## 2. Decisions (RESOLVED 2026-11-12 — these override §3–§10)
+## 2. Decisions (LOCKED 2026-11-16)
 
 | # | Decision | Resolution | Why |
 |---|---|---|---|
-| D1 | Core packaging | **ACCEPTED as proposed.** Embedded v3 en fallback + bundled vi pack (`bundled-vi`, default on). Installed packs override everything, including shorthand. | Works offline on a fresh install; tests and eval need no fetch. |
-| D2 | Format compat | **OVERRIDDEN → clean break. No v2 reader.** On load, an installed v2 (or otherwise invalid) pack is **ignored**: the engine falls back to the bundled v3 pack and logs `legacy_pack_ignored`. `dict list` shows `legacy v2 — ignored, run: smartkey dict update <lang>`. | D1 makes the fallback free, so users lose nothing. A v2 reader would keep a frozen shorthand table alive just for v2 packs, which is the split-brain this RFC removes. The project is a pre-1.0 beta, and the only v2 packs in the wild are the maintainer's. |
-| D3 | Curated data home | **OVERRIDDEN → monorepo.** Move `smartkey-dicts/dicts/` and `spec/` into `smartkey/dicts/` (single source). Delete the curated files in `smartkey/data/`, keep `data/sources/` as a gitignored fetch cache. Publish v3 packs as release assets of `segfawlt/smartkey`, and point `dict update` (`main.rs:2177`) there. **Freeze `smartkey-dicts` at its last v2 release** (the maintainer archives it; agents never do), so old binaries' `dict update` keeps getting v2 packs they can read. | The pack format, builder, `rules.toml` schema, corpus gates and the bundled pack all change together. Today the dicts CI checks out *unpinned* smartkey `main`, so any format change breaks it. A monorepo gives one atomic commit per change and one CI. Contributors still edit a single text file. Third parties can still build their own packs with `build-pack --dicts-dir`. |
-| D4 | Tier A proof language | **OVERRIDDEN → es first, fr second.** | es has accents/ñ (exercises Unicode and confirms the ASCII-only smash index omits words rather than breaking) with no elision and little compounding, so the "zero Rust edits" claim is tested cleanly. fr elision (`l'homme`, `qu'il`, `j'ai`) goes through the English apostrophe/contraction paths and would pull Rust work into the proof. Do fr next, with elision documented as a known Tier A gap. de needs a compound-noun false-positive design first and is out of scope. |
+| D1 | Core packaging | **Embedded v3 `en` (`bundled-en`) + `vi` (`bundled-vi`) fallbacks, default on.** Installed packs override everything, including shorthand. | Works offline on a fresh install; tests and eval need no fetch. |
+| D2 | Format compat | **Clean break. No v1/v2 reader.** On load, an installed v1/v2 (or invalid) pack is **ignored**: the engine falls back to the bundled v3 pack and logs `DiagnosticEvent::PackNotice` (`legacy_pack_ignored` / `invalid_pack_ignored`). `dict list` shows `[legacy v2 — ignored; run: smartkey dict update <lang>]`. | D1 makes fallback free; keeping a v2 reader would retain a frozen shorthand table and perpetuate split-brain. |
+| D3 | Curated data home | **Monorepo `dicts/<lang>/`.** Move `smartkey-dicts/dicts/` + `spec/` into `smartkey/dicts/` without touching `smartkey-dicts` (frozen at v2). Delete duplicate curated files in `smartkey/data/`, keeping `data/sources/` as the gitignored fetch cache. Publish v3 packs on `segfawlt/smartkey` releases and point `dict update` there. | Format, builder, rules schema, corpus gates, and bundled packs evolve atomically in one commit and one CI. |
+| D4 | Tier A proof & routing | **`es` primary + `fr` secondary**, plus Fcitx5 `inputMethodEntry(ic)->languageCode()` routing via `resolveDirectKeyboardLang` (`keyboard-vn*` excluded from Lotus Telex). `clitics.prefixes` handles French elisions; `capitalize_standalone_i` gates `i -> I` to English only. | `es` verifies accents/ñ cleanly with zero Rust edits; `fr` proves prefix elision cleanly; `languageCode()` enables multi-language Fcitx5 keyboards without hardcoding `"en"`. |
+| D5 | Zero new external crates | Implement FIPS 180-4 SHA-256 directly in `smartkey-core::pack_builder`; keep `Cargo.lock` external crate graph unchanged (`curl` + `gzip -dc` for `--fetch`). | `--locked`/`--frozen` builds (`install-local.sh`, `PKGBUILD`) stay self-contained. |
+| D6 | Proper-noun homographs | **F1 + F2 + F3**: remove `polish` and `latin` from `dicts/en/proper_nouns.tsv`; keep AOSP `lint_proper_nouns` (`gap >= 60`); add `FLAG_AMBIGUOUS_PROPER = 0x04` skipped in Step 4b. | `count_2w.txt` has lowercase web-query bias on `texas`/`paris`/`asian`; AOSP case frequency gap separates true homographs cleanly. |
+| D7 | Vietnamese Tier B | Bundle `vi_lexicon.skdict` (~55 KB) via `bundled-vi`; remove all 3 `include_str!`s in `vi_telex.rs`; runtime reads installed Lotus `vietnamese.cm.dict` (`SMARTKEY_LOTUS_DICT` or system/user paths) as syllable authority with normalized-set `lotus_dict_drift` notice. | Runtime tracks live `fcitx5-lotus` updates automatically while preserving offline fallback. |
 
-### 2.1 Additional requirements from review
+### 2.1 Additional invariants from review
 
-1. **vi runtime authority:** when the installed lotus dict is present and parses, **it is the authority**, because lotus uses it. The pack's SYLLABLE_DICT is the fallback. Real set divergence is logged once per load (`info`), never per keystroke. Make the lotus dict path configurable, resolved next to `resolve_dict_path`.
-2. **Collapse the rule tables.** Contractions, transposed apostrophes, unmerged compounds and typo overrides are all unconditional typed→fix maps, so merge them into one `replacements = [{ typed, fix, kind }]` table. Keep `kind` so `MatchKind` and the learner's 2x-evidence rule for contractions still work. Keep `function_words`, `clitics { suffixes, prefixes }` (prefixes reserved for fr elision, unused for now), `casing { abbreviations, exclusions }` and `bigram_boosts`.
-3. **Keep only one copy of the en rules.** Once `dicts/en/rules.toml` exists, delete the Rust consts. They must not stay as defaults, or there will be two copies again. Tests use the bundled pack or an explicit test fixture.
-4. **`sha2` goes only in `smartkey-cli`** (dev builder), never in `smartkey-core`.
-5. **Stronger Phase 1 gate:** besides the corpus eval A/B, dump every `(word, meta)`, bigram, typo, variant pair and proper noun from the v2 and v3 images and require an **exact** diff (after remapping flags).
-6. **Defer the `EnglishScorer → LatinScorer` / `EnglishLexicon → PackLexicon` renames** to Phase 4, once es works. That keeps Phase 1 about the format and avoids alias churn.
-7. **Norvig `count_2w.txt` stays `UNVERIFIED`.** In Phase 4, also run the en eval *without* it and record how much it matters, so it can be dropped if the license check fails.
-8. **Dirty tree before Phase 1:** `casing.rs`, `event_log.rs`, `session.rs` and `vi_telex.rs` have uncommitted changes (~92+/104−) that this RFC didn't make. Their owner must commit or resolve them first. Never sweep them into an RFC commit.
+1. **vi runtime authority:** when the installed Lotus dict is present and non-empty, **it is the authority**, because Lotus uses it. The pack's `SYLLABLE_DICT` is the fallback. Real set divergence is logged once per load (`DiagnosticEvent::PackNotice { notice: "lotus_dict_drift", .. }`), never per keystroke and never on line-order / trailing-newline differences.
+2. **Collapse the rule tables.** Contractions, transposed apostrophes, unmerged compounds, and typo overrides collapse into one `replacements = [{ typed, fix, kind }]` table in `dicts/<lang>/rules.toml`. Keep `kind` so `MatchKind` and the learner's 2x-evidence rule for contractions still work. Keep `capitalize_standalone_i`, `function_words`, `clitics { suffixes, prefixes }`, `casing { leading_apostrophes, abbreviations, exclusions }`, and `bigram_boosts`.
+3. **Single source of truth for English rules.** Once `dicts/en/rules.toml` exists, delete the duplicated Rust rule consts (`UNCONDITIONAL_CONTRACTIONS`, `TRANSPOSED_APOSTROPHES`, `UNMERGED_COMPOUNDS`, `FUNCTION_WORDS`, `CLITIC_SUFFIXES`, `curated_typo_overrides`, `curated_boosts`). Tests use the bundled pack or explicit rule builders.
+4. **Zero-copy static load:** `PackLexicon::from_static_bytes` slices `WORDS_FST`, `TYPOS_FST`, and `typo_pool` as `Cow::Borrowed`.
+5. **Stronger Phase 1 gate:** before overwriting `en_lexicon.skdict`, dump every `(word, freq0, freq1, variant_mask, flags_remapped, word_id)`, every typo mapping, every UK↔US pair, every bigram, every smash entry, and every proper noun from v2 vs v3 and assert an **exact** match (0 differences).
+6. **Staged renames:** keep `EnglishLexicon` / `EnglishScorer` names in Phases 1–3; generalize to `PackLexicon` / `LatinScorer` (with deprecated type aliases) in Phase 4 once `es` works.
+7. **Norvig `count_2w.txt` stays `UNVERIFIED`:** mark `license = "UNVERIFIED"` in `dicts/en/pack.toml` (loud build warning + recorded in `SOURCE_MANIFEST`) and run a Phase 4 `--without-count2w` eval ablation to measure impact.
+8. **Clean baseline:** prior dirty changes in `casing.rs`, `event_log.rs`, `session.rs`, `vi_telex.rs` were already committed (`9ab2ef5`..`cae2c7e`), and `from_static_bytes` zero-copy (`Cow::Borrowed`) is already landed for v2 and preserved in v3.
 
 ---
 
 ## 3. Design overview — two tiers
 
-- **Tier A (data-only, Latin-script directly-typed):** fr, de, es, pt, it, nl, pl. Pack recipe + generic builder → generic `LatinScorer` (the current EnglishScorer algorithm, with rule tables from the pack). **Zero Rust edits** to add a language.
-- **Tier B (IME-coupled):** vi today (fcitx5-lotus bridge), CJK later. A small Rust module provides the IME-specific correction logic (Telex rescue / composition simulation); the **pack supplies** shorthand, slang shields, and the syllable dictionary. The lotus syllable validator is read at **runtime** from the IME's installed dict, with the pack's embedded copy as fallback and a **drift warning** when the two differ.
+- **Tier A (data-only, Latin-script directly-typed):** es, fr, pt, it, nl, pl, etc. (`tier = "data"`). Pack recipe + generic builder (`smartkey-dev build-pack`) → generic `LatinScorer` (with per-pack `LANGUAGE_RULES`, `capitalize_standalone_i`, and `clitics.prefixes`/`suffixes`). **Zero Rust edits** to add a language.
+- **Tier B (IME-coupled):** vi today (`fcitx5-lotus` bridge, `tier = "ime_bridge"`), CJK later. A small Rust module provides IME-specific correction logic (Telex rescue / composition simulation); the **pack supplies** shorthand, slang shields, and fallback syllable dictionary (`vi_lexicon.skdict`). The Lotus syllable validator reads at **runtime** from the installed IME dict (`SMARTKEY_LOTUS_DICT` or `/usr/{local/,}share/fcitx5/lotus/vietnamese.cm.dict`), using the pack's `SYLLABLE_DICT` as fallback and logging `lotus_dict_drift` once per load/reload if the normalized sets diverge.
 
-Non-goals for this RFC: keyboard layout as data (AZERTY/QWERTZ), Unicode-aware smash masks, accent-folding candidates, CJK modules, the dead `telex_passthrough` path (lotus audit P1 — separate fix), rules.toml format changes, FFI ABI changes.
+Non-goals for this RFC: keyboard layout as data (AZERTY/QWERTZ), Unicode-aware smash masks, accent-folding candidates, CJK modules, the dead `telex_passthrough` path (lotus audit P1 — separate fix), user `rules.toml` format changes, FFI ABI breaking changes.
 
 ---
 
@@ -129,64 +131,66 @@ offset  size  field
 0       8     magic  "SKDICT03"
 8       2     header_len      u16 LE — byte length of the header block below
 -- header block (self-describing, then TLV sections follow) --
-+0      1     lang_len        u8, then lang code ASCII lowercase ("en", "vi", "fr", …)
++0      1     lang_len        u8, then lang code ASCII lowercase ("en", "vi", "es", "fr", …)
 +…      3     pack_version    semver (major, minor, patch) as u8 ×3
++…      1     tier            u8 (0 = Data, 1 = ImeBridge)
 +…      1     variant_count   V, 1..=8
 +…      V ×   variant tag     u8 len + ASCII ("en_US", "pt_BR", …); index = bit position
 +…      1     freq_slot_count S, 0..=2
 +…      S ×   u8              bitmask of variant indices sharing that frequency slot
-+…      2     feature_flags   u16, reserved 0
++…      1     default_variant_idx u8
++…      2     feature_flags   u16 LE, reserved 0
 -- sections (repeat until EOF) --
 2       tag   u16 LE
 4       len   u32 LE
 len     payload
 ```
 
-**Forward compatibility rule:** readers MUST skip unknown section tags (length-delimited) and MUST fail cleanly on a malformed header. Newer packs on older runtimes degrade by omission, never by crash.
+**Forward compatibility rule:** readers MUST skip unknown section tags (length-delimited) and MUST fail cleanly on malformed headers or non-v3 magics (`SKDICT01`/`SKDICT02` return `LexiconError::LegacyFormat(1|2)`).
 
 ### 4.2 Section tags
 
 | Tag | Name | Payload |
 |---|---|---|
 | 0x0001 | `WORDS_FST` | fst `Map`, values = `WordMetaV3` packed u64 (§4.3) |
-| 0x0002 | `KNOWN_TYPOS` | `u32 fst_len` + typo fst + pool (fst values: `offset | len<<32` into pool) — same encoding as v2, wrapped in TLV |
-| 0x0003 | `VARIANT_REWRITES` | `u8 k`, then k × { variant_idx u8, `u32 pair_count`, pairs of len-prefixed `(other_variant_spelling, this_variant_spelling)` } |
-| 0x0004 | `BIGRAMS` | `u32 count` + count × (`u32 key` LE + `u8 score`) — key = `(word_id<<16)|word_id`, unchanged |
+| 0x0002 | `KNOWN_TYPOS` | `u32 fst_len` + typo fst + pool (fst values: `offset \| len<<32` into pool) |
+| 0x0003 | `VARIANT_REWRITES` | `u8 k`, then k × { `target_variant_idx` u8, `u32 pair_count`, pairs of len-prefixed `(from_other, to_target)` } |
+| 0x0004 | `BIGRAMS` | `u32 count` + count × (`u32 key` LE + `u8 score`) — key = `(word_id<<16)\|word_id`, unchanged |
 | 0x0005 | `SMASH_INDEX` | `u32 count` + count × (`u32 mask`, `u8 len`, `u8 freq`, len-prefixed word) — ASCII-only in v3.0 |
 | 0x0006 | `PROPER_NOUNS` | `u32 count` + pairs of len-prefixed `(lower, Capitalized)` |
 | 0x0007 | `SHORTHAND` | `u32 count` + pairs of len-prefixed `(trigger, expansion)`, sorted+deduped by trigger |
-| 0x0008 | `SLANG_SET` | `u32 count` + len-prefixed lowercase words — runtime-queryable shield set (vi today; en merges slang into flags at build time and omits this section) |
-| 0x0009 | `LANGUAGE_RULES` | `u8 rules_version = 1` + UTF-8 JSON: contractions, transposed_apostrophes, unmerged_compounds, function_words, clitic_suffixes, typo_overrides, bigram_boosts, casing { abbreviations, exclusions } |
-| 0x000A | `SYLLABLE_DICT` | `u32 count` + sorted, deduped syllables (vi; built from the upstream cm.dict, normalized as a set so upstream reordering ≠ drift) |
-| 0x000B | `SOURCE_MANIFEST` | `u32 count` + count × { name, 32-byte sha256, license string } — provenance, shown by `smartkey dict list -v` |
+| 0x0008 | `SLANG_SET` | `u32 count` + len-prefixed lowercase words — runtime-queryable shield set (`vi` uses this; `en`/`es`/`fr` merge slang into `FLAG_SHIELD` at build time) |
+| 0x0009 | `LANGUAGE_RULES` | `u8 rules_version = 1` + UTF-8 JSON: `capitalize_standalone_i`, `replacements [{ typed, fix, kind }]`, `function_words`, `clitics { suffixes, prefixes }`, `bigram_boosts`, `casing { leading_apostrophes, abbreviations, exclusions }` |
+| 0x000A | `SYLLABLE_DICT` | `u32 count` + sorted, deduped syllables (`vi`; normalized as a set so upstream reordering ≠ drift) |
+| 0x000B | `SOURCE_MANIFEST` | `u32 count` + count × { `u32`-len-prefixed name, `[u8; 32]` sha256, `u32`-len-prefixed license string } |
 
-All sections are **optional**. A Tier A pack without bigram or typo sources simply omits 0x0004/0x0002; the vi pack omits WORDS_FST-scale sections entirely.
+All sections are **optional**. A Tier A pack without bigram or typo sources omits `0x0004`/`0x0002`; the `vi` pack omits `WORDS_FST`-scale sections entirely.
 
-### 4.3 `WordMetaV3` (packed u64, 48 bits used)
+### 4.3 `WordMeta` v3 (packed u64, 48 bits used)
 
 ```
-bits  0..8   freq[0]  u8   frequency within freq-slot-0 variants
-bits  8..16  freq[1]  u8   frequency within freq-slot-1 variants
+bits  0..8   freq0         u8   frequency within freq-slot-0 variants
+bits  8..16  freq1         u8   frequency within freq-slot-1 variants
 bits 16..24  variant_mask  u8   bit i = valid in variant i (up to 8 variants)
 bits 24..32  flags         u8   0x01 offensive · 0x02 shield (tech/slang/dev) ·
-                                0x04 ambiguous_proper (findings F3) · 0xF8 reserved
+                                0x04 ambiguous_proper (findings F3) · 0xF8 reserved (0)
 bits 32..48  word_id       u16
 bits 48..64  reserved, must be 0 (validated on load)
 ```
 
-**Why frequency slots:** two u8 slots + a header mapping (which variants share which slot) exactly reproduces today's en semantics — `freq[0]`≡`us_freq`, `freq[1]`≡`gb_freq` — while generalizing: `de` = slot0 {de_DE, de_AT}, slot1 {de_CH} (ß/ss); `pt` = slot0 {pt_BR}, slot1 {pt_PT}. `effective_freq` keeps the −25 cross-slot fallback and the max() behavior in variant-agnostic ("Mixed") mode. **English behavior is bit-for-bit isomorphic** (appendix A).
+**Why frequency slots:** two `u8` slots + header slot bitmasks reproduce today's English semantics (`freq0 ≡ us_freq`, `freq1 ≡ gb_freq`) while generalizing (`de` = slot0 `{de_DE, de_AT}`, slot1 `{de_CH}`; `pt` = slot0 `{pt_BR}`, slot1 `{pt_PT}`; `es`/`fr` = slot0 `{es_ES}`/`{fr_FR}`). `effective_freq` keeps the −25 cross-slot fallback and `max()` in variant-agnostic (`Mixed`) mode.
 
-**Variants vs `Dialect`:** the user-facing `rules.toml` key `dialect` stays valid for en (back-compat); internally it maps to a variant index. New generic key: `[lang.<code>] variant = "en_GB"`. `VariantSelection` replaces `Dialect` in internal APIs; the public enum stays as a deprecated alias.
+**Variants vs `Dialect`:** the user-facing `rules.toml` key `dialect` stays valid for `en` (back-compat). Internal lookups accept variant awareness without breaking public API/FFI types.
 
-### 4.4 v2 read-compat (per D2)
+### 4.4 Clean break on v1/v2 (per D2)
 
-The v2 parser is retained, mapped onto the same `PackLexicon` struct with synthesized header data (`lang="en"`, variants `[en_US, en_GB]`, slot map {0:{0}, 1:{1}}). v2 packs have no SHORTHAND/LANGUAGE_RULES sections → shorthand expansion falls back to the built-in (frozen) table and rules to the built-in consts. `smartkey dict list` flags v2 packs `legacy — update available`. Deletion planned after one release cycle of v3-only CI packs.
+No v1/v2 parser is included. `parse_sections` / `peek_skdict_header` identify `SKDICT01` / `SKDICT02` and return `LexiconError::LegacyFormat(1|2)`. `LexiconRegistry` ignores legacy/corrupt files on disk, falls back to the bundled v3 pack when present, and emits a one-time `DiagnosticEvent::PackNotice` (`legacy_pack_ignored` / `invalid_pack_ignored`). `smartkey dict list` displays `[legacy v2 — ignored; run: smartkey dict update <lang>]`.
 
 ---
 
 ## 5. `pack.toml` schema
 
-Existing `[pack]` keys are kept and extended; `[sources]` becomes structured; curated local files move to `[overlays]`.
+Lives at `dicts/<lang>/pack.toml` in the `smartkey` monorepo:
 
 ```toml
 [pack]
@@ -204,25 +208,25 @@ en_US = { freq_slot = 0, default = true }
 en_GB = { freq_slot = 1 }
 
 [sources.en_us]                   # every source: url + sha256 + license, build FAILS if missing
-format = "aosp_combined"          # aosp_combined | typos_csv | bigram_counts | variant_map_json | fcitx_cm_dict
+format = "aosp_combined"          # aosp_combined | typos_csv | bigram_counts | variant_map_json | wordlist | fcitx_cm_dict
 url = "https://raw.githubusercontent.com/openboard-team/openboard/v1.4.5/dictionaries/en_wordlist.combined.gz"
-decompress = "gzip"
+decompress = "gzip"               # none | gzip
 sha256 = "<sha256 of the decoded content the parser ingests>"
 license = "Apache-2.0"
-variants = ["en_US"]              # which variant bucket this source feeds
+variants = ["en_US"]
 capture_bigrams = true
 
 [sources.en_gb]                   # … variants = ["en_GB"], capture_bigrams = false
 [sources.typos]                   # format = "typos_csv", license = "MIT OR Apache-2.0"
-[sources.variant_map]             # format = "variant_map_json" (british_to_american.json)
-[sources.bigram_counts]           # format = "bigram_counts", license = "UNVERIFIED"  (warning, never silent)
+[sources.variant_map]             # format = "variant_map_json"
+[sources.bigram_counts]           # format = "bigram_counts", license = "UNVERIFIED" (warning, never silent)
 
 [overlays]                        # curated files, relative to dicts/<lang>/, merged in order
-shorthand   = ["shorthand.tsv"]
-slang       = ["slang.txt"]
+shorthand    = ["shorthand.tsv"]
+slang        = ["slang.txt"]
 proper_nouns = ["proper_nouns.tsv"]
-dev_terms   = ["dev_terms.txt"]
-rules       = ["rules.toml"]      # curated rule tables → LANGUAGE_RULES section
+dev_terms    = ["dev_terms.txt"]
+rules        = ["rules.toml"]     # curated rule tables → LANGUAGE_RULES section
 
 [build]                           # optional tuning; sane defaults per format
 bigram_top_n = 90000
@@ -231,30 +235,36 @@ proper_noun_freq = 160
 tech_freq = 172
 ```
 
-vi example (Tier B, overlays-only — no upstream wordlist):
+`vi` example (Tier B):
 
 ```toml
 [pack]
-code = "vi"; tier = "ime_bridge"; version = "0.1.0"; format_version = 3; …
+code = "vi"
+name = "Vietnamese"
+version = "0.2.0"
+format_version = 3
+tier = "ime_bridge"
+maintainer = "segfawlt"
+license = "GPL-3.0-or-later"
 
 [variants]
 vi = { freq_slot = 0, default = true }
 
-[sources.lotus_dict]              # provenance only; runtime prefers the installed IME dict
+[sources.lotus_dict]
 format = "fcitx_cm_dict"
-url = "<upstream lotus vietnamese.cm.dict raw URL>"
-sha256 = "…"
-license = "TBD — verify against fcitx5-lotus upstream at phase 5"
+path = "vietnamese.cm.dict"       # or pinned url + sha256
+sha256 = "<sha256>"
+license = "GPL-3.0-or-later"
 
 [overlays]
 shorthand = ["shorthand.tsv"]
 slang = ["slang.txt"]
 
 [build]
-syllable_dict = true              # emits SYLLABLE_DICT from the lotus source
+syllable_dict = true
 ```
 
-Curated rule tables move from Rust consts into `dicts/en/rules.toml` (contractions, apostrophe slips, compounds, function words, clitics, typo overrides, bigram boosts, casing tables). The Rust consts remain as **defaults** used when a pack has no LANGUAGE_RULES section (test helpers `from_word_list`, v2 packs).
+English rule tables move from Rust consts (`scorer.rs`, `lexicon.rs`, `casing.rs`) into `dicts/en/rules.toml`, with the Rust consts deleted once `dicts/en/rules.toml` is wired in.
 
 ---
 
@@ -262,40 +272,37 @@ Curated rule tables move from Rust consts into `dicts/en/rules.toml` (contractio
 
 | Today | Becomes |
 |---|---|
-| `EnglishLexicon` (en-shaped) | `PackLexicon` (generic; `pub type EnglishLexicon = PackLexicon` deprecated alias for FFI/one cycle). Parses v3 + v2. `from_static_bytes` fixed to real `Cow::Borrowed` (v3 path) — kills the `lexicon.rs:343-358` copy. |
-| `EnglishScorer` (en rules hardcoded) | `LatinScorer` implementing `LanguageScorer`; contractions/compounds/function-words/casing read from the pack's LANGUAGE_RULES, falling back to built-in consts. |
-| `Option<EnglishScorer>` in engine | `LexiconRegistry { packs: HashMap<LangId, LoadedPack> }`; `LoadedPack = { lexicon, scorer: Latin | ViLotus }`. `evaluate_token` resolves by session lang; missing pack → today's user-rules-only path. |
-| `resolve_dict_path("en")` at `session.rs:41,58`, `main.rs:44` | `registry.load_installed(lang)` with fallback chain: installed pack → bundled pack (per D1) → none. |
-| Shorthand via `include_str!` (`lexicon.rs:12` → `scorer.rs:684`) | `PackLexicon::lookup_shorthand` over the SHORTHAND section. Split-brain fixed: pack overrides everything. |
-| vi data via 3 × `include_str!` (`vi_telex.rs:3-5`) | Bundled v3 vi pack (feature `bundled-vi`, default on — parity with today's unconditional embed, ~<100 KB) + optional runtime read of the installed lotus dict: parse `/usr/share/fcitx5/lotus/vietnamese.cm.dict`, compare as a **normalized set** vs the pack's SYLLABLE_DICT, emit an `event_log` warning on real divergence (set difference or count change), never on mere reordering. |
-| `reconcile_surrounding` gate `lang != "en"` (`session.rs:688`) | Capability gate: reconciliation enabled for `tier = "data"` packs, disabled for `tier = "ime_bridge"`. |
-| `dict install` validating everything as English (`main.rs:1948`) | Header validation: `lang` must equal the requested `<lang>`; prints pack version, variants, licenses. `dict list` parses headers (cheap header read) and shows lang/version/variants/legacy flag; `-v` prints SOURCE_MANIFEST. |
-| `Dialect` (en-only semantics) | `VariantSelection` internally; `dialect` key still accepted for en. |
+| `EnglishLexicon` (en-shaped) | `PackLexicon` (generic; `pub type EnglishLexicon = PackLexicon` kept as compat alias in Phase 4). Parses v3 only (`SKDICT03`). `from_static_bytes` slices `WORDS_FST`, `TYPOS_FST`, `typo_pool` via `Cow::Borrowed`. |
+| `EnglishScorer` (en rules hardcoded) | `LatinScorer` implementing `LanguageScorer` (`pub type EnglishScorer = LatinScorer` alias); contractions, apostrophe slips, compounds, typo overrides, function words, clitics (`prefixes` + `suffixes`), `capitalize_standalone_i`, and casing tables read from `LANGUAGE_RULES`. |
+| `Option<EnglishScorer>` in engine | `LexiconRegistry` inside `SmartKeyEngine` (`HashMap<LangId, LoadedPack>`). `scorer()` / `lexicon()` return `"en"` pack for back-compat + Lotus momentum shield; `scorer_for(lang)` / `lexicon_for(lang)` resolve any loaded language. |
+| `resolve_dict_path("en")` (`session.rs`, `main.rs`) | Registry loads installed packs (user/system/`SMARTKEY_DICT_DIR`), ignoring non-v3 files with `PackNotice` and falling back to `bundled-en` / `bundled-vi`. |
+| Shorthand via `include_str!` (`lexicon.rs:12`) | `PackLexicon::lookup_shorthand` over `SHORTHAND` section. Split-brain eliminated. |
+| `vi` data via 3 × `include_str!` (`vi_telex.rs:3-5`) | Bundled `vi_lexicon.skdict` (`bundled-vi`, default on, ~55 KB) + runtime read of `resolve_lotus_dict_path()` (`SMARTKEY_LOTUS_DICT` → `/usr/{local/,}share/fcitx5/lotus/vietnamese.cm.dict` → `~/.local/share/fcitx5/lotus/vietnamese.cm.dict`). Normalized-set diff once on load/reload emits `lotus_dict_drift` only when sets differ. |
+| Fcitx5 addon hardcoded `"en"` on `keyboard-*` | `resolveDirectKeyboardLang(ic)` inspects `instance_->inputMethodEntry(ic)->languageCode()`, extracts lowercase primary subtag, skips empty/`"vi"`, and passes the active language (`"en"`, `"es"`, `"fr"`, …) to `smartkey_session_set_lang`. |
+| `session.rs` `!= "en"` / `== "en"` gates | Capability/tier + `scorer_for(lang)` gates (`tier == Data` enables surrounding-text reconcile + `RealWordDeclined` + lexicon-backed learning). |
+| `dict install` / `list` / `update` | Validates `header.lang == requested_lang`; `dict list [-v]` inspects headers (flagging legacy v1/v2 as ignored) and displays `SOURCE_MANIFEST`; `dict update` points to `segfawlt/smartkey` releases. |
 
-The learner, `rules.toml` user format, event log, session state machine, and FFI ABI are unchanged.
+The learner's `rules.toml` format, JSONL event log layout, session state machine, and `smartkey.h` C ABI stay backwards-compatible.
 
 ---
 
-## 7. Generic builder: `smartkey-dev build-pack <lang> [options]`
+## 7. Generic builder: `smartkey-dev build-pack <lang|all> [options]`
 
-Options: `--dicts-dir <path>` (default: sibling `../smartkey-dicts/dicts`, else explicit error with hint), `--out <path>`, `--fetch` (download pinned sources), `--verify` (run pack eval gate after build).
+Options: `--dicts-dir <path>` (defaults to `<repo>/dicts`), `--out <path>`, `--fetch`, `--verify`.
 
 Pipeline:
-
 1. **Parse** `dicts/<lang>/pack.toml` (`toml_edit` — no new dep).
-2. **Fetch** each source with `curl` (same pattern as `dict install`), verify **sha256** (`sha2` — the one new dependency); cache under `data/sources/<lang>/`. Fail hard on mismatch or missing `license`.
-3. **Parse** per `format` handler: `aosp_combined` (existing `parse_aosp`, parameterized by variant bucket + `capture_bigrams`), `typos_csv`, `bigram_counts`, `variant_map_json`, `wordlist` (plain, optional `,freq`), `fcitx_cm_dict`.
-4. **Merge overlays** with today's exact semantics (dev-terms freq 172, slang shield-only, proper-noun freq 160, variant-map propagation ≥120, shorthand trigger shields).
+2. **Fetch/verify** each source (via `curl` + optional `gzip -dc` when `--fetch` is set; cache under `data/sources/<lang>/`), verify **SHA-256** using pure-Rust FIPS 180-4 (`pack_builder::sha256_hex` — zero new external crates), fail hard on mismatch or missing `license`.
+3. **Parse** per `format` handler: `aosp_combined`, `typos_csv`, `bigram_counts`, `variant_map_json`, `wordlist`, `fcitx_cm_dict`.
+4. **Merge overlays**: `dev_terms`, `slang`, `proper_nouns`, `shorthand`, `rules` (`rules.toml` → `LanguageRules`).
 5. **Lint:**
-   - Proper-noun homograph lint (findings F2): flag candidates whose lowercase form is a valid word; when a case-sensitive bigram corpus is present use lowercase-vs-capitalized share (the `polish` 73% / `april` 19% evidence), setting `FLAG_AMBIGUOUS_PROPER` (F3) or failing under `--strict`; warn+skip when no corpus exists.
-   - Duplicate shorthand triggers, trigger-is-valid-word collisions, empty expansions.
-   - License gate: missing → hard fail; `UNVERIFIED` / NC / ND → loud warning recorded in SOURCE_MANIFEST.
-6. **Serialize** v3 deterministically (BTreeMap ordering — byte-reproducible for identical inputs).
-7. **Verify:** load the image back; with `--verify`, run the language's corpus gate.
+   - Proper-noun homograph lint (`lint_proper_nouns`, AOSP frequency gap `>= 60`, **F2**); `FLAG_AMBIGUOUS_PROPER` runtime safety bit (**F3**).
+   - Duplicate/invalid shorthand checks.
+   - License gate: missing → hard fail; `UNVERIFIED` / NC / ND → warning + recorded in `SOURCE_MANIFEST`.
+6. **Serialize** v3 deterministically (`BTreeMap` ordering).
+7. **Verify** roundtrip load and optional corpus eval (`--verify`).
 
-`build-lexicon` remains as a deprecated alias for `build-pack en`.
-
-**CI (smartkey-dicts):** checkout both repos → `build-pack en --verify`, `build-pack fr --verify` (phase 4+) → upload artifacts → release on tags. **The dicts→data copy step is deleted** (D3). vi pack builds from phase 5.
+`build-lexicon` rebuilds the bundled assets (`en_lexicon.skdict` and `vi_lexicon.skdict`).
 
 ---
 
@@ -303,40 +310,33 @@ Pipeline:
 
 | Component | Today | After |
 |---|---|---|
-| Compiler | `compile_skdict_from_sources(8 args)` | `PackBuilder` driven by pack.toml |
-| Shorthand | `include_str!` binary-side, shields pack-side | SHORTHAND pack section, single source |
-| En rule tables | Rust consts `scorer.rs:90-193`, `casing.rs` | `dicts/en/rules.toml` → LANGUAGE_RULES section (consts = defaults) |
+| Compiler | `compile_skdict_from_sources(8 args)` | `PackBuilder` driven by `dicts/<lang>/pack.toml` |
+| Shorthand | `include_str!` binary-side, shields pack-side | `SHORTHAND` pack section, single source |
+| En rule tables | Rust consts (`scorer.rs`, `lexicon.rs`, `casing.rs`) | `dicts/en/rules.toml` → `LANGUAGE_RULES` (consts deleted) |
 | Engine | `Option<EnglishScorer>` | `LexiconRegistry` |
-| Dict install | any pack validates as en | header-lang validation |
-| Curated data | two mirrors (`smartkey/data` + `smartkey-dicts/dicts`) | `smartkey-dicts/dicts/` only |
-| Source pinning | `fetch_sources.sh` (AB_REF unpinned master) | pack.toml url+sha256+ref, enforced |
-| vi data | 3 × `include_str!`, vendored dict already drifted | vi v3 pack + runtime lotus dict read + drift warning |
-| CI | copy step, en only | `--dicts-dir` builds en/fr(/vi), no copying |
-| FST copy on load | `Cow::Owned` both branches | true zero-copy on v3 static path |
+| Fcitx5 IM lang | Hardcoded `"en"` on `keyboard-*` | `inputMethodEntry(ic)->languageCode()` via `resolveDirectKeyboardLang` |
+| Dict install | Any pack validates as `en` | Header `lang` validation + `segfawlt/smartkey` releases |
+| Curated data | Duplicate `smartkey/data` + `smartkey-dicts` | Monorepo `smartkey/dicts/` only (`smartkey-dicts` frozen at v2) |
+| `vi` data | 3 × `include_str!` | `vi_lexicon.skdict` + runtime Lotus dict authority + drift warning |
 
 ---
 
 ## 9. Phase plan (each phase independently green, conventional commit, staged files only)
 
-1. **`feat(core): skdict v3 TLV format, generic WordMeta, v2 read-compat`**
-   PackLexicon rename behind alias; v3 parse/serialize; real zero-copy static load; en pack rebuilt as v3 through the existing pipeline temporarily.
-   *Gate:* `cargo test --workspace` (incl. `corpus_eval`, `vi_lotus_eval`, `learning_eval`), `cargo clippy --workspace`, and a scripted A/B: `smartkey-dev eval` output (fix recall / must-not-touch / p50-p99) **identical** before vs after; pasted in the report.
-2. **`feat(core): shorthand + language rules as pack sections`**
-   Delete `lexicon.rs:12` include_str; scorer reads pack sections (consts as fallback); F3 ambiguous flag plumbed through proper-noun pass; en pack regenerated.
-   *Gate:* same eval A/B + new section roundtrip unit tests.
-3. **`feat(engine): LexiconRegistry + lang-aware dict commands`**
-   Registry replaces `Option<EnglishScorer>`; session/CLI rewiring; capability gate replaces `!= "en"`; `dict install/list/update` header-aware.
-   *Gate:* full tests + CLI smoke (install mismatched-lang pack must fail), eval unchanged.
-4. **`feat(cli): generic build-pack + en recipe + fr proof pack`**
-   pack.toml schema, `sha2` dep, lints, fr recipe from aosp-dictionaries, small `tests/corpus/fr` gate; smartkey-dicts CI switches to `build-pack --dicts-dir` (copy step deleted).
-   *Gate:* en A/B eval identical; fr pack loads and corrects (demo transcript incl. accented words; smash index demonstrably omits non-ASCII without breaking).
-5. **`feat(vi): vi pack + lotus runtime dict with drift warning`**
-   vi pack.toml → vi.skdict (SHORTHAND + SLANG_SET + SYLLABLE_DICT + manifest); runtime installed-dict read with normalized-set drift warning; remove the 3 `include_str!`s.
-   *Gate:* `vi_lotus_eval` + `corpus_eval` unchanged; drift warning demonstrated against the already-drifted installed dict (observed in §1.5).
-6. **`docs: align both READMEs`**
-   smartkey: "English fallback embedded, fully overridable; every language a hot-swappable pack". smartkey-dicts: contributor flow = pack.toml + overlays + licenses; CI builds en+fr; vi documented.
-
-Verification ritual per phase: full test suite + clippy + scripted before/after `smartkey-dev eval` with pasted outputs; every claim labeled **Observed** (command output) vs **Inferred**.
+0. **`docs(rfc): finalize multilang dict pack v3 specification and decisions`**
+   Propagate locked D1–D7 decisions cleanly across `docs/rfc-multilang-dict-packs.md`.
+1. **`feat(core): skdict v3 TLV format and WordMetaV3`**
+   v3 header/TLV parse & serialize; clean-break `LegacyFormat` error on v1/v2; zero-copy `Cow::Borrowed` static load; exact v2-vs-v3 6-table dump diff gate + `en_lexicon.skdict` rebuilt as v3.
+2. **`feat(core): shorthand, slang, and language rules in v3 packs`**
+   Migrate curated data into `dicts/{en,vi,spec}/`; create `dicts/en/rules.toml` (collapsed `replacements` + `capitalize_standalone_i` + `clitics` + `function_words` + `casing` + `bigram_boosts`); remove `include_str!` and duplicated Rust consts; F1 (`polish`, `latin` removed) + F3 (`FLAG_AMBIGUOUS_PROPER`).
+3. **`feat(engine,fcitx5,cli): LexiconRegistry, language routing, and header-aware dict CLI`**
+   `LexiconRegistry` + `PackNotice` on ignored legacy packs; Fcitx5 `resolveDirectKeyboardLang` (`inputMethodEntry->languageCode()`); `smartkey dict list/install/update` header checks + `explain --lang`.
+4. **`feat(cli,dicts): generic build-pack, PackLexicon/LatinScorer, and es + fr proof packs`**
+   `pack_builder` with FIPS 180-4 SHA-256 (0 new external crates); `PackLexicon` / `LatinScorer` renames + `clitics.prefixes` French elision; `dicts/en/pack.toml` (`count_2w` `--without-count2w` ablation); `dicts/es/` + `dicts/fr/` packs & corpus gates.
+5. **`feat(vi): vi_lexicon.skdict pack and runtime Lotus dictionary authority`**
+   Build `vi_lexicon.skdict` (`bundled-vi`); remove all 3 `include_str!`s from `vi_telex.rs`; runtime `resolve_lotus_dict_path()` with normalized-set `lotus_dict_drift` notice; remove legacy curated files from `data/` and update install/packaging scripts.
+6. **`docs: align README, AGENTS, and RFC with v3 multi-language packs`**
+   Update docs, run full verification (`cargo test`, `clippy`, `eval` en/es/fr, `check-versions.sh`), commit, and run `install-local.sh` + live smoke checks.
 
 ---
 
@@ -344,28 +344,27 @@ Verification ritual per phase: full test suite + clippy + scripted before/after 
 
 | Risk | Mitigation |
 |---|---|
-| En behavior drift on rebuild | A/B corpus eval per phase; format mapping is bit-isomorphic (appendix A); word_id ranking rule unchanged |
-| Upstream drift/unavailability | url+ref+sha256 pinned per source; hard fail on mismatch; `AB_REF@master` hole closed by pack.toml |
-| License landmines (Norvig unverified; NC lists e.g. Slovak; per-language variety) | per-source license mandatory; NC/ND/UNVERIFIED warnings recorded in SOURCE_MANIFEST; distribution calls stay with the maintainer, never silently stripped |
-| u16 word_id cap | bigram coverage limited to top 65,535 words — acceptable for ranking; documented per pack (fr large vocab still fine for top words) |
-| ASCII-only smash index on accented langs | builder includes ASCII words only; non-ASCII gracefully uncovered; Unicode folding explicitly future work |
-| vi false-positive drift alarms | compare normalized syllable **sets**, not raw file bytes; ordering/header changes don't warn |
-| Legacy v2 debt | read-only support, flagged in `dict list`, deleted after one release cycle |
-| Pack size growth (fr etc. in releases) | artifacts via GitHub Releases as today; core binary grows only if fallbacks are enabled (en 5 MB + vi <0.1 MB, no regression vs today) |
-| Determinism/reproducibility | BTreeMap-ordered serialization; CI builds are byte-reproducible for pinned inputs |
+| En behavior drift on v2→v3 rebuild | Phase 1 exact 6-table dump diff + A/B `smartkey-dev eval` (`95/95`, `141/141`) |
+| Upstream drift/unavailability | URL + tag + SHA-256 pinned in `pack.toml`, enforced in `build-pack` |
+| License landmines (`count_2w` unverified; NC lists) | Per-source license mandatory; `UNVERIFIED` / NC / ND recorded in `SOURCE_MANIFEST` with warnings |
+| French elision false positives (`l'homme`, `qu'il`) | `clitics.prefixes` in `LANGUAGE_RULES` strips known elision prefix for valid-stem shield |
+| `keyboard-vn*` accidentally activating Lotus Telex | `resolveDirectKeyboardLang` excludes `languageCode == "vi"` on `keyboard-*` |
+| `vi` false-positive drift alarms | Compare normalized deduplicated syllable **sets**, never raw file bytes |
+| Lockfile drift on `--locked`/`--frozen` builds | Zero new external crates (pure-Rust SHA-256, `curl` + `gzip`) |
 
 ---
 
-## Appendix A — en v2 → v3 field equivalence
+## Appendix A — `en` v2 → v3 field equivalence
 
 | v2 | v3 | Note |
 |---|---|---|
-| `us_freq` | `freq[0]`, slot0 = {en_US} | identical semantics incl. −25 fallback |
-| `gb_freq` | `freq[1]`, slot1 = {en_GB} | identical |
+| `us_freq` | `freq0`, slot0 = `{en_US}` | identical semantics incl. −25 fallback |
+| `gb_freq` | `freq1`, slot1 = `{en_GB}` | identical |
 | `FLAG_IN_US/GB` | `variant_mask` bits 0/1 | identical validity logic |
 | `FLAG_OFFENSIVE` (0x04) | `flags` bit 0x01 | value remap only |
 | `FLAG_TECH` (0x08) | `flags` bit 0x02 (shield) | value remap only |
+| (none) | `flags` bit 0x04 (`ambiguous_proper`) | F3 proper-noun guard |
 | `word_id: u16` | `word_id: u16` | unchanged, same ranking rule |
-| uk_to_us / us_to_uk | VARIANT_REWRITES for en_US / en_GB | `Mixed` mode uses default-variant rewrites (today's behavior) |
-| positional sections | TLV tags | v3 reader; v2 reader retained |
-| (none) | SHORTHAND, LANGUAGE_RULES, SOURCE_MANIFEST | new capability; fallback to built-ins when absent |
+| `uk_to_us` / `us_to_uk` | `VARIANT_REWRITES` for `en_US` / `en_GB` | `Mixed` mode uses default-variant (`en_US`) rewrites |
+| positional sections | TLV tags | clean break: v3 only (`LegacyFormat` on v1/v2) |
+| (none) | `SHORTHAND`, `SLANG_SET`, `LANGUAGE_RULES`, `SYLLABLE_DICT`, `SOURCE_MANIFEST` | modular pack data |
