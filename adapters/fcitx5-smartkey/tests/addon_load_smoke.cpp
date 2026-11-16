@@ -148,10 +148,32 @@ void verifyProfileClassification() {
     assert(st.vkBoundaryCommit().empty());
 }
 
+void verifyKeyboardLangNormalization() {
+    using fcitx::smartkey::normalizeKeyboardLangCode;
+
+    assert(normalizeKeyboardLangCode("keyboard-us", "en") == "en");
+    assert(normalizeKeyboardLangCode("keyboard-latam", "es") == "es");
+    assert(normalizeKeyboardLangCode("keyboard-fr", "fr_FR") == "fr");
+    assert(normalizeKeyboardLangCode("keyboard-pt", "pt-BR") == "pt");
+    assert(normalizeKeyboardLangCode("keyboard-brai", "") == "");
+    assert(normalizeKeyboardLangCode("keyboard-vn", "vi") == "");
+    assert(normalizeKeyboardLangCode("lotus", "vi") == "");
+
+    // Additional edge cases: case-folding, regional Vietnamese, non-keyboard IMs, empty subtags
+    assert(normalizeKeyboardLangCode("keyboard-us", "EN_US") == "en");
+    assert(normalizeKeyboardLangCode("keyboard-es", "es_ES") == "es");
+    assert(normalizeKeyboardLangCode("keyboard-vn", "vi_VN") == "");
+    assert(normalizeKeyboardLangCode("keyboard-trans", "") == "");
+    assert(normalizeKeyboardLangCode("keyboard-de", "de") == "de");
+    assert(normalizeKeyboardLangCode("keyboard-us", "_US") == "");
+    assert(normalizeKeyboardLangCode("", "en") == "");
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
     verifyProfileClassification();
+    verifyKeyboardLangNormalization();
     if (argc < 2) {
         std::cerr << "usage: addon_load_smoke <libsmartkey.so>\n";
         return 2;
