@@ -16,11 +16,14 @@ pub use event_log::{
 pub use learner::{LearnEvent, SkipReason};
 pub use lexicon::{
     compile_skdict_from_sources, default_user_dict_dir, lookup_english_shorthand,
-    resolve_dict_path, EnglishLexicon, LexiconError, WordMeta,
+    peek_skdict_header, peek_skdict_header_and_manifest, resolve_dict_path, BigramBoost,
+    CasingRules, CliticRules, EnglishLexicon, LanguageRules, LexiconError, PackHeader, PackTier,
+    ReplacementKind, ReplacementRule, SourceManifestEntry, WordMeta,
 };
 pub use scorer::{EmptyUserRules, EnglishScorer, EvalContext, LanguageScorer, UserRuleView};
 pub use session::{
-    apply_key_to_buffer, KeyInput, SessionAction, SessionOutput, SmartKeyEngine, SmartKeySession,
+    apply_key_to_buffer, KeyInput, LexiconRegistry, SessionAction, SessionOutput, SmartKeyEngine,
+    SmartKeySession,
 };
 pub use store::{
     classify_builtin_program, normalize_program_id, BlockPair, CompiledRules, ConfidenceTier,

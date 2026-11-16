@@ -72,17 +72,7 @@ const TWO_CHAR_CAPSLOCK_EXCLUSIONS: &[&str] = &[
     "pH", "dB", "kB", "mB", "gB", "tB", "mA", "mV", "mW", "kW", "kV", "nM", "uM", "mM", "iO",
 ];
 
-/// Valid English leading-apostrophe colloquial contractions that keep their leading `'`.
-pub const LEADING_APOSTROPHE_CONTRACTIONS: &[&str] = &[
-    "'em", "'cause", "'til", "'90s", "'80s", "'70s", "'60s", "'round", "'n'", "'tis", "'twas",
-];
-
-/// Abbreviations whose trailing period does NOT end a sentence (suppresses `auto_capitalize_sentence`).
-pub const ABBREVIATIONS: &[&str] = &[
-    "e.g", "eg", "i.e", "ie", "etc", "vs", "mr", "mrs", "ms", "dr", "prof", "inc", "ltd", "jr",
-    "sr", "st", "ave", "approx", "dept", "fig", "vol", "al", "jan", "feb", "mar", "apr", "jun",
-    "jul", "aug", "sep", "sept", "oct", "nov", "dec",
-];
+use crate::lexicon::CasingRules;
 
 /// Returns true if `punct` requires holding `Shift` on standard ANSI/ISO keyboards.
 #[inline]
@@ -110,15 +100,22 @@ pub fn is_shifted_punctuation(punct: char) -> bool {
     )
 }
 
-/// Returns true if `word` (without trailing `.`) is a common abbreviation that suppresses
-/// automatic next-sentence capitalization.
-pub fn is_abbreviation(word: &str) -> bool {
+/// Returns true if `word` (without trailing `.`) is an abbreviation in `abbreviations`
+/// that suppresses automatic next-sentence capitalization.
+pub fn is_abbreviation_with_rules(word: &str, abbreviations: &[String]) -> bool {
     let trimmed = word.trim_end_matches('.');
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || abbreviations.is_empty() {
         return false;
     }
     let lower = trimmed.to_lowercase();
-    ABBREVIATIONS.contains(&lower.as_str())
+    abbreviations.iter().any(|a| a == &lower)
+}
+
+/// Returns true if `word` (without trailing `.`) is a common English abbreviation that suppresses
+/// automatic next-sentence capitalization (reads from bundled v3 English pack rules).
+pub fn is_abbreviation(word: &str) -> bool {
+    crate::lexicon::bundled_en_lexicon()
+        .is_some_and(|lex| is_abbreviation_with_rules(word, &lex.rules().casing.abbreviations))
 }
 
 /// Result of pre-processing a raw token for outer quotes, bypass guards, and Shift/CapsLock slips.
@@ -150,10 +147,13 @@ pub enum TokenAnalysis {
 }
 
 /// Strips outer single quotes (`'apple'` -> `("'", "apple", "'")`) while preserving valid
-/// leading-apostrophe contractions (`'em`, `'cause`, `'til`, `'90s`) and trailing possessives/clitics.
-pub fn split_outer_single_quotes(raw: &str) -> (&str, &str, &str) {
+/// leading-apostrophe contractions from `leading_apostrophes` and trailing possessives/clitics.
+pub fn split_outer_single_quotes_with_rules<'a>(
+    raw: &'a str,
+    leading_apostrophes: &[String],
+) -> (&'a str, &'a str, &'a str) {
     let lower = raw.to_lowercase();
-    if LEADING_APOSTROPHE_CONTRACTIONS.contains(&lower.as_str()) {
+    if leading_apostrophes.iter().any(|s| s == &lower) {
         return ("", raw, "");
     }
 
@@ -165,7 +165,7 @@ pub fn split_outer_single_quotes(raw: &str) -> (&str, &str, &str) {
         let ch = raw[start..].chars().next().unwrap();
         if ch == '\'' || ch == '‘' {
             let rem_lower = raw[start..end].to_lowercase();
-            if LEADING_APOSTROPHE_CONTRACTIONS.contains(&rem_lower.as_str()) {
+            if leading_apostrophes.iter().any(|s| s == &rem_lower) {
                 break;
             }
             start += ch.len_utf8();
@@ -191,6 +191,11 @@ pub fn split_outer_single_quotes(raw: &str) -> (&str, &str, &str) {
     }
 
     (&raw[..start], &raw[start..end], &raw[end..])
+}
+
+/// Strips outer single quotes using empty leading-apostrophe rules (or use `split_outer_single_quotes_with_rules`).
+pub fn split_outer_single_quotes(raw: &str) -> (&str, &str, &str) {
+    split_outer_single_quotes_with_rules(raw, &[])
 }
 
 /// Returns true if `core` is a pluralized acronym like `IDs`, `PRs`, `UIs`, `OSes`, `URLs`, `VMs`.
@@ -265,12 +270,14 @@ pub fn is_expressive_stretch(core: &str, is_valid_word: impl Fn(&str) -> bool) -
     is_valid_word(&stem_1) || is_valid_word(&stem_2)
 }
 
-/// Analyzes a token for code/URL bypasses, outer quotes, stretched tails, and physical Shift/CapsLock slips.
-pub fn analyze_token(
+/// Analyzes a token for code/URL bypasses, outer quotes, stretched tails, and physical Shift/CapsLock slips
+/// using the active language pack's `CasingRules`.
+pub fn analyze_token_with_rules(
     raw: &str,
     boundary_punct: Option<char>,
     at_sentence_start: bool,
     fix_shift_slips: bool,
+    casing_rules: &CasingRules,
     is_valid_word: impl Fn(&str) -> bool,
 ) -> TokenAnalysis {
     if raw.is_empty() {
@@ -283,13 +290,18 @@ pub fn analyze_token(
         return TokenAnalysis::Bypass;
     }
 
-    let (leading_q, inner, trailing_q) = split_outer_single_quotes(raw);
+    let (leading_q, inner, trailing_q) =
+        split_outer_single_quotes_with_rules(raw, &casing_rules.leading_apostrophes);
     let inner_lower = inner.to_lowercase();
-    if LEADING_APOSTROPHE_CONTRACTIONS.contains(&inner_lower.as_str()) {
+    if casing_rules
+        .leading_apostrophes
+        .iter()
+        .any(|s| s == &inner_lower)
+    {
         return TokenAnalysis::LeadingApostropheValid;
     }
 
-    if CASING_EXCLUSIONS.contains(&inner) {
+    if CASING_EXCLUSIONS.contains(&inner) || casing_rules.exclusions.iter().any(|e| e == inner) {
         let alpha_count = inner.chars().filter(|c| c.is_alphabetic()).count();
         if alpha_count >= 4
             && !matches!(inner, "mRNA" | "tRNA" | "rRNA" | "dsRNA" | "ssRNA" | "cDNA")
@@ -510,6 +522,24 @@ pub fn analyze_token(
         };
     }
     TokenAnalysis::Bypass
+}
+
+/// Analyzes a token using default empty `CasingRules` (or call `analyze_token_with_rules`).
+pub fn analyze_token(
+    raw: &str,
+    boundary_punct: Option<char>,
+    at_sentence_start: bool,
+    fix_shift_slips: bool,
+    is_valid_word: impl Fn(&str) -> bool,
+) -> TokenAnalysis {
+    analyze_token_with_rules(
+        raw,
+        boundary_punct,
+        at_sentence_start,
+        fix_shift_slips,
+        &CasingRules::default(),
+        is_valid_word,
+    )
 }
 
 /// Applies user casing (`TitleCase` or `auto_capitalize_sentence`) onto a lowercase replacement,

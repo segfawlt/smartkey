@@ -5,61 +5,131 @@ use std::sync::OnceLock;
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA, SINK_STATE};
+use serde::{Deserialize, Serialize};
 
 use crate::keyboard::ascii_letter_mask;
 use crate::types::Dialect;
 
-const RAW_EN_SHORTHAND: &str = include_str!("../../../data/shorthand_en.tsv");
-
-fn en_shorthand_map() -> &'static Vec<(&'static str, &'static str)> {
-    static MAP: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut pairs: Vec<(&'static str, &'static str)> = RAW_EN_SHORTHAND
-            .lines()
-            .filter_map(|line| {
-                let s = line.trim();
-                if s.is_empty() || s.starts_with('#') {
-                    return None;
-                }
-                let mut cols = s.split('\t');
-                let trig = cols.next()?.trim();
-                let exp = cols.next()?.trim();
-                if trig.is_empty() || exp.is_empty() {
-                    return None;
-                }
-                Some((trig, exp))
-            })
-            .collect();
-        pairs.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        pairs.dedup_by(|a, b| a.0 == b.0);
-        pairs
-    })
+#[cfg(feature = "bundled-en")]
+pub(crate) fn bundled_en_lexicon() -> Option<&'static EnglishLexicon> {
+    static BUNDLED_LEX: OnceLock<Option<EnglishLexicon>> = OnceLock::new();
+    BUNDLED_LEX
+        .get_or_init(|| EnglishLexicon::from_bundled().ok())
+        .as_ref()
 }
 
-/// Looks up a curated unambiguous English shorthand auto-expansion (`pls -> please`, `rn -> right now`).
+#[cfg(not(feature = "bundled-en"))]
+pub(crate) fn bundled_en_lexicon() -> Option<&'static EnglishLexicon> {
+    None
+}
+
+/// Looks up a curated unambiguous English shorthand auto-expansion (`pls -> please`, `rn -> right now`)
+/// from the bundled v3 English pack's `SHORTHAND` section.
 pub fn lookup_english_shorthand(lower_word: &str) -> Option<&'static str> {
-    if lower_word.is_empty() {
-        return None;
-    }
-    let map = en_shorthand_map();
-    map.binary_search_by(|(k, _)| (*k).cmp(lower_word))
-        .ok()
-        .map(|idx| map[idx].1)
+    bundled_en_lexicon()?.lookup_shorthand(lower_word)
 }
 
 pub const MAGIC_V1: &[u8; 8] = b"SKDICT01";
 pub const MAGIC_V2: &[u8; 8] = b"SKDICT02";
+pub const MAGIC_V3: &[u8; 8] = b"SKDICT03";
 
-pub const FLAG_IN_US: u8 = 0x01;
-pub const FLAG_IN_GB: u8 = 0x02;
-pub const FLAG_OFFENSIVE: u8 = 0x04;
-pub const FLAG_TECH: u8 = 0x08;
+pub const TAG_WORDS_FST: u16 = 0x0001;
+pub const TAG_KNOWN_TYPOS: u16 = 0x0002;
+pub const TAG_VARIANT_REWRITES: u16 = 0x0003;
+pub const TAG_BIGRAMS: u16 = 0x0004;
+pub const TAG_SMASH_INDEX: u16 = 0x0005;
+pub const TAG_PROPER_NOUNS: u16 = 0x0006;
+pub const TAG_SHORTHAND: u16 = 0x0007;
+pub const TAG_SLANG_SET: u16 = 0x0008;
+pub const TAG_LANGUAGE_RULES: u16 = 0x0009;
+pub const TAG_SYLLABLE_DICT: u16 = 0x000A;
+pub const TAG_SOURCE_MANIFEST: u16 = 0x000B;
 
-/// Unpacked metadata stored in `words_fst` for every known lowercase word.
+pub const FLAG_OFFENSIVE: u8 = 0x01;
+pub const FLAG_SHIELD: u8 = 0x02;
+pub const FLAG_TECH: u8 = FLAG_SHIELD;
+pub const FLAG_AMBIGUOUS_PROPER: u8 = 0x04;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PackTier {
+    Data = 0,
+    ImeBridge = 1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackHeader {
+    pub lang: String,
+    pub pack_version: [u8; 3],
+    pub tier: PackTier,
+    pub variants: Vec<String>,
+    pub freq_slots: Vec<u8>,
+    pub default_variant_idx: u8,
+    pub feature_flags: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceManifestEntry {
+    pub name: String,
+    pub sha256: [u8; 32],
+    pub license: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplacementKind {
+    Contraction,
+    TransposedApostrophe,
+    UnmergedCompound,
+    TypoOverride,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementRule {
+    pub typed: String,
+    pub fix: String,
+    pub kind: ReplacementKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CliticRules {
+    pub suffixes: Vec<String>,
+    pub prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CasingRules {
+    pub leading_apostrophes: Vec<String>,
+    pub abbreviations: Vec<String>,
+    pub exclusions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BigramBoost {
+    pub prev: String,
+    pub next: String,
+    pub score: u8,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LanguageRules {
+    pub capitalize_standalone_i: bool,
+    pub function_words: Vec<String>,
+    pub clitics: CliticRules,
+    pub casing: CasingRules,
+    pub bigram_boosts: Vec<BigramBoost>,
+    pub replacements: Vec<ReplacementRule>,
+}
+
+/// Unpacked metadata (`WordMetaV3`) stored in `words_fst` for every known lowercase word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WordMeta {
-    pub us_freq: u8,
-    pub gb_freq: u8,
+    pub freq0: u8,
+    pub freq1: u8,
+    pub variant_mask: u8,
     pub flags: u8,
     pub word_id: u16,
 }
@@ -67,20 +137,30 @@ pub struct WordMeta {
 impl WordMeta {
     #[inline]
     pub fn pack(self) -> u64 {
-        (self.us_freq as u64)
-            | ((self.gb_freq as u64) << 8)
-            | ((self.flags as u64) << 16)
-            | ((self.word_id as u64) << 24)
+        (self.freq0 as u64)
+            | ((self.freq1 as u64) << 8)
+            | ((self.variant_mask as u64) << 16)
+            | ((self.flags as u64) << 24)
+            | ((self.word_id as u64) << 32)
     }
 
     #[inline]
     pub fn unpack(v: u64) -> Self {
         Self {
-            us_freq: (v & 0xFF) as u8,
-            gb_freq: ((v >> 8) & 0xFF) as u8,
-            flags: ((v >> 16) & 0xFF) as u8,
-            word_id: ((v >> 24) & 0xFFFF) as u16,
+            freq0: (v & 0xFF) as u8,
+            freq1: ((v >> 8) & 0xFF) as u8,
+            variant_mask: ((v >> 16) & 0xFF) as u8,
+            flags: ((v >> 24) & 0xFF) as u8,
+            word_id: ((v >> 32) & 0xFFFF) as u16,
         }
+    }
+
+    #[inline]
+    pub fn unpack_checked(v: u64) -> Result<Self, LexiconError> {
+        if (v >> 48) != 0 {
+            return Err(LexiconError::CorruptSection("WORDS_FST"));
+        }
+        Ok(Self::unpack(v))
     }
 
     #[inline]
@@ -89,28 +169,47 @@ impl WordMeta {
     }
 
     #[inline]
+    pub fn is_shield(self) -> bool {
+        (self.flags & FLAG_SHIELD) != 0
+    }
+
+    #[inline]
     pub fn is_tech(self) -> bool {
-        (self.flags & FLAG_TECH) != 0
+        self.is_shield()
+    }
+
+    #[inline]
+    pub fn is_ambiguous_proper(self) -> bool {
+        (self.flags & FLAG_AMBIGUOUS_PROPER) != 0
     }
 
     #[inline]
     pub fn effective_freq(self, dialect: Dialect) -> u8 {
         match dialect {
             Dialect::EnUs => {
-                if self.us_freq > 0 {
-                    self.us_freq
+                if self.freq0 > 0 {
+                    self.freq0
                 } else {
-                    self.gb_freq.saturating_sub(25)
+                    self.freq1.saturating_sub(25)
                 }
             }
             Dialect::EnGb => {
-                if self.gb_freq > 0 {
-                    self.gb_freq
+                if self.freq1 > 0 {
+                    self.freq1
                 } else {
-                    self.us_freq.saturating_sub(25)
+                    self.freq0.saturating_sub(25)
                 }
             }
-            Dialect::Mixed => self.us_freq.max(self.gb_freq),
+            Dialect::Mixed => self.freq0.max(self.freq1),
+        }
+    }
+
+    #[inline]
+    pub fn effective_freq_for_pack(self, variant_count: usize, dialect: Dialect) -> u8 {
+        if variant_count == 1 {
+            self.freq0
+        } else {
+            self.effective_freq(dialect)
         }
     }
 
@@ -120,9 +219,18 @@ impl WordMeta {
             return true;
         }
         match dialect {
-            Dialect::Mixed => (self.flags & (FLAG_IN_US | FLAG_IN_GB)) != 0,
-            Dialect::EnUs => (self.flags & FLAG_IN_US) != 0,
-            Dialect::EnGb => (self.flags & FLAG_IN_GB) != 0,
+            Dialect::Mixed => self.variant_mask != 0,
+            Dialect::EnUs => (self.variant_mask & 0x01) != 0,
+            Dialect::EnGb => (self.variant_mask & 0x02) != 0,
+        }
+    }
+
+    #[inline]
+    pub fn is_valid_for_pack(self, variant_count: usize, dialect: Dialect) -> bool {
+        if variant_count == 1 {
+            (self.variant_mask & 1) != 0 || self.is_tech() || self.is_offensive()
+        } else {
+            self.is_valid_for_dialect(dialect)
         }
     }
 }
@@ -139,6 +247,9 @@ pub struct SmashEntry {
 #[derive(Debug)]
 pub enum LexiconError {
     InvalidMagic,
+    LegacyFormat(u8),
+    LanguageMismatch { expected: String, found: String },
+    CorruptSection(&'static str),
     TruncatedData,
     Fst(fst::Error),
     Utf8(std::str::Utf8Error),
@@ -148,6 +259,15 @@ impl fmt::Display for LexiconError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidMagic => write!(f, "invalid .skdict magic header"),
+            Self::LegacyFormat(v) => write!(
+                f,
+                "legacy .skdict v{v} format is unsupported (run: smartkey dict update)"
+            ),
+            Self::LanguageMismatch { expected, found } => write!(
+                f,
+                "dictionary pack language mismatch: expected {expected:?}, found {found:?}"
+            ),
+            Self::CorruptSection(section) => write!(f, "corrupt .skdict section: {section}"),
             Self::TruncatedData => write!(f, "truncated .skdict binary image"),
             Self::Fst(e) => write!(f, "fst error: {e}"),
             Self::Utf8(e) => write!(f, "utf-8 error: {e}"),
@@ -191,31 +311,278 @@ impl fst::Automaton for DfaAutomaton<'_> {
     }
 }
 
-/// Loaded English lexicon, known-smash table, dialect mapper, and bigram scorer.
+fn empty_fst_bytes() -> &'static [u8] {
+    static EMPTY_FST: OnceLock<Box<[u8]>> = OnceLock::new();
+    EMPTY_FST.get_or_init(|| {
+        MapBuilder::memory()
+            .into_inner()
+            .expect("empty fst map")
+            .into_boxed_slice()
+    })
+}
+
+struct PayloadReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    section: &'static str,
+}
+
+impl<'a> PayloadReader<'a> {
+    fn new(buf: &'a [u8], section: &'static str) -> Self {
+        Self {
+            buf,
+            pos: 0,
+            section,
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.pos >= self.buf.len()
+    }
+
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, LexiconError> {
+        if self.pos >= self.buf.len() {
+            return Err(LexiconError::CorruptSection(self.section));
+        }
+        let v = self.buf[self.pos];
+        self.pos += 1;
+        Ok(v)
+    }
+
+    fn read_u16(&mut self) -> Result<u16, LexiconError> {
+        let end = self
+            .pos
+            .checked_add(2)
+            .filter(|&e| e <= self.buf.len())
+            .ok_or(LexiconError::CorruptSection(self.section))?;
+        let v = u16::from_le_bytes(self.buf[self.pos..end].try_into().unwrap());
+        self.pos = end;
+        Ok(v)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, LexiconError> {
+        let end = self
+            .pos
+            .checked_add(4)
+            .filter(|&e| e <= self.buf.len())
+            .ok_or(LexiconError::CorruptSection(self.section))?;
+        let v = u32::from_le_bytes(self.buf[self.pos..end].try_into().unwrap());
+        self.pos = end;
+        Ok(v)
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], LexiconError> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .filter(|&e| e <= self.buf.len())
+            .ok_or(LexiconError::CorruptSection(self.section))?;
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn read_fixed<const N: usize>(&mut self) -> Result<[u8; N], LexiconError> {
+        let slice = self.read_bytes(N)?;
+        Ok(slice.try_into().unwrap())
+    }
+
+    fn read_len_u32_str(&mut self) -> Result<Box<str>, LexiconError> {
+        let len = self.read_u32()? as usize;
+        let slice = self.read_bytes(len)?;
+        let s = std::str::from_utf8(slice).map_err(LexiconError::Utf8)?;
+        Ok(s.to_string().into_boxed_str())
+    }
+
+    fn finish(self) -> Result<(), LexiconError> {
+        if self.is_empty() {
+            Ok(())
+        } else {
+            Err(LexiconError::CorruptSection(self.section))
+        }
+    }
+}
+
+fn peek_skdict_header_internal(bytes: &[u8]) -> Result<(PackHeader, usize), LexiconError> {
+    if bytes.len() < 8 {
+        return Err(LexiconError::TruncatedData);
+    }
+    match &bytes[..8] {
+        b"SKDICT01" => return Err(LexiconError::LegacyFormat(1)),
+        b"SKDICT02" => return Err(LexiconError::LegacyFormat(2)),
+        b"SKDICT03" => {}
+        _ => return Err(LexiconError::InvalidMagic),
+    }
+    if bytes.len() < 10 {
+        return Err(LexiconError::TruncatedData);
+    }
+    let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let header_end = 10usize
+        .checked_add(header_len)
+        .ok_or(LexiconError::TruncatedData)?;
+    if bytes.len() < header_end {
+        return Err(LexiconError::TruncatedData);
+    }
+
+    let mut r = PayloadReader::new(&bytes[10..header_end], "header");
+    let lang_len = r.read_u8()? as usize;
+    if lang_len == 0 {
+        return Err(LexiconError::CorruptSection("header"));
+    }
+    let lang_bytes = r.read_bytes(lang_len)?;
+    let lang = std::str::from_utf8(lang_bytes)
+        .map_err(LexiconError::Utf8)?
+        .to_string();
+
+    let pack_version = [r.read_u8()?, r.read_u8()?, r.read_u8()?];
+    let tier = match r.read_u8()? {
+        0 => PackTier::Data,
+        1 => PackTier::ImeBridge,
+        _ => return Err(LexiconError::CorruptSection("header")),
+    };
+
+    let variant_count = r.read_u8()? as usize;
+    if !(1..=8).contains(&variant_count) {
+        return Err(LexiconError::CorruptSection("header"));
+    }
+    let mut variants = Vec::with_capacity(variant_count);
+    for _ in 0..variant_count {
+        let vlen = r.read_u8()? as usize;
+        if vlen == 0 {
+            return Err(LexiconError::CorruptSection("header"));
+        }
+        let vbytes = r.read_bytes(vlen)?;
+        let vstr = std::str::from_utf8(vbytes).map_err(LexiconError::Utf8)?;
+        if !vstr.is_ascii() {
+            return Err(LexiconError::CorruptSection("header"));
+        }
+        variants.push(vstr.to_string());
+    }
+
+    let freq_slot_count = r.read_u8()? as usize;
+    if freq_slot_count > 2 {
+        return Err(LexiconError::CorruptSection("header"));
+    }
+    let mut freq_slots = Vec::with_capacity(freq_slot_count);
+    for _ in 0..freq_slot_count {
+        freq_slots.push(r.read_u8()?);
+    }
+
+    let default_variant_idx = r.read_u8()?;
+    if (default_variant_idx as usize) >= variant_count {
+        return Err(LexiconError::CorruptSection("header"));
+    }
+    let feature_flags = r.read_u16()?;
+    r.finish()?;
+
+    Ok((
+        PackHeader {
+            lang,
+            pack_version,
+            tier,
+            variants,
+            freq_slots,
+            default_variant_idx,
+            feature_flags,
+        },
+        header_end,
+    ))
+}
+
+/// Parses only the self-describing `.skdict` v3 header without loading FSTs or payload tables.
+pub fn peek_skdict_header(bytes: &[u8]) -> Result<PackHeader, LexiconError> {
+    peek_skdict_header_internal(bytes).map(|(h, _)| h)
+}
+
+fn parse_source_manifest_payload(payload: &[u8]) -> Result<Vec<SourceManifestEntry>, LexiconError> {
+    let mut r = PayloadReader::new(payload, "SOURCE_MANIFEST");
+    let count = r.read_u32()? as usize;
+    let mut out = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let name = r.read_len_u32_str()?.into_string();
+        let sha256 = r.read_fixed::<32>()?;
+        let license = r.read_len_u32_str()?.into_string();
+        out.push(SourceManifestEntry {
+            name,
+            sha256,
+            license,
+        });
+    }
+    r.finish()?;
+    Ok(out)
+}
+
+/// Parses `.skdict` v3 header plus any `SOURCE_MANIFEST` TLV section without loading FSTs.
+pub fn peek_skdict_header_and_manifest(
+    bytes: &[u8],
+) -> Result<(PackHeader, Vec<SourceManifestEntry>), LexiconError> {
+    let (header, mut cursor) = peek_skdict_header_internal(bytes)?;
+    let mut manifest = Vec::new();
+    while cursor < bytes.len() {
+        if cursor + 6 > bytes.len() {
+            return Err(LexiconError::TruncatedData);
+        }
+        let tag = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
+        let len = u32::from_le_bytes([
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+        ]) as usize;
+        cursor += 6;
+        let end = cursor
+            .checked_add(len)
+            .filter(|&e| e <= bytes.len())
+            .ok_or(LexiconError::TruncatedData)?;
+        if tag == TAG_SOURCE_MANIFEST {
+            manifest = parse_source_manifest_payload(&bytes[cursor..end])?;
+        }
+        cursor = end;
+    }
+    Ok((header, manifest))
+}
+
+/// Loaded language pack lexicon, known-smash table, variant rewriter, and bigram scorer.
 pub struct EnglishLexicon {
+    header: PackHeader,
     words_fst: Map<Cow<'static, [u8]>>,
     typos_fst: Map<Cow<'static, [u8]>>,
     typo_pool: Cow<'static, [u8]>,
-    uk_to_us: Vec<(Box<str>, Box<str>)>,
-    us_to_uk: Vec<(Box<str>, Box<str>)>,
+    variant_rewrites: Vec<Vec<(Box<str>, Box<str>)>>,
     proper_nouns: Vec<(Box<str>, Box<str>)>,
     bigram_keys: Vec<u32>,
     bigram_scores: Vec<u8>,
     smash_entries: Vec<SmashEntry>,
+    shorthand: Vec<(Box<str>, Box<str>)>,
+    slang_set: Vec<Box<str>>,
+    rules: LanguageRules,
+    syllable_dict: Vec<Box<str>>,
+    source_manifest: Vec<SourceManifestEntry>,
     lev1: LevenshteinAutomatonBuilder,
     lev2: LevenshteinAutomatonBuilder,
 }
 
 struct ParsedSections {
-    wf_range: (usize, usize),
-    tf_range: (usize, usize),
-    tp_range: (usize, usize),
-    uk_to_us: Vec<(Box<str>, Box<str>)>,
-    us_to_uk: Vec<(Box<str>, Box<str>)>,
+    header: PackHeader,
+    wf_range: Option<(usize, usize)>,
+    tf_range: Option<(usize, usize)>,
+    tp_range: Option<(usize, usize)>,
+    variant_rewrites: Vec<Vec<(Box<str>, Box<str>)>>,
     proper_nouns: Vec<(Box<str>, Box<str>)>,
     bigram_keys: Vec<u32>,
     bigram_scores: Vec<u8>,
     smash_entries: Vec<SmashEntry>,
+    shorthand: Vec<(Box<str>, Box<str>)>,
+    slang_set: Vec<Box<str>>,
+    rules: LanguageRules,
+    syllable_dict: Vec<Box<str>>,
+    source_manifest: Vec<SourceManifestEntry>,
 }
 
 impl EnglishLexicon {
@@ -229,147 +596,234 @@ impl EnglishLexicon {
     /// Zero-copy load over a `'static` byte slice (`include_bytes!` or `mmap`).
     pub fn from_static_bytes(bytes: &'static [u8]) -> Result<Self, LexiconError> {
         let parsed = Self::parse_sections(bytes)?;
-        let words_cow = Cow::Borrowed(&bytes[parsed.wf_range.0..parsed.wf_range.1]);
-        let typos_cow = Cow::Borrowed(&bytes[parsed.tf_range.0..parsed.tf_range.1]);
-        let pool_cow = Cow::Borrowed(&bytes[parsed.tp_range.0..parsed.tp_range.1]);
+        let words_cow = match parsed.wf_range {
+            Some((s, e)) => Cow::Borrowed(&bytes[s..e]),
+            None => Cow::Borrowed(empty_fst_bytes()),
+        };
+        let typos_cow = match parsed.tf_range {
+            Some((s, e)) => Cow::Borrowed(&bytes[s..e]),
+            None => Cow::Borrowed(empty_fst_bytes()),
+        };
+        let pool_cow = match parsed.tp_range {
+            Some((s, e)) => Cow::Borrowed(&bytes[s..e]),
+            None => Cow::Borrowed(&[][..]),
+        };
         Self::from_parsed(words_cow, typos_cow, pool_cow, parsed)
     }
 
     /// Loads from an owned byte buffer (e.g. Android asset stream or custom file).
     pub fn from_owned_bytes(bytes: Vec<u8>) -> Result<Self, LexiconError> {
         let parsed = Self::parse_sections(&bytes)?;
-        let words_cow = Cow::Owned(bytes[parsed.wf_range.0..parsed.wf_range.1].to_vec());
-        let typos_cow = Cow::Owned(bytes[parsed.tf_range.0..parsed.tf_range.1].to_vec());
-        let pool_cow = Cow::Owned(bytes[parsed.tp_range.0..parsed.tp_range.1].to_vec());
+        let words_cow = match parsed.wf_range {
+            Some((s, e)) => Cow::Owned(bytes[s..e].to_vec()),
+            None => Cow::Borrowed(empty_fst_bytes()),
+        };
+        let typos_cow = match parsed.tf_range {
+            Some((s, e)) => Cow::Owned(bytes[s..e].to_vec()),
+            None => Cow::Borrowed(empty_fst_bytes()),
+        };
+        let pool_cow = match parsed.tp_range {
+            Some((s, e)) => Cow::Owned(bytes[s..e].to_vec()),
+            None => Cow::Borrowed(&[][..]),
+        };
         Self::from_parsed(words_cow, typos_cow, pool_cow, parsed)
     }
 
     fn parse_sections(bytes: &[u8]) -> Result<ParsedSections, LexiconError> {
-        let mut cursor = 0usize;
-        if bytes.len() < 8 {
-            return Err(LexiconError::TruncatedData);
-        }
-        let version = match &bytes[..8] {
-            b"SKDICT01" => 1,
-            b"SKDICT02" => 2,
-            _ => return Err(LexiconError::InvalidMagic),
-        };
-        cursor += 8;
+        let (header, mut cursor) = peek_skdict_header_internal(bytes)?;
+        let variant_count = header.variants.len();
 
-        let read_u32 = |buf: &[u8], pos: &mut usize| -> Result<u32, LexiconError> {
-            if *pos + 4 > buf.len() {
-                return Err(LexiconError::TruncatedData);
-            }
-            let val = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
-            *pos += 4;
-            Ok(val)
-        };
+        let mut wf_range: Option<(usize, usize)> = None;
+        let mut tf_range: Option<(usize, usize)> = None;
+        let mut tp_range: Option<(usize, usize)> = None;
+        let mut variant_rewrites = vec![Vec::new(); variant_count];
+        let mut bigram_keys = Vec::new();
+        let mut bigram_scores = Vec::new();
+        let mut smash_entries = Vec::new();
+        let mut proper_nouns = Vec::new();
+        let mut shorthand = Vec::new();
+        let mut slang_set = Vec::new();
+        let mut rules = LanguageRules::default();
+        let mut syllable_dict = Vec::new();
+        let mut source_manifest = Vec::new();
 
-        let read_slice = |buf: &[u8], pos: &mut usize| -> Result<(usize, usize), LexiconError> {
-            let len = read_u32(buf, pos)? as usize;
-            if *pos + len > buf.len() {
-                return Err(LexiconError::TruncatedData);
-            }
-            let start = *pos;
-            *pos += len;
-            Ok((start, start + len))
-        };
-
-        let wf_range = read_slice(bytes, &mut cursor)?;
-        let tf_range = read_slice(bytes, &mut cursor)?;
-        let tp_range = read_slice(bytes, &mut cursor)?;
-
-        // UK -> US pairs
-        let uk_count = read_u32(bytes, &mut cursor)? as usize;
-        let mut uk_to_us = Vec::with_capacity(uk_count);
-        let mut us_to_uk = Vec::with_capacity(uk_count);
-        for _ in 0..uk_count {
-            let (ks, ke) = read_slice(bytes, &mut cursor)?;
-            let (vs, ve) = read_slice(bytes, &mut cursor)?;
-            let uk = std::str::from_utf8(&bytes[ks..ke])
-                .map_err(LexiconError::Utf8)?
-                .to_string()
-                .into_boxed_str();
-            let us = std::str::from_utf8(&bytes[vs..ve])
-                .map_err(LexiconError::Utf8)?
-                .to_string()
-                .into_boxed_str();
-            us_to_uk.push((us.clone(), uk.clone()));
-            uk_to_us.push((uk, us));
-        }
-        uk_to_us.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        us_to_uk.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        us_to_uk.dedup_by(|a, b| a.0 == b.0);
-
-        // Bigrams
-        let bg_count = read_u32(bytes, &mut cursor)? as usize;
-        if cursor + bg_count * 5 > bytes.len() {
-            return Err(LexiconError::TruncatedData);
-        }
-        let mut bigram_keys = Vec::with_capacity(bg_count);
-        let mut bigram_scores = Vec::with_capacity(bg_count);
-        for _ in 0..bg_count {
-            let key = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            let score = bytes[cursor + 4];
-            cursor += 5;
-            bigram_keys.push(key);
-            bigram_scores.push(score);
-        }
-
-        // Smash rescue entries
-        let smash_count = read_u32(bytes, &mut cursor)? as usize;
-        let mut smash_entries = Vec::with_capacity(smash_count);
-        for _ in 0..smash_count {
+        while cursor < bytes.len() {
             if cursor + 6 > bytes.len() {
                 return Err(LexiconError::TruncatedData);
             }
-            let mask = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            let len = bytes[cursor + 4];
-            let freq = bytes[cursor + 5];
+            let tag = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
+            let len = u32::from_le_bytes([
+                bytes[cursor + 2],
+                bytes[cursor + 3],
+                bytes[cursor + 4],
+                bytes[cursor + 5],
+            ]) as usize;
             cursor += 6;
-            let (ws, we) = read_slice(bytes, &mut cursor)?;
-            let word = std::str::from_utf8(&bytes[ws..we])
-                .map_err(LexiconError::Utf8)?
-                .to_string()
-                .into_boxed_str();
-            smash_entries.push(SmashEntry {
-                mask,
-                len,
-                freq,
-                word,
-            });
-        }
+            let payload_start = cursor;
+            let payload_end = payload_start
+                .checked_add(len)
+                .filter(|&e| e <= bytes.len())
+                .ok_or(LexiconError::TruncatedData)?;
+            let payload = &bytes[payload_start..payload_end];
+            cursor = payload_end;
 
-        let mut proper_nouns = Vec::new();
-        if version >= 2 && cursor < bytes.len() {
-            let pn_count = read_u32(bytes, &mut cursor)? as usize;
-            for _ in 0..pn_count {
-                let (ks, ke) = read_slice(bytes, &mut cursor)?;
-                let (vs, ve) = read_slice(bytes, &mut cursor)?;
-                let lower = std::str::from_utf8(&bytes[ks..ke])
-                    .map_err(LexiconError::Utf8)?
-                    .to_string()
-                    .into_boxed_str();
-                let proper = std::str::from_utf8(&bytes[vs..ve])
-                    .map_err(LexiconError::Utf8)?
-                    .to_string()
-                    .into_boxed_str();
-                proper_nouns.push((lower, proper));
+            match tag {
+                TAG_WORDS_FST => {
+                    wf_range = Some((payload_start, payload_end));
+                }
+                TAG_KNOWN_TYPOS => {
+                    if payload.len() < 4 {
+                        return Err(LexiconError::CorruptSection("KNOWN_TYPOS"));
+                    }
+                    let fst_len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+                    let fst_end = 4usize
+                        .checked_add(fst_len)
+                        .filter(|&e| e <= payload.len())
+                        .ok_or(LexiconError::CorruptSection("KNOWN_TYPOS"))?;
+                    tf_range = Some((payload_start + 4, payload_start + fst_end));
+                    tp_range = Some((payload_start + fst_end, payload_end));
+                }
+                TAG_VARIANT_REWRITES => {
+                    let mut r = PayloadReader::new(payload, "VARIANT_REWRITES");
+                    let group_count = r.read_u8()? as usize;
+                    for _ in 0..group_count {
+                        let target_idx = r.read_u8()? as usize;
+                        if target_idx >= variant_count {
+                            return Err(LexiconError::CorruptSection("VARIANT_REWRITES"));
+                        }
+                        let pair_count = r.read_u32()? as usize;
+                        let mut pairs = Vec::with_capacity(pair_count.min(16_384));
+                        for _ in 0..pair_count {
+                            let from = r.read_len_u32_str()?;
+                            let to = r.read_len_u32_str()?;
+                            pairs.push((from, to));
+                        }
+                        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                        pairs.dedup_by(|a, b| a.0 == b.0);
+                        variant_rewrites[target_idx] = pairs;
+                    }
+                    r.finish()?;
+                }
+                TAG_BIGRAMS => {
+                    let mut r = PayloadReader::new(payload, "BIGRAMS");
+                    let count = r.read_u32()? as usize;
+                    let expected_bytes = count
+                        .checked_mul(5)
+                        .ok_or(LexiconError::CorruptSection("BIGRAMS"))?;
+                    if r.remaining() != expected_bytes {
+                        return Err(LexiconError::CorruptSection("BIGRAMS"));
+                    }
+                    bigram_keys = Vec::with_capacity(count);
+                    bigram_scores = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let key = r.read_u32()?;
+                        let score = r.read_u8()?;
+                        bigram_keys.push(key);
+                        bigram_scores.push(score);
+                    }
+                    r.finish()?;
+                }
+                TAG_SMASH_INDEX => {
+                    let mut r = PayloadReader::new(payload, "SMASH_INDEX");
+                    let count = r.read_u32()? as usize;
+                    smash_entries = Vec::with_capacity(count.min(65_536));
+                    for _ in 0..count {
+                        let mask = r.read_u32()?;
+                        let len = r.read_u8()?;
+                        let freq = r.read_u8()?;
+                        let word = r.read_len_u32_str()?;
+                        smash_entries.push(SmashEntry {
+                            mask,
+                            len,
+                            freq,
+                            word,
+                        });
+                    }
+                    r.finish()?;
+                }
+                TAG_PROPER_NOUNS => {
+                    let mut r = PayloadReader::new(payload, "PROPER_NOUNS");
+                    let count = r.read_u32()? as usize;
+                    proper_nouns = Vec::with_capacity(count.min(16_384));
+                    for _ in 0..count {
+                        let lower = r.read_len_u32_str()?;
+                        let proper = r.read_len_u32_str()?;
+                        proper_nouns.push((lower, proper));
+                    }
+                    r.finish()?;
+                    proper_nouns.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    proper_nouns.dedup_by(|a, b| a.0 == b.0);
+                }
+                TAG_SHORTHAND => {
+                    let mut r = PayloadReader::new(payload, "SHORTHAND");
+                    let count = r.read_u32()? as usize;
+                    shorthand = Vec::with_capacity(count.min(16_384));
+                    for _ in 0..count {
+                        let trig = r.read_len_u32_str()?;
+                        let exp = r.read_len_u32_str()?;
+                        shorthand.push((trig, exp));
+                    }
+                    r.finish()?;
+                    shorthand.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    shorthand.dedup_by(|a, b| a.0 == b.0);
+                }
+                TAG_SLANG_SET => {
+                    let mut r = PayloadReader::new(payload, "SLANG_SET");
+                    let count = r.read_u32()? as usize;
+                    slang_set = Vec::with_capacity(count.min(16_384));
+                    for _ in 0..count {
+                        let w = r.read_len_u32_str()?;
+                        slang_set.push(w);
+                    }
+                    r.finish()?;
+                    slang_set.sort_unstable();
+                    slang_set.dedup();
+                }
+                TAG_LANGUAGE_RULES => {
+                    if payload.is_empty() || payload[0] != 1 {
+                        return Err(LexiconError::CorruptSection("LANGUAGE_RULES"));
+                    }
+                    let json_str =
+                        std::str::from_utf8(&payload[1..]).map_err(LexiconError::Utf8)?;
+                    rules = serde_json::from_str(json_str)
+                        .map_err(|_| LexiconError::CorruptSection("LANGUAGE_RULES"))?;
+                }
+                TAG_SYLLABLE_DICT => {
+                    let mut r = PayloadReader::new(payload, "SYLLABLE_DICT");
+                    let count = r.read_u32()? as usize;
+                    syllable_dict = Vec::with_capacity(count.min(32_768));
+                    for _ in 0..count {
+                        let syl = r.read_len_u32_str()?;
+                        syllable_dict.push(syl);
+                    }
+                    r.finish()?;
+                    syllable_dict.sort_unstable();
+                    syllable_dict.dedup();
+                }
+                TAG_SOURCE_MANIFEST => {
+                    source_manifest = parse_source_manifest_payload(payload)?;
+                }
+                _ => {
+                    // Forward compatibility: cleanly skip unknown TLV tags.
+                }
             }
-            proper_nouns.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            proper_nouns.dedup_by(|a, b| a.0 == b.0);
         }
 
         Ok(ParsedSections {
+            header,
             wf_range,
             tf_range,
             tp_range,
-            uk_to_us,
-            us_to_uk,
+            variant_rewrites,
             proper_nouns,
             bigram_keys,
             bigram_scores,
             smash_entries,
+            shorthand,
+            slang_set,
+            rules,
+            syllable_dict,
+            source_manifest,
         })
     }
 
@@ -379,19 +833,106 @@ impl EnglishLexicon {
         typo_pool: Cow<'static, [u8]>,
         parsed: ParsedSections,
     ) -> Result<Self, LexiconError> {
+        let words_fst = Map::new(words_cow)?;
+        let typos_fst = Map::new(typos_cow)?;
+
+        {
+            let mut stream = words_fst.values();
+            while let Some(v) = stream.next() {
+                WordMeta::unpack_checked(v)?;
+            }
+        }
+
         Ok(Self {
-            words_fst: Map::new(words_cow)?,
-            typos_fst: Map::new(typos_cow)?,
+            header: parsed.header,
+            words_fst,
+            typos_fst,
             typo_pool,
-            uk_to_us: parsed.uk_to_us,
-            us_to_uk: parsed.us_to_uk,
+            variant_rewrites: parsed.variant_rewrites,
             proper_nouns: parsed.proper_nouns,
             bigram_keys: parsed.bigram_keys,
             bigram_scores: parsed.bigram_scores,
             smash_entries: parsed.smash_entries,
+            shorthand: parsed.shorthand,
+            slang_set: parsed.slang_set,
+            rules: parsed.rules,
+            syllable_dict: parsed.syllable_dict,
+            source_manifest: parsed.source_manifest,
             lev1: LevenshteinAutomatonBuilder::new(1, true),
             lev2: LevenshteinAutomatonBuilder::new(2, true),
         })
+    }
+
+    #[inline]
+    pub fn header(&self) -> &PackHeader {
+        &self.header
+    }
+
+    #[inline]
+    pub fn rules(&self) -> &LanguageRules {
+        &self.rules
+    }
+
+    #[inline]
+    pub fn source_manifest(&self) -> &[SourceManifestEntry] {
+        &self.source_manifest
+    }
+
+    #[inline]
+    pub fn slang_set(&self) -> &[Box<str>] {
+        &self.slang_set
+    }
+
+    #[inline]
+    pub fn syllable_dict(&self) -> &[Box<str>] {
+        &self.syllable_dict
+    }
+
+    #[inline]
+    pub fn lookup_shorthand(&self, lower_word: &str) -> Option<&str> {
+        if lower_word.is_empty() {
+            return None;
+        }
+        self.shorthand
+            .binary_search_by(|(trig, _)| trig.as_ref().cmp(lower_word))
+            .ok()
+            .map(|idx| self.shorthand[idx].1.as_ref())
+    }
+
+    #[inline]
+    pub fn is_slang_word(&self, lower_word: &str) -> bool {
+        !lower_word.is_empty() && self.slang_set.binary_search_by(|w| w.as_ref().cmp(lower_word)).is_ok()
+    }
+
+    #[inline]
+    pub fn is_contraction_pair(&self, typed_lower: &str, expanded_lower: &str) -> bool {
+        self.rules.replacements.iter().any(|r| {
+            r.kind == ReplacementKind::Contraction
+                && r.typed == typed_lower
+                && r.fix.to_lowercase() == expanded_lower.to_lowercase()
+        })
+    }
+
+    #[inline]
+    pub fn variant_rewrites_for(&self, variant_idx: u8) -> &[(Box<str>, Box<str>)] {
+        self.variant_rewrites
+            .get(variant_idx as usize)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn variant_index(&self, tag: &str) -> Option<usize> {
+        self.header.variants.iter().position(|v| v == tag)
+    }
+
+    #[inline]
+    pub fn is_valid_meta(&self, meta: WordMeta, dialect: Dialect) -> bool {
+        meta.is_valid_for_pack(self.header.variants.len(), dialect)
+    }
+
+    #[inline]
+    pub fn effective_freq_meta(&self, meta: WordMeta, dialect: Dialect) -> u8 {
+        meta.effective_freq_for_pack(self.header.variants.len(), dialect)
     }
 
     #[inline]
@@ -402,56 +943,84 @@ impl EnglishLexicon {
     #[inline]
     pub fn contains_valid(&self, lower_word: &str, dialect: Dialect) -> bool {
         self.lookup_word(lower_word)
-            .is_some_and(|m| m.is_valid_for_dialect(dialect))
+            .is_some_and(|m| self.is_valid_meta(m, dialect))
+    }
+
+    /// Returns true if `lower_word` matches `prefix'stem` (or `prefix’stem`) where `prefix` is in
+    /// `rules.clitics.prefixes`, `stem` has at least 2 Unicode chars, and `stem` is valid in `dialect`.
+    #[inline]
+    pub fn is_valid_elided(&self, lower_word: &str, dialect: Dialect) -> bool {
+        let prefixes = &self.rules.clitics.prefixes;
+        if prefixes.is_empty() {
+            return false;
+        }
+        let Some((prefix, stem)) = lower_word
+            .split_once('\'')
+            .or_else(|| lower_word.split_once('’'))
+        else {
+            return false;
+        };
+        prefixes.iter().any(|p| p == prefix)
+            && stem.chars().count() >= 2
+            && self.contains_valid(stem, dialect)
+    }
+
+    #[inline]
+    pub fn contains_valid_or_elided(&self, lower_word: &str, dialect: Dialect) -> bool {
+        self.contains_valid(lower_word, dialect) || self.is_valid_elided(lower_word, dialect)
+    }
+
+    #[inline]
+    pub fn contains_any_variant(&self, lower_word: &str) -> bool {
+        self.lookup_word(lower_word)
+            .is_some_and(|m| m.is_valid_for_pack(self.header.variants.len(), Dialect::Mixed))
+    }
+
+    #[inline]
+    pub fn contains_any_variant_or_elided(&self, lower_word: &str) -> bool {
+        self.contains_any_variant(lower_word) || self.is_valid_elided(lower_word, Dialect::Mixed)
     }
 
     #[inline]
     pub fn contains_any_english(&self, lower_word: &str) -> bool {
-        self.lookup_word(lower_word)
-            .is_some_and(|m| m.is_valid_for_dialect(Dialect::Mixed))
+        self.contains_any_variant(lower_word)
     }
 
-    /// Maps a word to the preferred dialect if a UK<->US counterpart exists.
+    /// Maps a word to the preferred variant if a variant rewrite counterpart exists.
     pub fn map_dialect<'a>(&'a self, lower_word: &'a str, dialect: Dialect) -> &'a str {
-        match dialect {
-            Dialect::Mixed | Dialect::EnUs => {
-                if let Ok(idx) = self
-                    .uk_to_us
-                    .binary_search_by(|(uk, _)| uk.as_ref().cmp(lower_word))
-                {
-                    &self.uk_to_us[idx].1
-                } else {
-                    lower_word
-                }
-            }
-            Dialect::EnGb => {
-                if let Ok(idx) = self
-                    .us_to_uk
-                    .binary_search_by(|(us, _)| us.as_ref().cmp(lower_word))
-                {
-                    &self.us_to_uk[idx].1
-                } else {
-                    lower_word
-                }
-            }
+        if self.header.variants.len() <= 1 {
+            return lower_word;
+        }
+        let target_idx = match dialect {
+            Dialect::Mixed => Some(self.header.default_variant_idx as usize),
+            Dialect::EnUs => self.variant_index("en_US"),
+            Dialect::EnGb => self.variant_index("en_GB"),
+        };
+        let Some(pairs) = target_idx.and_then(|idx| self.variant_rewrites.get(idx)) else {
+            return lower_word;
+        };
+        if let Ok(idx) = pairs.binary_search_by(|(from, _)| from.as_ref().cmp(lower_word)) {
+            &pairs[idx].1
+        } else {
+            lower_word
         }
     }
 
     /// Strictly checks if `lower_word` requires cross-dialect rewriting under `EnUs` or `EnGb`.
     pub fn strict_dialect_rewrite(&self, lower_word: &str, dialect: Dialect) -> Option<&str> {
-        match dialect {
-            Dialect::Mixed => None,
-            Dialect::EnUs => self
-                .uk_to_us
-                .binary_search_by(|(uk, _)| uk.as_ref().cmp(lower_word))
-                .ok()
-                .map(|i| self.uk_to_us[i].1.as_ref()),
-            Dialect::EnGb => self
-                .us_to_uk
-                .binary_search_by(|(us, _)| us.as_ref().cmp(lower_word))
-                .ok()
-                .map(|i| self.us_to_uk[i].1.as_ref()),
+        if self.header.variants.len() <= 1 {
+            return None;
         }
+        let target_idx = match dialect {
+            Dialect::Mixed => return None,
+            Dialect::EnUs => self.variant_index("en_US"),
+            Dialect::EnGb => self.variant_index("en_GB"),
+        }?;
+        let pairs = self.variant_rewrites.get(target_idx)?;
+        pairs
+            .binary_search_by(|(from, _)| from.as_ref().cmp(lower_word))
+            .ok()
+            .map(|i| pairs[i].1.as_ref())
     }
 
     /// Looks up curated human keyboard smashes (`crate-ci/typos` `words.csv`).
@@ -459,7 +1028,8 @@ impl EnglishLexicon {
         let packed = self.typos_fst.get(lower_word)?;
         let offset = (packed & 0xFFFF_FFFF) as usize;
         let len = (packed >> 32) as usize;
-        let slice = std::str::from_utf8(&self.typo_pool[offset..offset + len]).ok()?;
+        let end = offset.checked_add(len)?;
+        let slice = std::str::from_utf8(self.typo_pool.get(offset..end)?).ok()?;
         Some(slice.split('\n').filter(|s| !s.is_empty()))
     }
 
@@ -501,7 +1071,7 @@ impl EnglishLexicon {
             if meta.is_offensive() {
                 continue;
             }
-            if meta.us_freq == 0 && meta.gb_freq == 0 {
+            if meta.freq0 == 0 && meta.freq1 == 0 {
                 continue;
             }
             if let Ok(w) = std::str::from_utf8(k) {
@@ -526,6 +1096,45 @@ impl EnglishLexicon {
     #[inline]
     pub fn proper_nouns(&self) -> &[(Box<str>, Box<str>)] {
         &self.proper_nouns
+    }
+
+    /// Dumps all `(word, freq0, freq1, variant_mask, flags, word_id)` entries from `WORDS_FST`.
+    pub fn dump_words(&self) -> Vec<(String, u8, u8, u8, u8, u16)> {
+        let mut out = Vec::new();
+        let mut stream = self.words_fst.stream();
+        while let Some((k, v)) = stream.next() {
+            let w = String::from_utf8_lossy(k).into_owned();
+            let m = WordMeta::unpack(v);
+            out.push((w, m.freq0, m.freq1, m.variant_mask, m.flags, m.word_id));
+        }
+        out
+    }
+
+    /// Dumps all `(typo, joined_targets)` entries from `KNOWN_TYPOS`.
+    pub fn dump_typos(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut stream = self.typos_fst.stream();
+        while let Some((k, packed)) = stream.next() {
+            let offset = (packed & 0xFFFF_FFFF) as usize;
+            let len = (packed >> 32) as usize;
+            let targets = self
+                .typo_pool
+                .get(offset..offset + len)
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .unwrap_or_default()
+                .to_string();
+            out.push((String::from_utf8_lossy(k).into_owned(), targets));
+        }
+        out
+    }
+
+    /// Dumps all `(key, score)` pairs from `BIGRAMS`.
+    pub fn dump_bigrams(&self) -> Vec<(u32, u8)> {
+        self.bigram_keys
+            .iter()
+            .copied()
+            .zip(self.bigram_scores.iter().copied())
+            .collect()
     }
 
     /// Builds an in-memory minimal test lexicon from word lists (used when `.skdict` is not bundled).
@@ -661,8 +1270,204 @@ pub fn lint_proper_nouns(wordlists: &[&str], proper_nouns_tsv: &str) -> ProperNo
     out
 }
 
-/// Compiles raw AOSP `en_US.combined`, `en_GB.combined`, `dev_terms.txt`, `slang.txt`,
-/// `proper_nouns.tsv`, `typos_words.csv`, `british_to_american.json`, and `count_2w.txt` into a compact `.skdict` binary image.
+fn load_temp_en_shorthand_tsv() -> Vec<(String, String)> {
+    let candidates = [
+        std::path::PathBuf::from("data/shorthand_en.tsv"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/shorthand_en.tsv"),
+    ];
+    let raw = candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    let mut pairs: Vec<(String, String)> = raw
+        .lines()
+        .filter_map(|line| {
+            let s = line.trim();
+            if s.is_empty() || s.starts_with('#') {
+                return None;
+            }
+            let mut cols = s.split('\t');
+            let trig = cols.next()?.trim();
+            let exp = cols.next()?.trim();
+            if trig.is_empty() || exp.is_empty() {
+                return None;
+            }
+            Some((trig.to_string(), exp.to_string()))
+        })
+        .collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    pairs.dedup_by(|a, b| a.0 == b.0);
+    pairs
+}
+
+fn english_default_rules() -> LanguageRules {
+    let s = |x: &str| x.to_string();
+    let rep = |typed: &str, fix: &str, kind: ReplacementKind| ReplacementRule {
+        typed: typed.to_string(),
+        fix: fix.to_string(),
+        kind,
+    };
+
+    let mut replacements = Vec::new();
+    for (t, f) in [
+        ("im", "I'm"),
+        ("i'm", "I'm"),
+        ("ive", "I've"),
+        ("i've", "I've"),
+        ("i'll", "I'll"),
+        ("i'd", "I'd"),
+        ("dont", "don't"),
+        ("doesnt", "doesn't"),
+        ("didnt", "didn't"),
+        ("cant", "can't"),
+        ("wont", "won't"),
+        ("isnt", "isn't"),
+        ("arent", "aren't"),
+        ("wasnt", "wasn't"),
+        ("werent", "weren't"),
+        ("hasnt", "hasn't"),
+        ("havent", "haven't"),
+        ("hadnt", "hadn't"),
+        ("wouldnt", "wouldn't"),
+        ("couldnt", "couldn't"),
+        ("shouldnt", "shouldn't"),
+        ("mustnt", "mustn't"),
+        ("neednt", "needn't"),
+        ("aint", "ain't"),
+        ("thats", "that's"),
+        ("whats", "what's"),
+        ("theres", "there's"),
+        ("heres", "here's"),
+        ("wheres", "where's"),
+        ("whos", "who's"),
+        ("hows", "how's"),
+        ("youre", "you're"),
+        ("theyre", "they're"),
+        ("youve", "you've"),
+        ("weve", "we've"),
+        ("theyve", "they've"),
+        ("youll", "you'll"),
+        ("they'll", "they'll"),
+        ("theyll", "they'll"),
+        ("youd", "you'd"),
+        ("theyd", "they'd"),
+        ("couldve", "could've"),
+        ("wouldve", "would've"),
+        ("shouldve", "should've"),
+        ("mightve", "might've"),
+        ("mustve", "must've"),
+    ] {
+        replacements.push(rep(t, f, ReplacementKind::Contraction));
+    }
+    for (t, f) in [
+        ("do'nt", "don't"),
+        ("does'nt", "doesn't"),
+        ("did'nt", "didn't"),
+        ("ca'nt", "can't"),
+        ("wo'nt", "won't"),
+        ("is'nt", "isn't"),
+        ("are'nt", "aren't"),
+        ("was'nt", "wasn't"),
+        ("were'nt", "weren't"),
+        ("has'nt", "hasn't"),
+        ("have'nt", "haven't"),
+        ("hav'nt", "haven't"),
+        ("had'nt", "hadn't"),
+        ("would'nt", "wouldn't"),
+        ("could'nt", "couldn't"),
+        ("should'nt", "shouldn't"),
+        ("must'nt", "mustn't"),
+        ("ai'nt", "ain't"),
+    ] {
+        replacements.push(rep(t, f, ReplacementKind::TransposedApostrophe));
+    }
+    for (t, f) in [
+        ("alot", "a lot"),
+        ("aswell", "as well"),
+        ("atleast", "at least"),
+        ("infront", "in front"),
+        ("eachother", "each other"),
+        ("infact", "in fact"),
+        ("incase", "in case"),
+        ("noone", "no one"),
+        ("thankyou", "thank you"),
+    ] {
+        replacements.push(rep(t, f, ReplacementKind::UnmergedCompound));
+    }
+    for (t, f) in [
+        ("preventation", "prevention"),
+        ("apdater", "adapter"),
+        ("apdapter", "adapter"),
+    ] {
+        replacements.push(rep(t, f, ReplacementKind::TypoOverride));
+    }
+
+    LanguageRules {
+        capitalize_standalone_i: true,
+        function_words: [
+            "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "for", "from",
+            "had", "has", "have", "he", "her", "his", "if", "in", "into", "is", "it", "me", "my",
+            "no", "not", "of", "on", "or", "our", "out", "she", "so", "than", "that", "the",
+            "their", "them", "then", "there", "these", "they", "this", "to", "up", "us", "was",
+            "we", "were", "what", "when", "where", "which", "who", "will", "with", "would", "you",
+            "your",
+        ]
+        .into_iter()
+        .map(s)
+        .collect(),
+        clitics: CliticRules {
+            suffixes: ["t", "s", "m", "d", "ll", "ve", "re"]
+                .into_iter()
+                .map(s)
+                .collect(),
+            prefixes: Vec::new(),
+        },
+        casing: CasingRules {
+            leading_apostrophes: [
+                "'em", "'cause", "'til", "'90s", "'80s", "'70s", "'60s", "'round", "'n'", "'tis",
+                "'twas",
+            ]
+            .into_iter()
+            .map(s)
+            .collect(),
+            abbreviations: [
+                "e.g", "eg", "i.e", "ie", "etc", "vs", "mr", "mrs", "ms", "dr", "prof", "inc",
+                "ltd", "jr", "sr", "st", "ave", "approx", "dept", "fig", "vol", "al", "jan",
+                "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+            ]
+            .into_iter()
+            .map(s)
+            .collect(),
+            exclusions: Vec::new(),
+        },
+        bigram_boosts: [
+            ("over", "there", 248),
+            ("out", "there", 245),
+            ("right", "there", 245),
+            ("up", "there", 242),
+            ("down", "there", 242),
+            ("in", "their", 248),
+            ("of", "their", 245),
+            ("for", "their", 242),
+            ("with", "their", 242),
+            ("too", "much", 250),
+            ("so", "much", 248),
+            ("very", "much", 248),
+            ("sent", "from", 245),
+            ("away", "from", 245),
+            ("apart", "from", 245),
+        ]
+        .into_iter()
+        .map(|(p, n, score)| BigramBoost {
+            prev: p.to_string(),
+            next: n.to_string(),
+            score,
+        })
+        .collect(),
+        replacements,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compile_skdict_from_sources(
     en_us_combined: &str,
@@ -676,15 +1481,19 @@ pub fn compile_skdict_from_sources(
 ) -> Vec<u8> {
     #[derive(Default, Clone, Copy)]
     struct RawWord {
-        us_freq: u8,
-        gb_freq: u8,
+        freq0: u8,
+        freq1: u8,
+        variant_mask: u8,
         flags: u8,
     }
+
+    const VAR_US: u8 = 0x01;
+    const VAR_GB: u8 = 0x02;
 
     let mut words: BTreeMap<String, RawWord> = BTreeMap::new();
     let mut aosp_bigrams: Vec<(String, String, u8)> = Vec::new();
 
-    let mut parse_aosp = |content: &str, lang_flag: u8, capture_bigrams: bool| {
+    let mut parse_aosp = |content: &str, var_bit: u8, capture_bigrams: bool| {
         let mut current_word: Option<String> = None;
         for line in content.lines() {
             let trimmed = line.trim();
@@ -742,11 +1551,11 @@ pub fn compile_skdict_from_sources(
                 if offensive || freq == 0 {
                     entry.flags |= FLAG_OFFENSIVE;
                 } else {
-                    entry.flags |= lang_flag;
-                    if lang_flag == FLAG_IN_US {
-                        entry.us_freq = entry.us_freq.max(freq);
+                    entry.variant_mask |= var_bit;
+                    if var_bit == VAR_US {
+                        entry.freq0 = entry.freq0.max(freq);
                     } else {
-                        entry.gb_freq = entry.gb_freq.max(freq);
+                        entry.freq1 = entry.freq1.max(freq);
                     }
                     if capture_bigrams {
                         current_word = Some(lower);
@@ -779,8 +1588,8 @@ pub fn compile_skdict_from_sources(
         }
     };
 
-    parse_aosp(en_us_combined, FLAG_IN_US, true);
-    parse_aosp(en_gb_combined, FLAG_IN_GB, false);
+    parse_aosp(en_us_combined, VAR_US, true);
+    parse_aosp(en_gb_combined, VAR_GB, false);
 
     // Merge curated developer / Linux / CLI vocabulary shield (`dev_terms.txt`)
     for line in dev_terms.lines() {
@@ -790,13 +1599,14 @@ pub fn compile_skdict_from_sources(
         }
         let lower = w.to_lowercase();
         let entry = words.entry(lower).or_default();
-        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_TECH | FLAG_IN_US | FLAG_IN_GB;
-        entry.us_freq = entry.us_freq.max(172);
-        entry.gb_freq = entry.gb_freq.max(172);
+        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_SHIELD;
+        entry.variant_mask |= VAR_US | VAR_GB;
+        entry.freq0 = entry.freq0.max(172);
+        entry.freq1 = entry.freq1.max(172);
     }
 
     // Merge curated internet abbreviations & slang shield (`slang.txt`) as shield-only
-    // (leaving `us_freq`/`gb_freq` untouched so pure slang is never proposed as a fuzzy target).
+    // (leaving `freq0`/`freq1` untouched so pure slang is never proposed as a fuzzy target).
     for line in slang_terms.lines() {
         let w = line.trim();
         if w.is_empty() || w.starts_with('#') {
@@ -804,15 +1614,18 @@ pub fn compile_skdict_from_sources(
         }
         let lower = w.to_lowercase();
         let entry = words.entry(lower).or_default();
-        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_TECH | FLAG_IN_US | FLAG_IN_GB;
+        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_SHIELD;
+        entry.variant_mask |= VAR_US | VAR_GB;
     }
 
     // Also shield all English shorthand triggers (`shorthand_en.tsv`) so that if `expand_shorthand = false`
     // or a shorthand pair is in `blocklist`, the trigger remains shielded as a valid word.
-    for &(trig, _) in en_shorthand_map() {
+    let shorthand_pairs = load_temp_en_shorthand_tsv();
+    for (trig, _) in &shorthand_pairs {
         let lower = trig.to_lowercase();
         let entry = words.entry(lower).or_default();
-        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_TECH | FLAG_IN_US | FLAG_IN_GB;
+        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_SHIELD;
+        entry.variant_mask |= VAR_US | VAR_GB;
     }
 
     // Parse curated unambiguous proper nouns (`proper_nouns.tsv`)
@@ -831,9 +1644,10 @@ pub fn compile_skdict_from_sources(
             continue;
         }
         let entry = words.entry(lower.clone()).or_default();
-        entry.flags = (entry.flags & !FLAG_OFFENSIVE) | FLAG_IN_US | FLAG_IN_GB;
-        entry.us_freq = entry.us_freq.max(160);
-        entry.gb_freq = entry.gb_freq.max(160);
+        entry.flags &= !FLAG_OFFENSIVE;
+        entry.variant_mask |= VAR_US | VAR_GB;
+        entry.freq0 = entry.freq0.max(160);
+        entry.freq1 = entry.freq1.max(160);
 
         proper_nouns.push((lower, proper));
     }
@@ -852,29 +1666,36 @@ pub fn compile_skdict_from_sources(
             continue;
         }
         // Propagate frequencies so both dialect forms are first-class valid words in their dialect
-        let us_f = words.get(&us).map(|w| w.us_freq).unwrap_or(0);
-        let gb_f = words.get(&uk).map(|w| w.gb_freq).unwrap_or(0);
+        let us_f = words.get(&us).map(|w| w.freq0).unwrap_or(0);
+        let gb_f = words.get(&uk).map(|w| w.freq1).unwrap_or(0);
         let shared_f = us_f.max(gb_f).max(120);
         {
             let uk_entry = words.entry(uk.clone()).or_default();
-            uk_entry.flags |= FLAG_IN_GB;
-            uk_entry.gb_freq = uk_entry.gb_freq.max(shared_f);
+            uk_entry.variant_mask |= VAR_GB;
+            uk_entry.freq1 = uk_entry.freq1.max(shared_f);
         }
         {
             let us_entry = words.entry(us.clone()).or_default();
-            us_entry.flags |= FLAG_IN_US;
-            us_entry.us_freq = us_entry.us_freq.max(shared_f);
+            us_entry.variant_mask |= VAR_US;
+            us_entry.freq0 = us_entry.freq0.max(shared_f);
         }
         uk_pairs.push((uk, us));
     }
     uk_pairs.sort_unstable();
     uk_pairs.dedup_by(|a, b| a.0 == b.0);
 
+    let mut us_to_uk_pairs: Vec<(String, String)> = uk_pairs
+        .iter()
+        .map(|(uk, us)| (us.clone(), uk.clone()))
+        .collect();
+    us_to_uk_pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    us_to_uk_pairs.dedup_by(|a, b| a.0 == b.0);
+
     // Assign `word_id` (`1..=65535`) to the top 65,535 words by max frequency
     let mut freq_rank: Vec<(&String, u8)> = words
         .iter()
-        .filter(|(_, m)| (m.flags & FLAG_OFFENSIVE) == 0 && m.us_freq.max(m.gb_freq) > 0)
-        .map(|(w, m)| (w, m.us_freq.max(m.gb_freq)))
+        .filter(|(_, m)| (m.flags & FLAG_OFFENSIVE) == 0 && m.freq0.max(m.freq1) > 0)
+        .map(|(w, m)| (w, m.freq0.max(m.freq1)))
         .collect();
     freq_rank.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 
@@ -889,14 +1710,15 @@ pub fn compile_skdict_from_sources(
     for (w, m) in &words {
         let wid = word_ids.get(w).copied().unwrap_or(0);
         let meta = WordMeta {
-            us_freq: m.us_freq,
-            gb_freq: m.gb_freq,
+            freq0: m.freq0,
+            freq1: m.freq1,
+            variant_mask: m.variant_mask,
             flags: m.flags,
             word_id: wid,
         };
         words_builder.insert(w.as_bytes(), meta.pack()).unwrap();
 
-        let max_f = m.us_freq.max(m.gb_freq);
+        let max_f = m.freq0.max(m.freq1);
         if (m.flags & FLAG_OFFENSIVE) == 0
             && w.is_ascii()
             && !w.contains('\'')
@@ -925,7 +1747,9 @@ pub fn compile_skdict_from_sources(
         }
         // NEVER override a valid dictionary/tech/offensive word in the unconditional typo map!
         if let Some(existing) = words.get(&typo) {
-            if (existing.flags & (FLAG_IN_US | FLAG_IN_GB | FLAG_TECH | FLAG_OFFENSIVE)) != 0 {
+            if (existing.variant_mask & (VAR_US | VAR_GB)) != 0
+                || (existing.flags & (FLAG_SHIELD | FLAG_OFFENSIVE)) != 0
+            {
                 continue;
             }
         }
@@ -939,14 +1763,15 @@ pub fn compile_skdict_from_sources(
         typos_map.insert(typo, targets.join("\n"));
     }
 
+    let en_rules = english_default_rules();
+
     // Curated morphological & motor overrides where upstream `crate-ci/typos` has wrong/missing mappings
-    let curated_typo_overrides: &[(&str, &str)] = &[
-        ("preventation", "prevention"),
-        ("apdater", "adapter"),
-        ("apdapter", "adapter"),
-    ];
-    for &(bad, good) in curated_typo_overrides {
-        typos_map.insert(bad.to_string(), good.to_string());
+    for r in en_rules
+        .replacements
+        .iter()
+        .filter(|r| r.kind == ReplacementKind::TypoOverride)
+    {
+        typos_map.insert(r.typed.clone(), r.fix.clone());
     }
 
     let mut typos_builder = MapBuilder::memory();
@@ -1005,39 +1830,45 @@ pub fn compile_skdict_from_sources(
     }
 
     // Curated spoken/chat locative & grammar disambiguators where raw web 2-grams have right-context bias
-    let curated_boosts: &[(&str, &str, u8)] = &[
-        ("over", "there", 248),
-        ("out", "there", 245),
-        ("right", "there", 245),
-        ("up", "there", 242),
-        ("down", "there", 242),
-        ("in", "their", 248),
-        ("of", "their", 245),
-        ("for", "their", 242),
-        ("with", "their", 242),
-        ("too", "much", 250),
-        ("so", "much", 248),
-        ("very", "much", 248),
-        ("sent", "from", 245),
-        ("away", "from", 245),
-        ("apart", "from", 245),
-    ];
-    for &(p, n, sc) in curated_boosts {
-        if let (Some(&pid), Some(&nid)) = (word_ids.get(p), word_ids.get(n)) {
+    for b in &en_rules.bigram_boosts {
+        if let (Some(&pid), Some(&nid)) = (word_ids.get(&b.prev), word_ids.get(&b.next)) {
             let key = ((pid as u32) << 16) | (nid as u32);
-            bigram_map.insert(key, sc);
+            bigram_map.insert(key, b.score);
         }
     }
 
-    serialize_skdict(
-        &words_fst_bytes,
-        &typos_fst_bytes,
-        &typo_pool,
-        &uk_pairs,
-        &bigram_map,
-        &smash_entries,
-        &proper_nouns,
-    )
+    let header = PackHeader {
+        lang: "en".to_string(),
+        pack_version: [0, 3, 0],
+        tier: PackTier::Data,
+        variants: vec!["en_US".to_string(), "en_GB".to_string()],
+        freq_slots: vec![0x01, 0x02],
+        default_variant_idx: 0,
+        feature_flags: 0,
+    };
+    let mut variant_rewrites = Vec::new();
+    if !uk_pairs.is_empty() {
+        variant_rewrites.push((0u8, uk_pairs));
+    }
+    if !us_to_uk_pairs.is_empty() {
+        variant_rewrites.push((1u8, us_to_uk_pairs));
+    }
+
+    serialize_skdict_v3(&SkdictV3Payload {
+        header: &header,
+        words_fst: &words_fst_bytes,
+        typos_fst: &typos_fst_bytes,
+        typo_pool: &typo_pool,
+        variant_rewrites: &variant_rewrites,
+        bigrams: &bigram_map,
+        smash_entries: &smash_entries,
+        proper_nouns: &proper_nouns,
+        shorthand: &shorthand_pairs,
+        slang_set: &[],
+        rules: Some(&en_rules),
+        syllable_dict: &[],
+        source_manifest: &[],
+    })
 }
 
 fn compile_skdict_in_memory(
@@ -1061,9 +1892,10 @@ fn compile_skdict_in_memory(
     for (w, &f) in &sorted_words {
         let wid = word_ids.get(w).copied().unwrap_or(0);
         let meta = WordMeta {
-            us_freq: f,
-            gb_freq: f,
-            flags: FLAG_IN_US | FLAG_IN_GB,
+            freq0: f,
+            freq1: f,
+            variant_mask: 0x03,
+            flags: 0,
             word_id: wid,
         };
         wb.insert(w.as_bytes(), meta.pack()).unwrap();
@@ -1085,10 +1917,18 @@ fn compile_skdict_in_memory(
         tb.insert(t.as_bytes(), off | (len << 32)).unwrap();
     }
 
-    let uk_vec: Vec<(String, String)> = uk_pairs
+    let mut uk_vec: Vec<(String, String)> = uk_pairs
         .iter()
         .map(|&(k, v)| (k.to_string(), v.to_string()))
         .collect();
+    uk_vec.sort_unstable();
+    uk_vec.dedup_by(|a, b| a.0 == b.0);
+    let mut us_vec: Vec<(String, String)> = uk_vec
+        .iter()
+        .map(|(uk, us)| (us.clone(), uk.clone()))
+        .collect();
+    us_vec.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    us_vec.dedup_by(|a, b| a.0 == b.0);
 
     let mut bg_map: BTreeMap<u32, u8> = BTreeMap::new();
     for &(p, n, sc) in bigrams {
@@ -1100,69 +1940,220 @@ fn compile_skdict_in_memory(
         }
     }
 
-    let pn_vec: Vec<(String, String)> = proper_nouns
+    let mut pn_vec: Vec<(String, String)> = proper_nouns
         .iter()
         .map(|&(k, v)| (k.to_string(), v.to_string()))
         .collect();
+    pn_vec.sort_unstable();
+    pn_vec.dedup_by(|a, b| a.0 == b.0);
 
-    serialize_skdict(
-        &wb.into_inner().unwrap(),
-        &tb.into_inner().unwrap(),
-        &pool,
-        &uk_vec,
-        &bg_map,
-        &smash_entries,
-        &pn_vec,
-    )
+    let header = PackHeader {
+        lang: "en".to_string(),
+        pack_version: [0, 3, 0],
+        tier: PackTier::Data,
+        variants: vec!["en_US".to_string(), "en_GB".to_string()],
+        freq_slots: vec![0x01, 0x02],
+        default_variant_idx: 0,
+        feature_flags: 0,
+    };
+    let mut variant_rewrites = Vec::new();
+    if !uk_vec.is_empty() {
+        variant_rewrites.push((0u8, uk_vec));
+    }
+    if !us_vec.is_empty() {
+        variant_rewrites.push((1u8, us_vec));
+    }
+
+    serialize_skdict_v3(&SkdictV3Payload {
+        header: &header,
+        words_fst: &wb.into_inner().unwrap(),
+        typos_fst: &tb.into_inner().unwrap(),
+        typo_pool: &pool,
+        variant_rewrites: &variant_rewrites,
+        bigrams: &bg_map,
+        smash_entries: &smash_entries,
+        proper_nouns: &pn_vec,
+        shorthand: &[],
+        slang_set: &[],
+        rules: None,
+        syllable_dict: &[],
+        source_manifest: &[],
+    })
 }
 
-fn serialize_skdict(
-    words_fst: &[u8],
-    typos_fst: &[u8],
-    typo_pool: &[u8],
-    uk_pairs: &[(String, String)],
-    bigrams: &BTreeMap<u32, u8>,
-    smash_entries: &[(u32, u8, u8, String)],
-    proper_nouns: &[(String, String)],
-) -> Vec<u8> {
+pub fn build_words_fst_bytes(entries: &[(&str, WordMeta)]) -> Vec<u8> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    sorted.dedup_by(|a, b| a.0 == b.0);
+    let mut wb = MapBuilder::memory();
+    for (w, meta) in sorted {
+        wb.insert(w.as_bytes(), meta.pack()).unwrap();
+    }
+    wb.into_inner().unwrap()
+}
+
+pub struct SkdictV3Payload<'a> {
+    pub header: &'a PackHeader,
+    pub words_fst: &'a [u8],
+    pub typos_fst: &'a [u8],
+    pub typo_pool: &'a [u8],
+    pub variant_rewrites: &'a [(u8, Vec<(String, String)>)],
+    pub bigrams: &'a BTreeMap<u32, u8>,
+    pub smash_entries: &'a [(u32, u8, u8, String)],
+    pub proper_nouns: &'a [(String, String)],
+    pub shorthand: &'a [(String, String)],
+    pub slang_set: &'a [String],
+    pub rules: Option<&'a LanguageRules>,
+    pub syllable_dict: &'a [String],
+    pub source_manifest: &'a [SourceManifestEntry],
+}
+
+fn write_u32_slice(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(data);
+}
+
+fn write_tlv_section(out: &mut Vec<u8>, tag: u16, payload: &[u8]) {
+    out.extend_from_slice(&tag.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+}
+
+pub fn serialize_skdict_v3(p: &SkdictV3Payload<'_>) -> Vec<u8> {
+    assert!(!p.header.lang.is_empty() && p.header.lang.len() <= 255);
+    assert!((1..=8).contains(&p.header.variants.len()));
+    assert!(p.header.freq_slots.len() <= 2);
+    assert!((p.header.default_variant_idx as usize) < p.header.variants.len());
+
+    let mut hdr = Vec::with_capacity(64);
+    hdr.push(p.header.lang.len() as u8);
+    hdr.extend_from_slice(p.header.lang.as_bytes());
+    hdr.extend_from_slice(&p.header.pack_version);
+    hdr.push(p.header.tier as u8);
+    hdr.push(p.header.variants.len() as u8);
+    for v in &p.header.variants {
+        assert!(!v.is_empty() && v.len() <= 255 && v.is_ascii());
+        hdr.push(v.len() as u8);
+        hdr.extend_from_slice(v.as_bytes());
+    }
+    hdr.push(p.header.freq_slots.len() as u8);
+    for &mask in &p.header.freq_slots {
+        hdr.push(mask);
+    }
+    hdr.push(p.header.default_variant_idx);
+    hdr.extend_from_slice(&p.header.feature_flags.to_le_bytes());
+    assert!(hdr.len() <= u16::MAX as usize);
+
     let mut out = Vec::with_capacity(
-        words_fst.len() + typos_fst.len() + typo_pool.len() + bigrams.len() * 5 + 65536,
+        10 + hdr.len() + p.words_fst.len() + p.typos_fst.len() + p.typo_pool.len() + 65536,
     );
-    out.extend_from_slice(MAGIC_V2);
+    out.extend_from_slice(MAGIC_V3);
+    out.extend_from_slice(&(hdr.len() as u16).to_le_bytes());
+    out.extend_from_slice(&hdr);
 
-    let write_slice = |buf: &mut Vec<u8>, data: &[u8]| {
-        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        buf.extend_from_slice(data);
-    };
-
-    write_slice(&mut out, words_fst);
-    write_slice(&mut out, typos_fst);
-    write_slice(&mut out, typo_pool);
-
-    out.extend_from_slice(&(uk_pairs.len() as u32).to_le_bytes());
-    for (uk, us) in uk_pairs {
-        write_slice(&mut out, uk.as_bytes());
-        write_slice(&mut out, us.as_bytes());
+    if !p.words_fst.is_empty() {
+        write_tlv_section(&mut out, TAG_WORDS_FST, p.words_fst);
     }
 
-    out.extend_from_slice(&(bigrams.len() as u32).to_le_bytes());
-    for (&key, &score) in bigrams {
-        out.extend_from_slice(&key.to_le_bytes());
-        out.push(score);
+    if !p.typos_fst.is_empty() || !p.typo_pool.is_empty() {
+        let mut sec = Vec::with_capacity(4 + p.typos_fst.len() + p.typo_pool.len());
+        sec.extend_from_slice(&(p.typos_fst.len() as u32).to_le_bytes());
+        sec.extend_from_slice(p.typos_fst);
+        sec.extend_from_slice(p.typo_pool);
+        write_tlv_section(&mut out, TAG_KNOWN_TYPOS, &sec);
     }
 
-    out.extend_from_slice(&(smash_entries.len() as u32).to_le_bytes());
-    for (mask, len, freq, word) in smash_entries {
-        out.extend_from_slice(&mask.to_le_bytes());
-        out.push(*len);
-        out.push(*freq);
-        write_slice(&mut out, word.as_bytes());
+    if !p.variant_rewrites.is_empty() {
+        let mut sec = Vec::new();
+        sec.push(p.variant_rewrites.len() as u8);
+        for (target_idx, pairs) in p.variant_rewrites {
+            sec.push(*target_idx);
+            sec.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
+            for (from, to) in pairs {
+                write_u32_slice(&mut sec, from.as_bytes());
+                write_u32_slice(&mut sec, to.as_bytes());
+            }
+        }
+        write_tlv_section(&mut out, TAG_VARIANT_REWRITES, &sec);
     }
 
-    out.extend_from_slice(&(proper_nouns.len() as u32).to_le_bytes());
-    for (lower, proper) in proper_nouns {
-        write_slice(&mut out, lower.as_bytes());
-        write_slice(&mut out, proper.as_bytes());
+    if !p.bigrams.is_empty() {
+        let mut sec = Vec::with_capacity(4 + p.bigrams.len() * 5);
+        sec.extend_from_slice(&(p.bigrams.len() as u32).to_le_bytes());
+        for (&key, &score) in p.bigrams {
+            sec.extend_from_slice(&key.to_le_bytes());
+            sec.push(score);
+        }
+        write_tlv_section(&mut out, TAG_BIGRAMS, &sec);
+    }
+
+    if !p.smash_entries.is_empty() {
+        let mut sec = Vec::with_capacity(4 + p.smash_entries.len() * 20);
+        sec.extend_from_slice(&(p.smash_entries.len() as u32).to_le_bytes());
+        for (mask, len, freq, word) in p.smash_entries {
+            sec.extend_from_slice(&mask.to_le_bytes());
+            sec.push(*len);
+            sec.push(*freq);
+            write_u32_slice(&mut sec, word.as_bytes());
+        }
+        write_tlv_section(&mut out, TAG_SMASH_INDEX, &sec);
+    }
+
+    if !p.proper_nouns.is_empty() {
+        let mut sec = Vec::new();
+        sec.extend_from_slice(&(p.proper_nouns.len() as u32).to_le_bytes());
+        for (lower, proper) in p.proper_nouns {
+            write_u32_slice(&mut sec, lower.as_bytes());
+            write_u32_slice(&mut sec, proper.as_bytes());
+        }
+        write_tlv_section(&mut out, TAG_PROPER_NOUNS, &sec);
+    }
+
+    if !p.shorthand.is_empty() {
+        let mut sec = Vec::new();
+        sec.extend_from_slice(&(p.shorthand.len() as u32).to_le_bytes());
+        for (trig, exp) in p.shorthand {
+            write_u32_slice(&mut sec, trig.as_bytes());
+            write_u32_slice(&mut sec, exp.as_bytes());
+        }
+        write_tlv_section(&mut out, TAG_SHORTHAND, &sec);
+    }
+
+    if !p.slang_set.is_empty() {
+        let mut sec = Vec::new();
+        sec.extend_from_slice(&(p.slang_set.len() as u32).to_le_bytes());
+        for w in p.slang_set {
+            write_u32_slice(&mut sec, w.as_bytes());
+        }
+        write_tlv_section(&mut out, TAG_SLANG_SET, &sec);
+    }
+
+    if let Some(rules) = p.rules {
+        let json = serde_json::to_vec(rules).expect("serialize LanguageRules JSON");
+        let mut sec = Vec::with_capacity(1 + json.len());
+        sec.push(1u8);
+        sec.extend_from_slice(&json);
+        write_tlv_section(&mut out, TAG_LANGUAGE_RULES, &sec);
+    }
+
+    if !p.syllable_dict.is_empty() {
+        let mut sec = Vec::new();
+        sec.extend_from_slice(&(p.syllable_dict.len() as u32).to_le_bytes());
+        for syl in p.syllable_dict {
+            write_u32_slice(&mut sec, syl.as_bytes());
+        }
+        write_tlv_section(&mut out, TAG_SYLLABLE_DICT, &sec);
+    }
+
+    if !p.source_manifest.is_empty() {
+        let mut sec = Vec::new();
+        sec.extend_from_slice(&(p.source_manifest.len() as u32).to_le_bytes());
+        for entry in p.source_manifest {
+            write_u32_slice(&mut sec, entry.name.as_bytes());
+            sec.extend_from_slice(&entry.sha256);
+            write_u32_slice(&mut sec, entry.license.as_bytes());
+        }
+        write_tlv_section(&mut out, TAG_SOURCE_MANIFEST, &sec);
     }
 
     out
@@ -1170,7 +2161,7 @@ fn serialize_skdict(
 
 #[cfg(test)]
 mod proper_noun_lint_tests {
-    use super::{lint_proper_nouns, PROPER_NOUN_MIN_CASE_GAP};
+    use super::*;
 
     const WORDLIST: &str = "\
 dictionary=main:en_us,locale=en_US
@@ -1227,10 +2218,138 @@ dictionary=main:en_us,locale=en_US
     #[test]
     fn from_static_bytes_borrows_fst_and_typo_pool_without_copy() {
         use std::borrow::Cow;
-        let lex = super::EnglishLexicon::from_bundled().expect("bundled lexicon loads");
+        static RAW: &[u8] = include_bytes!("../assets/en_lexicon.skdict");
+        let lex = super::EnglishLexicon::from_static_bytes(RAW).expect("bundled lexicon loads");
+        let range = RAW.as_ptr_range();
         assert!(matches!(lex.typo_pool, Cow::Borrowed(_)));
-        assert!(matches!(lex.words_fst.as_fst().as_bytes(), b if !b.is_empty()));
+        assert!(range.contains(&lex.typo_pool.as_ptr()));
+        assert!(!lex.words_fst.as_fst().as_bytes().is_empty());
+        assert!(range.contains(&lex.words_fst.as_fst().as_bytes().as_ptr()));
+        assert!(!lex.typos_fst.as_fst().as_bytes().is_empty());
+        assert!(range.contains(&lex.typos_fst.as_fst().as_bytes().as_ptr()));
         assert!(lex.lookup_word("the").is_some());
         assert!(lex.lookup_known_typos("teh").is_some());
+    }
+
+    #[test]
+    fn skdict_v3_rejects_legacy_magics_skips_unknown_tlv_and_checks_wordmeta_reserved_bits() {
+        assert!(matches!(
+            peek_skdict_header(b"SKDICT01xxxx"),
+            Err(LexiconError::LegacyFormat(1))
+        ));
+        assert!(matches!(
+            peek_skdict_header(b"SKDICT02xxxx"),
+            Err(LexiconError::LegacyFormat(2))
+        ));
+        assert!(matches!(
+            EnglishLexicon::from_owned_bytes(b"SKDICT02xxxx".to_vec()),
+            Err(LexiconError::LegacyFormat(2))
+        ));
+
+        // Reserved bits 48..64 must be rejected by unpack_checked and load
+        let good_meta = WordMeta {
+            freq0: 190,
+            freq1: 185,
+            variant_mask: 0x03,
+            flags: FLAG_SHIELD | FLAG_AMBIGUOUS_PROPER,
+            word_id: 42,
+        };
+        let packed = good_meta.pack();
+        assert_eq!(WordMeta::unpack_checked(packed).unwrap(), good_meta);
+        assert!(matches!(
+            WordMeta::unpack_checked(packed | (1u64 << 48)),
+            Err(LexiconError::CorruptSection("WORDS_FST"))
+        ));
+
+        let mut bad_wb = MapBuilder::memory();
+        bad_wb.insert(b"hello", packed | (1u64 << 55)).unwrap();
+        let bad_hdr = PackHeader {
+            lang: "en".to_string(),
+            pack_version: [0, 3, 0],
+            tier: PackTier::Data,
+            variants: vec!["en_US".to_string()],
+            freq_slots: vec![0x01],
+            default_variant_idx: 0,
+            feature_flags: 0,
+        };
+        let bad_img = serialize_skdict_v3(&SkdictV3Payload {
+            header: &bad_hdr,
+            words_fst: &bad_wb.into_inner().unwrap(),
+            typos_fst: &[],
+            typo_pool: &[],
+            variant_rewrites: &[],
+            bigrams: &BTreeMap::new(),
+            smash_entries: &[],
+            proper_nouns: &[],
+            shorthand: &[],
+            slang_set: &[],
+            rules: None,
+            syllable_dict: &[],
+            source_manifest: &[],
+        });
+        assert!(matches!(
+            EnglishLexicon::from_owned_bytes(bad_img),
+            Err(LexiconError::CorruptSection("WORDS_FST"))
+        ));
+
+        // Single-variant pack (`variant_count == 1`), unknown TLV tag skip, and manifest/shorthand/slang/syllables roundtrip
+        let mut wb = MapBuilder::memory();
+        let es_meta = WordMeta {
+            freq0: 200,
+            freq1: 0,
+            variant_mask: 0x01,
+            flags: 0,
+            word_id: 1,
+        };
+        wb.insert(b"hola", es_meta.pack()).unwrap();
+        let es_hdr = PackHeader {
+            lang: "es".to_string(),
+            pack_version: [0, 3, 1],
+            tier: PackTier::Data,
+            variants: vec!["es_ES".to_string()],
+            freq_slots: vec![0x01],
+            default_variant_idx: 0,
+            feature_flags: 0,
+        };
+        let manifest = vec![SourceManifestEntry {
+            name: "es_wordlist".to_string(),
+            sha256: [0xAB; 32],
+            license: "Apache-2.0".to_string(),
+        }];
+        let mut img = serialize_skdict_v3(&SkdictV3Payload {
+            header: &es_hdr,
+            words_fst: &wb.into_inner().unwrap(),
+            typos_fst: &[],
+            typo_pool: &[],
+            variant_rewrites: &[],
+            bigrams: &BTreeMap::new(),
+            smash_entries: &[],
+            proper_nouns: &[],
+            shorthand: &[("xq".to_string(), "porque".to_string())],
+            slang_set: &["holi".to_string()],
+            rules: Some(&LanguageRules::default()),
+            syllable_dict: &["syl".to_string()],
+            source_manifest: &manifest,
+        });
+        // Append an unknown future TLV tag 0x9999 with 4 bytes payload
+        img.extend_from_slice(&0x9999u16.to_le_bytes());
+        img.extend_from_slice(&4u32.to_le_bytes());
+        img.extend_from_slice(b"TEST");
+
+        let (peeked_hdr, peeked_manifest) = peek_skdict_header_and_manifest(&img).unwrap();
+        assert_eq!(peeked_hdr, es_hdr);
+        assert_eq!(peeked_manifest, manifest);
+
+        let lex = EnglishLexicon::from_owned_bytes(img).unwrap();
+        assert_eq!(lex.header(), &es_hdr);
+        assert!(lex.contains_valid("hola", Dialect::EnGb));
+        assert_eq!(
+            lex.effective_freq_meta(lex.lookup_word("hola").unwrap(), Dialect::EnGb),
+            200
+        );
+        assert_eq!(lex.lookup_shorthand("xq"), Some("porque"));
+        assert!(lex.is_slang_word("holi"));
+        assert_eq!(lex.syllable_dict(), &["syl".to_string().into_boxed_str()]);
+        assert_eq!(lex.source_manifest(), manifest.as_slice());
     }
 }

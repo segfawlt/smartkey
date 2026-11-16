@@ -1,10 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
 
-use crate::casing::{analyze_token, project_case, TokenAnalysis};
+use crate::casing::{analyze_token_with_rules, project_case, TokenAnalysis};
 use crate::keyboard::{
     ascii_letter_mask, damerau_levenshtein_chars, multiset_overlap, weighted_keyboard_cost,
 };
-use crate::lexicon::EnglishLexicon;
+use crate::lexicon::{EnglishLexicon, ReplacementKind};
 use crate::types::{
     Aggressiveness, AppProfile, Candidate, EvalOutcome, Explanation, MatchKind, ScorerConfig,
 };
@@ -97,64 +97,30 @@ pub trait LanguageScorer {
     ) -> Explanation;
 }
 
-/// Unconditional missing-apostrophe contractions (excludes valid homographs like `its`, `were`, `lets`, `ill`, `id`, `well`, `hell`, `shed`, `wed`).
-const UNCONDITIONAL_CONTRACTIONS: &[(&str, &str)] = &[
-    ("im", "I'm"),
-    ("i'm", "I'm"),
-    ("ive", "I've"),
-    ("i've", "I've"),
-    ("i'll", "I'll"),
-    ("i'd", "I'd"),
-    ("dont", "don't"),
-    ("doesnt", "doesn't"),
-    ("didnt", "didn't"),
-    ("cant", "can't"),
-    ("wont", "won't"),
-    ("isnt", "isn't"),
-    ("arent", "aren't"),
-    ("wasnt", "wasn't"),
-    ("werent", "weren't"),
-    ("hasnt", "hasn't"),
-    ("havent", "haven't"),
-    ("hadnt", "hadn't"),
-    ("wouldnt", "wouldn't"),
-    ("couldnt", "couldn't"),
-    ("shouldnt", "shouldn't"),
-    ("mustnt", "mustn't"),
-    ("neednt", "needn't"),
-    ("aint", "ain't"),
-    ("thats", "that's"),
-    ("whats", "what's"),
-    ("theres", "there's"),
-    ("heres", "here's"),
-    ("wheres", "where's"),
-    ("whos", "who's"),
-    ("hows", "how's"),
-    ("youre", "you're"),
-    ("theyre", "they're"),
-    ("youve", "you've"),
-    ("weve", "we've"),
-    ("theyve", "they've"),
-    ("youll", "you'll"),
-    ("they'll", "they'll"),
-    ("theyll", "they'll"),
-    ("youd", "you'd"),
-    ("theyd", "they'd"),
-    ("couldve", "could've"),
-    ("wouldve", "would've"),
-    ("shouldve", "should've"),
-    ("mightve", "might've"),
-    ("mustve", "must've"),
-];
-
 /// True when `(typed_lower, expanded_lower)` is one of the curated unconditional contraction
-/// pairs above (`dont -> don't`). These are near-100% corrections — the typed form is never a
-/// valid English word — so a single accidental rejection must not permanently block them
-/// (see `learner::reject_pair_permanently` for the `2x` evidence requirement).
+/// pairs in the bundled English pack (`dont -> don't`). These are near-100% corrections — the
+/// typed form is never a valid word — so a single accidental rejection must not permanently block
+/// them (see `learner::reject_pair_permanently` for the `2x` evidence requirement).
 pub fn is_unconditional_contraction_pair(typed_lower: &str, expanded_lower: &str) -> bool {
-    UNCONDITIONAL_CONTRACTIONS.iter().any(|&(raw, expanded)| {
-        raw == typed_lower && expanded.to_lowercase() == expanded_lower.to_lowercase()
-    })
+    crate::lexicon::bundled_en_lexicon()
+        .is_some_and(|lex| lex.is_contraction_pair(typed_lower, expanded_lower))
+}
+
+/// True when `(typed_lower, rejected_lower)` requires `2x` rejection evidence for the given pack:
+/// curated contractions from `lexicon.rules()` (`dont -> don't`) and case-only corrections (`polish -> Polish`).
+pub fn is_staged_rejection_pair_for(
+    lexicon: Option<&EnglishLexicon>,
+    lang: &str,
+    typed_lower: &str,
+    rejected_lower: &str,
+) -> bool {
+    if typed_lower == rejected_lower {
+        return true;
+    }
+    match lexicon {
+        Some(lex) => lex.is_contraction_pair(typed_lower, rejected_lower),
+        None => lang == "en" && is_unconditional_contraction_pair(typed_lower, rejected_lower),
+    }
 }
 
 /// Pairs whose permanent block needs `2x` rejection evidence instead of an immediate `1x` block:
@@ -165,53 +131,7 @@ pub fn is_staged_rejection_pair(typed_lower: &str, rejected_lower: &str) -> bool
     typed_lower == rejected_lower || is_unconditional_contraction_pair(typed_lower, rejected_lower)
 }
 
-/// Transposed apostrophe slips (`do'nt -> don't`, `does'nt -> doesn't`).
-const TRANSPOSED_APOSTROPHES: &[(&str, &str)] = &[
-    ("do'nt", "don't"),
-    ("does'nt", "doesn't"),
-    ("did'nt", "didn't"),
-    ("ca'nt", "can't"),
-    ("wo'nt", "won't"),
-    ("is'nt", "isn't"),
-    ("are'nt", "aren't"),
-    ("was'nt", "wasn't"),
-    ("were'nt", "weren't"),
-    ("has'nt", "hasn't"),
-    ("have'nt", "haven't"),
-    ("hav'nt", "haven't"),
-    ("had'nt", "hadn't"),
-    ("would'nt", "wouldn't"),
-    ("could'nt", "couldn't"),
-    ("should'nt", "shouldn't"),
-    ("must'nt", "mustn't"),
-    ("ai'nt", "ain't"),
-];
-
-/// Unmerged two-word prose compounds (`alot -> a lot`, `aswell -> as well`).
-const UNMERGED_COMPOUNDS: &[(&str, &str)] = &[
-    ("alot", "a lot"),
-    ("aswell", "as well"),
-    ("atleast", "at least"),
-    ("infront", "in front"),
-    ("eachother", "each other"),
-    ("infact", "in fact"),
-    ("incase", "in case"),
-    ("noone", "no one"),
-    ("thankyou", "thank you"),
-];
-
-/// Closed-class function words allowed in automatic 2-word missed-space / thumb-clip splitting.
-const FUNCTION_WORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "for", "from", "had",
-    "has", "have", "he", "her", "his", "if", "in", "into", "is", "it", "me", "my", "no", "not",
-    "of", "on", "or", "our", "out", "she", "so", "than", "that", "the", "their", "them", "then",
-    "there", "these", "they", "this", "to", "up", "us", "was", "we", "were", "what", "when",
-    "where", "which", "who", "will", "with", "would", "you", "your",
-];
-
-const CLITIC_SUFFIXES: &[&str] = &["t", "s", "m", "d", "ll", "ve", "re"];
-
-/// Layer 1 PC-first English scorer backed by `EnglishLexicon`.
+/// Layer 1 PC-first scorer backed by `EnglishLexicon`.
 pub struct EnglishScorer {
     lexicon: EnglishLexicon,
 }
@@ -286,7 +206,7 @@ impl EnglishScorer {
         let mut fuzzy_hits = Vec::new();
         self.lexicon.search_fuzzy(&core_lower, 1, &mut fuzzy_hits);
         for (w, meta) in fuzzy_hits {
-            if meta.is_offensive() || !meta.is_valid_for_dialect(config.dialect) {
+            if meta.is_offensive() || !self.lexicon.is_valid_meta(meta, config.dialect) {
                 continue;
             }
             let mapped = self.lexicon.map_dialect(&w, config.dialect);
@@ -342,12 +262,14 @@ impl EnglishScorer {
             );
         }
 
-        let analysis = analyze_token(
+        let lang_rules = self.lexicon.rules();
+        let analysis = analyze_token_with_rules(
             token,
             ctx.boundary_punct,
             ctx.at_sentence_start && !ctx.suppress_sentence_cap,
             config.fix_shift_slips,
-            |w| self.lexicon.contains_any_english(w) || rules.is_personal_word(w),
+            &lang_rules.casing,
+            |w| self.lexicon.contains_any_variant_or_elided(w) || rules.is_personal_word(w),
         );
 
         let (
@@ -478,17 +400,15 @@ impl EnglishScorer {
         // Step 2: Pinky semicolon slip (`don;t -> don't`, `i;m -> I'm`)
         if core_lower.contains(';') {
             if let Some((stem, suffix)) = core_lower.split_once(';') {
-                if !stem.is_empty() && CLITIC_SUFFIXES.contains(&suffix) {
+                if !stem.is_empty() && lang_rules.clitics.suffixes.iter().any(|s| s == suffix) {
                     let candidate_apos = format!("{stem}'{suffix}");
-                    let resolved = if candidate_apos == "i'm" {
-                        Some("I'm".to_string())
-                    } else if candidate_apos == "i've" {
-                        Some("I've".to_string())
-                    } else if candidate_apos == "i'll" {
-                        Some("I'll".to_string())
-                    } else if candidate_apos == "i'd" {
-                        Some("I'd".to_string())
-                    } else if self.lexicon.contains_any_english(&candidate_apos) {
+                    let resolved = if let Some(rule) = lang_rules
+                        .replacements
+                        .iter()
+                        .find(|r| r.kind == ReplacementKind::Contraction && r.typed == candidate_apos)
+                    {
+                        Some(rule.fix.clone())
+                    } else if self.lexicon.contains_any_variant(&candidate_apos) {
                         Some(candidate_apos)
                     } else {
                         None
@@ -528,9 +448,14 @@ impl EnglishScorer {
 
         // Step 2b: Transposed apostrophes (`do'nt -> don't`, `does'nt -> doesn't`)
         if core_lower.contains('\'') && !is_mixed_case_word {
-            for &(bad, good) in TRANSPOSED_APOSTROPHES {
-                if core_lower == bad && !rules.is_pair_blocked(&core_lower, &good.to_lowercase()) {
-                    let rep = wrap(&project_case(good, cap_initial));
+            for r in lang_rules
+                .replacements
+                .iter()
+                .filter(|r| r.kind == ReplacementKind::TransposedApostrophe)
+            {
+                if core_lower == r.typed && !rules.is_pair_blocked(&core_lower, &r.fix.to_lowercase())
+                {
+                    let rep = wrap(&project_case(&r.fix, cap_initial));
                     return (
                         EvalOutcome::Autocorrect {
                             replacement: rep.clone(),
@@ -631,7 +556,11 @@ impl EnglishScorer {
 
         // Step 3b: Standalone `i -> I`, missing-apostrophe contractions (`doesnt -> doesn't`, `im -> I'm`),
         // and unmerged compounds (`alot -> a lot`)
-        if config.auto_capitalize_i && core == "i" && !rules.is_pair_blocked("i", "i") {
+        if config.auto_capitalize_i
+            && lang_rules.capitalize_standalone_i
+            && core == "i"
+            && !rules.is_pair_blocked("i", "i")
+        {
             let rep = wrap("I");
             return (
                 EvalOutcome::Autocorrect {
@@ -652,11 +581,15 @@ impl EnglishScorer {
         }
 
         if config.enable_contractions {
-            for &(raw_c, expanded) in UNCONDITIONAL_CONTRACTIONS {
-                if core_lower == raw_c {
-                    let exp_lower = expanded.to_lowercase();
+            for r in lang_rules
+                .replacements
+                .iter()
+                .filter(|r| r.kind == ReplacementKind::Contraction)
+            {
+                if core_lower == r.typed {
+                    let exp_lower = r.fix.to_lowercase();
                     if !rules.is_pair_blocked(&core_lower, &exp_lower) {
-                        let projected = project_case(expanded, cap_initial);
+                        let projected = project_case(&r.fix, cap_initial);
                         let rep = wrap(&projected);
                         if rep != token {
                             return (
@@ -682,9 +615,13 @@ impl EnglishScorer {
         }
 
         if config.enable_missed_space_split {
-            for &(merged, split_pair) in UNMERGED_COMPOUNDS {
-                if core_lower == merged && !rules.is_pair_blocked(&core_lower, split_pair) {
-                    let rep = wrap(&project_case(split_pair, cap_initial));
+            for r in lang_rules
+                .replacements
+                .iter()
+                .filter(|r| r.kind == ReplacementKind::UnmergedCompound)
+            {
+                if core_lower == r.typed && !rules.is_pair_blocked(&core_lower, &r.fix) {
+                    let rep = wrap(&project_case(&r.fix, cap_initial));
                     return (
                         EvalOutcome::Autocorrect {
                             replacement: rep.clone(),
@@ -707,7 +644,7 @@ impl EnglishScorer {
 
         // Step 3c: Built-in Shorthand Auto-Expansion (`pls -> please`, `rn -> right now`, `idk -> I don't know`)
         if config.expand_shorthand && !shift_slip_fixed {
-            if let Some(expanded) = crate::lexicon::lookup_english_shorthand(&core_lower) {
+            if let Some(expanded) = self.lexicon.lookup_shorthand(&core_lower) {
                 let exp_lower = expanded.to_lowercase();
                 if !rules.is_pair_blocked(&core_lower, &exp_lower) {
                     let projected =
@@ -761,8 +698,11 @@ impl EnglishScorer {
             }
         }
 
-        // Step 4b: Valid-Word Fast Path (`0%` false-positive shield on real US/UK/tech/offensive words)
-        if self.lexicon.contains_valid(&core_lower, config.dialect) {
+        // Step 4b: Valid-Word Fast Path (`0%` false-positive shield on real US/UK/tech/offensive words + clitic elisions)
+        if self
+            .lexicon
+            .contains_valid_or_elided(&core_lower, config.dialect)
+        {
             if shift_slip_fixed {
                 let rep = wrap(&core);
                 if rep != token {
@@ -785,8 +725,12 @@ impl EnglishScorer {
                 }
             }
 
+            let word_meta = self.lexicon.lookup_word(&core_lower);
+            let is_ambiguous_proper = word_meta.is_some_and(|m| m.is_ambiguous_proper());
+
             // Proper Noun auto-capitalization (english -> English, monday -> Monday)
-            if config.fix_proper_nouns && !shift_slip_fixed {
+            // Ambiguous lowercase words (`FLAG_AMBIGUOUS_PROPER`, e.g. `latin` or `march`) are skipped.
+            if config.fix_proper_nouns && !shift_slip_fixed && !is_ambiguous_proper {
                 if let Some(proper) = self.lexicon.lookup_proper_noun(&core_lower) {
                     if core != proper
                         && (rules.is_pinned(&core_lower)
@@ -831,11 +775,8 @@ impl EnglishScorer {
             let allow_title_case_learn = user_title_case
                 && !shift_slip_fixed
                 && !in_personal
-                && self.lexicon.lookup_proper_noun(&core_lower).is_none()
-                && self
-                    .lexicon
-                    .lookup_word(&core_lower)
-                    .is_some_and(|m| m.is_tech());
+                && (is_ambiguous_proper || self.lexicon.lookup_proper_noun(&core_lower).is_none())
+                && word_meta.is_some_and(|m| m.is_tech());
             return (
                 EvalOutcome::Unchanged {
                     reason: MatchKind::ValidWord,
@@ -976,10 +917,10 @@ impl EnglishScorer {
                 let Some(meta) = self.lexicon.lookup_word(mapped) else {
                     continue;
                 };
-                if meta.is_offensive() || !meta.is_valid_for_dialect(config.dialect) {
+                if meta.is_offensive() || !self.lexicon.is_valid_meta(meta, config.dialect) {
                     continue;
                 }
-                let freq = meta.effective_freq(config.dialect);
+                let freq = self.lexicon.effective_freq_meta(meta, config.dialect);
                 if freq == 0 {
                     continue;
                 }
@@ -1015,11 +956,11 @@ impl EnglishScorer {
             for collapsed in generate_chatter_collapses(&core_lower) {
                 let mapped = self.lexicon.map_dialect(&collapsed, config.dialect);
                 if let Some(meta) = self.lexicon.lookup_word(mapped) {
-                    if !meta.is_offensive() && meta.is_valid_for_dialect(config.dialect) {
+                    if !meta.is_offensive() && self.lexicon.is_valid_meta(meta, config.dialect) {
                         push_candidate(
                             &mut pool,
                             mapped,
-                            meta.effective_freq(config.dialect),
+                            self.lexicon.effective_freq_meta(meta, config.dialect),
                             0.24,
                             MatchKind::SwitchChatter,
                             Some(0.44),
@@ -1051,12 +992,12 @@ impl EnglishScorer {
                 for (w, meta) in fuzzy_hits {
                     let mapped = self.lexicon.map_dialect(&w, config.dialect);
                     let freq = if mapped == w {
-                        meta.effective_freq(config.dialect)
+                        self.lexicon.effective_freq_meta(meta, config.dialect)
                     } else {
                         self.lexicon
                             .lookup_word(mapped)
-                            .map(|m| m.effective_freq(config.dialect))
-                            .unwrap_or_else(|| meta.effective_freq(config.dialect))
+                            .map(|m| self.lexicon.effective_freq_meta(m, config.dialect))
+                            .unwrap_or_else(|| self.lexicon.effective_freq_meta(meta, config.dialect))
                     };
                     if char_len <= 4 {
                         let cost = weighted_keyboard_cost(&core_lower, mapped);
@@ -1244,6 +1185,8 @@ impl EnglishScorer {
         config: &ScorerConfig,
         push_candidate: &mut impl FnMut(&str, u8, f32, MatchKind, Option<f32>),
     ) {
+        let lang_rules = self.lexicon.rules();
+        let is_func = |w: &str| lang_rules.function_words.iter().any(|fw| fw == w);
         let n = core_lower.len();
         // 1. Direct missed space: `w1 + w2` (`ofthe -> of the`, `inthe -> in the`)
         for split in 1..n {
@@ -1255,14 +1198,15 @@ impl EnglishScorer {
             if w2.len() < 2 && w2 != "a" {
                 continue;
             }
-            if !FUNCTION_WORDS.contains(&w1) && !FUNCTION_WORDS.contains(&w2) {
+            if !is_func(w1) && !is_func(w2) {
                 continue;
             }
             let (Some(m1), Some(m2)) = (self.lexicon.lookup_word(w1), self.lexicon.lookup_word(w2))
             else {
                 continue;
             };
-            if !m1.is_valid_for_dialect(config.dialect) || !m2.is_valid_for_dialect(config.dialect)
+            if !self.lexicon.is_valid_meta(m1, config.dialect)
+                || !self.lexicon.is_valid_meta(m2, config.dialect)
             {
                 continue;
             }
@@ -1270,10 +1214,12 @@ impl EnglishScorer {
             if bg < 0.72 {
                 continue;
             }
-            let min_f = m1
-                .effective_freq(config.dialect)
-                .min(m2.effective_freq(config.dialect));
-            let w1_fmt = if w1 == "i" && config.auto_capitalize_i {
+            let min_f = self
+                .lexicon
+                .effective_freq_meta(m1, config.dialect)
+                .min(self.lexicon.effective_freq_meta(m2, config.dialect));
+            let w1_fmt = if w1 == "i" && config.auto_capitalize_i && lang_rules.capitalize_standalone_i
+            {
                 "I"
             } else {
                 w1
@@ -1296,7 +1242,7 @@ impl EnglishScorer {
             }
             let w1 = &core_lower[..mid];
             let w2 = &core_lower[mid + 1..];
-            if !FUNCTION_WORDS.contains(&w1) || !FUNCTION_WORDS.contains(&w2) {
+            if !is_func(w1) || !is_func(w2) {
                 continue;
             }
             let (Some(m1), Some(m2)) = (self.lexicon.lookup_word(w1), self.lexicon.lookup_word(w2))
@@ -1307,9 +1253,10 @@ impl EnglishScorer {
             if bg < 0.75 {
                 continue;
             }
-            let min_f = m1
-                .effective_freq(config.dialect)
-                .min(m2.effective_freq(config.dialect));
+            let min_f = self
+                .lexicon
+                .effective_freq_meta(m1, config.dialect)
+                .min(self.lexicon.effective_freq_meta(m2, config.dialect));
             let joined = format!("{w1} {w2}");
             push_candidate(
                 &joined,
@@ -1410,4 +1357,275 @@ fn generate_chatter_collapses(lower: &str) -> Vec<String> {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use fst::MapBuilder;
+
+    use super::*;
+    use crate::lexicon::{
+        serialize_skdict_v3, CliticRules, LanguageRules, PackHeader, PackTier, SkdictV3Payload,
+        WordMeta, FLAG_AMBIGUOUS_PROPER,
+    };
+
+    fn synthetic_lexicon(
+        lang: &str,
+        words: &[(&str, WordMeta)],
+        proper_nouns: &[(&str, &str)],
+        shorthand: &[(&str, &str)],
+        rules: LanguageRules,
+    ) -> EnglishLexicon {
+        let mut sorted_words = words.to_vec();
+        sorted_words.sort_by(|a, b| a.0.cmp(b.0));
+        let mut wb = MapBuilder::memory();
+        for (w, meta) in sorted_words {
+            wb.insert(w.as_bytes(), meta.pack()).unwrap();
+        }
+        let mut sorted_proper: Vec<(String, String)> = proper_nouns
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        sorted_proper.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut sorted_short: Vec<(String, String)> = shorthand
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        sorted_short.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let header = PackHeader {
+            lang: lang.to_string(),
+            pack_version: [0, 3, 0],
+            tier: PackTier::Data,
+            variants: vec![format!("{lang}_{}", lang.to_uppercase())],
+            freq_slots: vec![0x01],
+            default_variant_idx: 0,
+            feature_flags: 0,
+        };
+
+        let bytes = serialize_skdict_v3(&SkdictV3Payload {
+            header: &header,
+            words_fst: &wb.into_inner().unwrap(),
+            typos_fst: &[],
+            typo_pool: &[],
+            variant_rewrites: &[],
+            bigrams: &BTreeMap::new(),
+            smash_entries: &[],
+            proper_nouns: &sorted_proper,
+            shorthand: &sorted_short,
+            slang_set: &[],
+            rules: Some(&rules),
+            syllable_dict: &[],
+            source_manifest: &[],
+        });
+        EnglishLexicon::from_owned_bytes(bytes).expect("valid synthetic v3 pack")
+    }
+
+    #[test]
+    fn custom_shorthand_section_works_without_binary_consts() {
+        let lex = synthetic_lexicon(
+            "es",
+            &[(
+                "porque",
+                WordMeta {
+                    freq0: 210,
+                    freq1: 0,
+                    variant_mask: 0x01,
+                    flags: 0,
+                    word_id: 1,
+                },
+            )],
+            &[],
+            &[("xq", "porque")],
+            LanguageRules::default(),
+        );
+        let scorer = EnglishScorer::new(lex);
+        let cfg = ScorerConfig::default();
+        let ctx = EvalContext::default();
+
+        let out = scorer.evaluate("xq", &ctx, &cfg, &EmptyUserRules);
+        assert_eq!(
+            out,
+            EvalOutcome::Autocorrect {
+                replacement: "porque".to_string(),
+                kind: MatchKind::ShorthandExpansion,
+                score: 4.4,
+                margin: 4.4,
+            }
+        );
+
+        // English binary shorthand ("pls") does NOT trigger on a synthetic Spanish pack.
+        let out_pls = scorer.evaluate("pls", &ctx, &cfg, &EmptyUserRules);
+        assert!(matches!(out_pls, EvalOutcome::Unchanged { .. }));
+    }
+
+    #[test]
+    fn ambiguous_proper_flag_suppresses_step_4b_capitalization() {
+        let lex = synthetic_lexicon(
+            "en",
+            &[
+                (
+                    "latin",
+                    WordMeta {
+                        freq0: 190,
+                        freq1: 190,
+                        variant_mask: 0x01,
+                        flags: FLAG_AMBIGUOUS_PROPER,
+                        word_id: 1,
+                    },
+                ),
+                (
+                    "monday",
+                    WordMeta {
+                        freq0: 210,
+                        freq1: 210,
+                        variant_mask: 0x01,
+                        flags: 0,
+                        word_id: 2,
+                    },
+                ),
+            ],
+            &[("latin", "Latin"), ("monday", "Monday")],
+            &[],
+            LanguageRules::default(),
+        );
+        let scorer = EnglishScorer::new(lex);
+        let cfg = ScorerConfig::default();
+        let ctx = EvalContext::default();
+
+        assert_eq!(
+            scorer.evaluate("latin", &ctx, &cfg, &EmptyUserRules),
+            EvalOutcome::Unchanged {
+                reason: MatchKind::ValidWord,
+                do_not_learn: true,
+            }
+        );
+        assert_eq!(
+            scorer.evaluate("monday", &ctx, &cfg, &EmptyUserRules),
+            EvalOutcome::Autocorrect {
+                replacement: "Monday".to_string(),
+                kind: MatchKind::ProperNoun,
+                score: 4.5,
+                margin: 4.5,
+            }
+        );
+    }
+
+    #[test]
+    fn clitic_prefixes_elision_shields_valid_stems_and_rejects_one_char_stems() {
+        let lex = synthetic_lexicon(
+            "fr",
+            &[
+                (
+                    "a",
+                    WordMeta {
+                        freq0: 240,
+                        freq1: 0,
+                        variant_mask: 0x01,
+                        flags: 0,
+                        word_id: 1,
+                    },
+                ),
+                (
+                    "accord",
+                    WordMeta {
+                        freq0: 210,
+                        freq1: 0,
+                        variant_mask: 0x01,
+                        flags: 0,
+                        word_id: 2,
+                    },
+                ),
+                (
+                    "homme",
+                    WordMeta {
+                        freq0: 220,
+                        freq1: 0,
+                        variant_mask: 0x01,
+                        flags: 0,
+                        word_id: 3,
+                    },
+                ),
+                (
+                    "il",
+                    WordMeta {
+                        freq0: 245,
+                        freq1: 0,
+                        variant_mask: 0x01,
+                        flags: 0,
+                        word_id: 4,
+                    },
+                ),
+            ],
+            &[],
+            &[],
+            LanguageRules {
+                clitics: CliticRules {
+                    suffixes: Vec::new(),
+                    prefixes: vec!["l".to_string(), "d".to_string(), "qu".to_string()],
+                },
+                ..LanguageRules::default()
+            },
+        );
+        let scorer = EnglishScorer::new(lex);
+        let cfg = ScorerConfig::default();
+        let ctx = EvalContext::default();
+
+        for valid_elided in ["l'homme", "qu'il", "d’accord", "L'homme"] {
+            assert_eq!(
+                scorer.evaluate(valid_elided, &ctx, &cfg, &EmptyUserRules),
+                EvalOutcome::Unchanged {
+                    reason: MatchKind::ValidWord,
+                    do_not_learn: true,
+                },
+                "expected ValidWord shield for {valid_elided}"
+            );
+        }
+
+        // 1-char stem "a" must NOT pass the elision ValidWord shield (min 2 chars).
+        assert_ne!(
+            scorer.evaluate("l'a", &ctx, &cfg, &EmptyUserRules),
+            EvalOutcome::Unchanged {
+                reason: MatchKind::ValidWord,
+                do_not_learn: true,
+            }
+        );
+    }
+
+    #[test]
+    fn capitalize_standalone_i_false_leaves_lowercase_i_untouched() {
+        let lex = synthetic_lexicon(
+            "es",
+            &[(
+                "y",
+                WordMeta {
+                    freq0: 250,
+                    freq1: 0,
+                    variant_mask: 0x01,
+                    flags: 0,
+                    word_id: 1,
+                },
+            )],
+            &[],
+            &[],
+            LanguageRules {
+                capitalize_standalone_i: false,
+                ..LanguageRules::default()
+            },
+        );
+        let scorer = EnglishScorer::new(lex);
+        let cfg = ScorerConfig {
+            auto_capitalize_i: true,
+            ..ScorerConfig::default()
+        };
+        let ctx = EvalContext::default();
+
+        assert!(matches!(
+            scorer.evaluate("i", &ctx, &cfg, &EmptyUserRules),
+            EvalOutcome::Unchanged { .. }
+        ));
+    }
 }

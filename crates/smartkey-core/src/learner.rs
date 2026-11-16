@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::casing::is_expressive_stretch;
 use crate::keyboard::damerau_levenshtein_chars;
 use crate::lexicon::EnglishLexicon;
-use crate::scorer::{is_staged_rejection_pair, UserRuleView};
+use crate::scorer::{is_staged_rejection_pair_for, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::LangId;
 
@@ -162,11 +162,12 @@ const CONTRACTION_REJECT_STALE_AFTER_ACCEPTS: u32 = 10;
 /// Returns `true` when the pair is (now) permanently blocked.
 fn reject_pair_permanently(
     store: &mut RuleStore,
+    lexicon: Option<&EnglishLexicon>,
     lang: &LangId,
     typed_lower: &str,
     rejected_lower: &str,
 ) -> bool {
-    if is_staged_rejection_pair(typed_lower, rejected_lower) {
+    if is_staged_rejection_pair_for(lexicon, lang.as_str(), typed_lower, rejected_lower) {
         let key = format!("{}:{}->{}", lang.as_str(), typed_lower, rejected_lower);
         store.sync_state_before_write();
         let applied_now = store
@@ -206,7 +207,13 @@ fn reject_pair_permanently(
 /// always outrank earlier — possibly accidental — rejections; without this, a stale block both
 /// shadows the graduated correction in the scorer and makes the next `add_permanent_block`
 /// erase it again, deadlocking recovery by typing.
-fn clear_pair_rejection(store: &mut RuleStore, lang: &LangId, typed_lower: &str, fixed: &str) {
+fn clear_pair_rejection(
+    store: &mut RuleStore,
+    lexicon: Option<&EnglishLexicon>,
+    lang: &LangId,
+    typed_lower: &str,
+    fixed: &str,
+) {
     let _ = store.remove_blocklist_pair(typed_lower, fixed);
     let key = format!(
         "{}:{}->{}",
@@ -217,7 +224,7 @@ fn clear_pair_rejection(store: &mut RuleStore, lang: &LangId, typed_lower: &str,
     let state = store.state_mut();
     state.staged_contraction_reject_applied_at.remove(&key);
     if state.staged_contraction_rejects.remove(&key).is_some()
-        || is_staged_rejection_pair(typed_lower, &fixed.to_lowercase())
+        || is_staged_rejection_pair_for(lexicon, lang.as_str(), typed_lower, &fixed.to_lowercase())
     {
         // The 2x-blocked path leaves a persisted undo-keep key that `is_undo_shielded` reads as a
         // cross-session shield; graduation must lift it too.
@@ -233,6 +240,7 @@ fn clear_pair_rejection(store: &mut RuleStore, lang: &LangId, typed_lower: &str,
 /// - `2x`: Permanently promotes `typed` to `personal_dict` in `rules.toml`.
 pub fn record_undo_keep_verbatim(
     store: &mut RuleStore,
+    lexicon: Option<&EnglishLexicon>,
     lang: &LangId,
     typed_raw: &str,
     rejected: &str,
@@ -250,7 +258,7 @@ pub fn record_undo_keep_verbatim(
     store.add_session_word_shield(&typed_lower);
     store.add_session_pair_block(&typed_lower, &rejected_lower);
     store.sync_state_before_write();
-    if !reject_pair_permanently(store, lang, &typed_lower, &rejected_lower) {
+    if !reject_pair_permanently(store, lexicon, lang, &typed_lower, &rejected_lower) {
         // `1x` rejection of a curated contraction pair: session shield only, nothing permanent.
         // Must return BEFORE touching `staged_undo_keep`: `RuleStore::is_undo_shielded` treats any
         // persisted `staged_undo_keep` key for the word as a cross-session shield, which would
@@ -329,7 +337,9 @@ pub fn resolve_restored_edit(
     // Row 2: Kept verbatim (`"hok " -> "hot " -> BS -> "hok "`)
     if final_is_raw {
         store.resolve_pending_undo_log(raw_typed, rejected, UndoResolution::KeptVerbatim);
-        return vec![record_undo_keep_verbatim(store, lang, raw_typed, rejected)];
+        return vec![record_undo_keep_verbatim(
+            store, lexicon, lang, raw_typed, rejected,
+        )];
     }
 
     // Row 1: Deliberately edited to a 3rd word (`"fomr " -> "foam " -> BS -> "form "`).
@@ -358,9 +368,9 @@ pub fn resolve_restored_edit(
     // Curated contraction pairs stage their rejection (`2x` -> permanent); other pairs keep the
     // immediate `1x` block. Editing to a 3rd word (`"dont" -> "don't" -> BS -> "donut "`) is weak
     // evidence against the contraction — it may simply have been a different intended word.
-    let pair_blocked = reject_pair_permanently(store, lang, &raw_lower, &rej_lower);
+    let pair_blocked = reject_pair_permanently(store, lexicon, lang, &raw_lower, &rej_lower);
     let rej_in_lexicon =
-        lang.as_str() == "en" && lexicon.is_some_and(|l| l.contains_any_english(&rej_lower));
+        lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&rej_lower));
     if !rej_in_lexicon && store.is_explicit_personal_word(lang, &rej_lower) {
         let demote_key = format!("demote:{}:{}", lang.as_str(), rej_lower);
         let cnt = {
@@ -468,25 +478,27 @@ fn record_manual_edit_inner(
                 lang.clone()
             };
             let has_internal_upper = fixed_trimmed.chars().skip(1).any(char::is_uppercase);
-            let is_tech_word = effective_lang.as_str() == "en"
-                && lexicon.is_some_and(|l| {
-                    l.lookup_proper_noun(&fixed_lower).is_none()
-                        && l.lookup_word(&fixed_lower).is_some_and(|m| m.is_tech())
-                });
-            let is_blocked_proper = effective_lang.as_str() == "en"
-                && lexicon.is_some_and(|l| {
-                    l.lookup_proper_noun(&fixed_lower)
-                        .is_some_and(|p| p == fixed_trimmed)
-                })
-                && store.is_pair_blocked(&fixed_lower, &fixed_lower);
-            let is_non_lex_word = effective_lang.as_str() != "en"
-                || lexicon.is_none_or(|l| {
-                    !l.contains_any_english(&fixed_lower)
-                        && l.lookup_known_typos(&fixed_lower).is_none()
-                });
+            let active_lex = if effective_lang == *lang {
+                lexicon
+            } else {
+                None
+            };
+            let is_tech_word = active_lex.is_some_and(|l| {
+                l.lookup_proper_noun(&fixed_lower).is_none()
+                    && l.lookup_word(&fixed_lower).is_some_and(|m| m.is_tech())
+            });
+            let is_blocked_proper = active_lex.is_some_and(|l| {
+                l.lookup_proper_noun(&fixed_lower)
+                    .is_some_and(|p| p == fixed_trimmed)
+            }) && store.is_pair_blocked(&fixed_lower, &fixed_lower);
+            let is_non_lex_word = active_lex.is_none_or(|l| {
+                !l.contains_any_variant_or_elided(&fixed_lower)
+                    && l.lookup_known_typos(&fixed_lower).is_none()
+            });
             let is_stretch = !store.is_personal_word(&fixed_lower)
                 && is_expressive_stretch(&fixed_lower, |w| {
-                    store.is_personal_word(w) || lexicon.is_some_and(|l| l.contains_any_english(w))
+                    store.is_personal_word(w)
+                        || active_lex.is_some_and(|l| l.contains_any_variant_or_elided(w))
                 });
             if !is_stretch
                 && (has_internal_upper || is_tech_word || is_blocked_proper || is_non_lex_word)
@@ -517,7 +529,18 @@ fn record_manual_edit_inner(
                     *e
                 };
                 if count >= 2 {
-                    clear_pair_rejection(store, &effective_lang, &fixed_lower, fixed_trimmed);
+                    let eff_lex = if effective_lang == *lang {
+                        lexicon
+                    } else {
+                        None
+                    };
+                    clear_pair_rejection(
+                        store,
+                        eff_lex,
+                        &effective_lang,
+                        &fixed_lower,
+                        fixed_trimmed,
+                    );
                     store.state_mut().staged_undo_keep.remove(&format!(
                         "{}:{fixed_lower}->{fixed_lower}",
                         effective_lang.as_str()
@@ -663,43 +686,49 @@ fn record_manual_edit_inner(
         }
     }
 
+    let active_lex = if effective_lang == *lang {
+        lexicon
+    } else {
+        None
+    };
+
     // Target word validity check (prevents learning a typo-to-typo edit like `fomr -> fomrr`
     // or promoting a known typo like `recieve` into `personal_dict`).
     let mut target_is_novel_unknown = false;
-    if effective_lang.as_str() == "en" {
-        if let Some(lex) = lexicon {
-            if !lex.contains_any_english(&fixed_lower) && !store.is_personal_word(&fixed_lower) {
-                let is_key_bounce_extension = fixed_lower.starts_with(&orig_lower)
-                    && fixed_chars.len() == orig_chars.len() + 1
-                    && fixed_chars.last() == orig_chars.last();
-                let is_stretch = is_expressive_stretch(&fixed_lower, |w| {
-                    store.is_personal_word(w) || lex.contains_any_english(w)
-                });
-                if fixed_chars.len() < 4
-                    || is_key_bounce_extension
-                    || is_stretch
-                    || lex.lookup_known_typos(&fixed_lower).is_some()
-                {
-                    store.state_mut().record_skipped(
-                        effective_lang.as_str(),
-                        prev_word,
-                        &orig_lower,
-                        &fixed_lower,
-                        SkipReason::TargetNotValidWord.as_str(),
-                    );
-                    let _ = store.flush_state();
-                    return LearnEvent::Ignored(SkipReason::TargetNotValidWord);
-                }
-                target_is_novel_unknown = true;
+    if let Some(lex) = active_lex {
+        if !lex.contains_any_variant_or_elided(&fixed_lower)
+            && !store.is_personal_word(&fixed_lower)
+        {
+            let is_key_bounce_extension = fixed_lower.starts_with(&orig_lower)
+                && fixed_chars.len() == orig_chars.len() + 1
+                && fixed_chars.last() == orig_chars.last();
+            let is_stretch = is_expressive_stretch(&fixed_lower, |w| {
+                store.is_personal_word(w) || lex.contains_any_variant_or_elided(w)
+            });
+            if fixed_chars.len() < 4
+                || is_key_bounce_extension
+                || is_stretch
+                || lex.lookup_known_typos(&fixed_lower).is_some()
+            {
+                store.state_mut().record_skipped(
+                    effective_lang.as_str(),
+                    prev_word,
+                    &orig_lower,
+                    &fixed_lower,
+                    SkipReason::TargetNotValidWord.as_str(),
+                );
+                let _ = store.flush_state();
+                return LearnEvent::Ignored(SkipReason::TargetNotValidWord);
             }
+            target_is_novel_unknown = true;
         }
     }
 
     // Guard 2: Valid-Word Shield (`"form" -> "from"` must NEVER learn as a global unigram rule!).
     // Core lexicon words are permanently shielded; `personal_dict`-only words can be un-dictionaried
     // if the user manually fixes them into another word `2x`.
-    let orig_in_lexicon = effective_lang.as_str() == "en"
-        && lexicon.is_some_and(|l| l.contains_any_english(&orig_lower));
+    let orig_in_lexicon =
+        active_lex.is_some_and(|l| l.contains_any_variant_or_elided(&orig_lower));
 
     if !orig_in_lexicon {
         // If `orig_lower` previously had a `1x` undo-keep shield (e.g. an accidental `1x` undo on `"forn"`),
@@ -724,7 +753,7 @@ fn record_manual_edit_inner(
                     .chars()
                     .next()
                     .is_some_and(char::is_lowercase)
-                || lexicon
+                || active_lex
                     .is_some_and(|l| l.lookup_word(&fixed_lower).is_some_and(|m| m.is_tech())));
         let target_to_save = if target_has_non_ascii || has_internal_upper || has_intentional_title
         {
@@ -794,7 +823,12 @@ fn record_manual_edit_inner(
             store.add_correction(&effective_lang, &orig_lower, &target_to_save);
             // Graduation is strictly stronger evidence than any earlier rejection of the same
             // pair — clear its blocklist entry so the new rule actually fires.
-            clear_pair_rejection(store, &effective_lang, &orig_lower, &target_to_save);
+            let eff_lex = if effective_lang == *lang {
+                lexicon
+            } else {
+                None
+            };
+            clear_pair_rejection(store, eff_lex, &effective_lang, &orig_lower, &target_to_save);
             let _ = store.flush_state();
             return LearnEvent::GraduatedCorrection {
                 lang: effective_lang.0,
@@ -828,7 +862,7 @@ fn record_manual_edit_inner(
         return LearnEvent::Ignored(SkipReason::ValidWordNoContext);
     }
 
-    if let Some(lex) = lexicon {
+    if let Some(lex) = active_lex {
         let bg_orig = lex.bigram_score(&prev_lower, &orig_lower);
         let bg_fixed = lex.bigram_score(&prev_lower, &fixed_lower);
         if bg_orig >= 0.25 || bg_fixed < 0.50 || (bg_fixed - bg_orig) < 0.35 {
@@ -854,7 +888,12 @@ fn record_manual_edit_inner(
         store.add_context_correction(&prev_lower, &orig_lower, &fixed_lower);
         // Same as the plain graduation above: a stale rejection of this pair must not shadow
         // the newly graduated context correction.
-        clear_pair_rejection(store, &effective_lang, &orig_lower, &fixed_lower);
+        let eff_lex = if effective_lang == *lang {
+            lexicon
+        } else {
+            None
+        };
+        clear_pair_rejection(store, eff_lex, &effective_lang, &orig_lower, &fixed_lower);
         let _ = store.flush_state();
         LearnEvent::GraduatedContextCorrection {
             prev: prev_lower,
@@ -890,7 +929,7 @@ pub fn record_untouched_unknown(
 
     // Never pollute `personal_dict` with expressive stretches (`soooo`, `trờiiii`)
     if is_expressive_stretch(&lower, |w| {
-        store.is_personal_word(w) || lexicon.is_some_and(|l| l.contains_any_english(w))
+        store.is_personal_word(w) || lexicon.is_some_and(|l| l.contains_any_variant_or_elided(w))
     }) {
         return LearnEvent::None;
     }
@@ -953,10 +992,9 @@ pub fn record_untouched_unknown(
         }
         return LearnEvent::None;
     }
-    if lang.as_str() == "en"
-        && !has_internal_upper
+    if !has_internal_upper
         && !is_cased_tech_word
-        && lexicon.is_some_and(|l| l.contains_any_english(&lower))
+        && lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&lower))
     {
         return LearnEvent::None;
     }

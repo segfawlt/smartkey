@@ -171,6 +171,10 @@ pub enum DiagnosticEvent {
         word: String,
         reason: MatchKind,
     },
+    PackNotice {
+        notice: String,
+        detail: String,
+    },
 }
 
 /// Origin of an active rule or personal word in `rules.toml`.
@@ -925,6 +929,8 @@ pub struct RuleStore {
     session_blocked_pairs: BTreeSet<(String, String)>,
     /// In-memory personal-word hit increments (`key -> (delta_hits, last_hit_epoch_ms)`), flushed lazily on reset/Drop.
     pending_personal_hits: BTreeMap<String, (u32, u64)>,
+    /// Startup pack notices collected before `set_log_dir` configures JSONL logging.
+    pending_pack_notices: Vec<(String, String)>,
 }
 
 impl Drop for RuleStore {
@@ -956,6 +962,7 @@ impl RuleStore {
             session_shielded_words: BTreeSet::new(),
             session_blocked_pairs: BTreeSet::new(),
             pending_personal_hits: BTreeMap::new(),
+            pending_pack_notices: Vec::new(),
         }
     }
 
@@ -982,6 +989,7 @@ impl RuleStore {
             session_shielded_words: BTreeSet::new(),
             session_blocked_pairs: BTreeSet::new(),
             pending_personal_hits: BTreeMap::new(),
+            pending_pack_notices: Vec::new(),
         })
     }
 
@@ -1067,6 +1075,7 @@ impl RuleStore {
             session_shielded_words: BTreeSet::new(),
             session_blocked_pairs: BTreeSet::new(),
             pending_personal_hits: BTreeMap::new(),
+            pending_pack_notices: Vec::new(),
         })
     }
 
@@ -1155,6 +1164,7 @@ impl RuleStore {
             session_shielded_words: BTreeSet::new(),
             session_blocked_pairs: BTreeSet::new(),
             pending_personal_hits: BTreeMap::new(),
+            pending_pack_notices: Vec::new(),
         };
         Ok((store, rules_exists))
     }
@@ -1169,6 +1179,13 @@ impl RuleStore {
 
     pub fn set_log_dir(&mut self, dir: Option<PathBuf>) {
         self.event_log.set_dir(dir);
+        if self.event_log.dir().is_some() && !self.pending_pack_notices.is_empty() {
+            let drained = std::mem::take(&mut self.pending_pack_notices);
+            for (notice, detail) in drained {
+                let ev = DiagnosticEvent::PackNotice { notice, detail };
+                self.record_event_only(&ev);
+            }
+        }
     }
 
     pub fn log_dir(&self) -> Option<&Path> {
@@ -1953,6 +1970,22 @@ impl RuleStore {
             previous,
         };
         self.record_event_only(&ev);
+    }
+
+    /// Logs a dictionary pack notice (`"legacy_pack_ignored"` / `"invalid_pack_ignored"`) to
+    /// the JSONL event log only (never into `learner_state.json::recent_events`). If `log_dir`
+    /// is not yet configured (e.g. startup before `set_log_dir`), buffers it until `set_log_dir`.
+    pub fn log_pack_notice(&mut self, notice: &str, detail: &str) {
+        if self.event_log.dir().is_some() {
+            let ev = DiagnosticEvent::PackNotice {
+                notice: notice.to_string(),
+                detail: detail.to_string(),
+            };
+            self.record_event_only(&ev);
+        } else {
+            self.pending_pack_notices
+                .push((notice.to_string(), detail.to_string()));
+        }
     }
 
     fn format_provenance_comment(&self, label: &str, previous: Option<&str>) -> String {
