@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DICT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/smartkey/dicts"
 rm -f "${HOME}/.local/bin/smartkey" "${HOME}/.local/bin/smartkeyctl"
 rm -f "${HOME}/.local/lib/fcitx5/libsmartkey.so"
 rm -f "${HOME}/.local/share/fcitx5/addon/smartkey.conf"
+rm -f "${DICT_DIR}/en.skdict" "${DICT_DIR}/vi.skdict"
 
 echo "Removed fcitx5-smartkey and smartkey from ~/.local."
 

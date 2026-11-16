@@ -19,6 +19,7 @@ fn workspace_root() -> PathBuf {
 fn default_pack_output_path(root: &Path, lang: &str) -> PathBuf {
     match lang {
         "en" => root.join("crates/smartkey-core/assets/en_lexicon.skdict"),
+        "vi" => root.join("crates/smartkey-core/assets/vi_lexicon.skdict"),
         other => root.join("target/packs").join(format!("{other}.skdict")),
     }
 }
@@ -214,7 +215,11 @@ fn cmd_build_lexicon() -> Result<(), String> {
     };
     let en_dir = root.join("dicts/en");
     let en_out = default_pack_output_path(&root, "en");
-    build_single_pack(&root, &en_dir, &en_out, &opts, false)
+    build_single_pack(&root, &en_dir, &en_out, &opts, false)?;
+
+    let vi_dir = root.join("dicts/vi");
+    let vi_out = default_pack_output_path(&root, "vi");
+    build_single_pack(&root, &vi_dir, &vi_out, &opts, false)
 }
 
 fn eval_with_scorer(

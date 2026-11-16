@@ -23,6 +23,19 @@ pub(crate) fn bundled_en_lexicon() -> Option<&'static PackLexicon> {
     None
 }
 
+#[cfg(feature = "bundled-vi")]
+pub(crate) fn bundled_vi_lexicon() -> Option<&'static PackLexicon> {
+    static BUNDLED_VI_LEX: OnceLock<Option<PackLexicon>> = OnceLock::new();
+    BUNDLED_VI_LEX
+        .get_or_init(|| PackLexicon::from_bundled_vi().ok())
+        .as_ref()
+}
+
+#[cfg(not(feature = "bundled-vi"))]
+pub(crate) fn bundled_vi_lexicon() -> Option<&'static PackLexicon> {
+    None
+}
+
 /// Looks up a curated unambiguous English shorthand auto-expansion (`pls -> please`, `rn -> right now`)
 /// from the bundled v3 English pack's `SHORTHAND` section.
 pub fn lookup_english_shorthand(lower_word: &str) -> Option<&'static str> {
@@ -594,6 +607,13 @@ impl PackLexicon {
     pub fn from_bundled() -> Result<Self, LexiconError> {
         static BUNDLED: &[u8] = include_bytes!("../assets/en_lexicon.skdict");
         Self::from_static_bytes(BUNDLED)
+    }
+
+    /// Loads the bundled Vietnamese `.skdict` pack when compiled with `feature = "bundled-vi"`.
+    #[cfg(feature = "bundled-vi")]
+    pub fn from_bundled_vi() -> Result<Self, LexiconError> {
+        static BUNDLED_VI: &[u8] = include_bytes!("../assets/vi_lexicon.skdict");
+        Self::from_static_bytes(BUNDLED_VI)
     }
 
     /// Zero-copy load over a `'static` byte slice (`include_bytes!` or `mmap`).

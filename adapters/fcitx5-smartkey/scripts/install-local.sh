@@ -17,6 +17,7 @@ cargo build --release --locked --manifest-path "${ROOT_DIR}/Cargo.toml" -p smart
 install -m 755 "${ROOT_DIR}/target/release/smartkey" "${BIN_DIR}/smartkey"
 ln -sf smartkey "${BIN_DIR}/smartkeyctl"
 install -m 644 "${ROOT_DIR}/crates/smartkey-core/assets/en_lexicon.skdict" "${DICT_DIR}/en.skdict"
+install -m 644 "${ROOT_DIR}/crates/smartkey-core/assets/vi_lexicon.skdict" "${DICT_DIR}/vi.skdict"
 
 if [ -f "${HOME}/.cargo/bin/smartkey" ]; then
     rm -f "${HOME}/.cargo/bin/smartkey"
@@ -45,6 +46,7 @@ echo "  ${BIN_DIR}/smartkey (aliased as smartkeyctl)"
 echo "  ${HOME}/.local/lib/fcitx5/libsmartkey.so"
 echo "  ${HOME}/.local/share/fcitx5/addon/smartkey.conf"
 echo "  ${DICT_DIR}/en.skdict"
+echo "  ${DICT_DIR}/vi.skdict"
 
 if command -v busctl >/dev/null 2>&1 && command -v fcitx5-remote >/dev/null 2>&1 && fcitx5-remote --check >/dev/null 2>&1; then
     busctl --user call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1 Restart >/dev/null 2>&1 || true

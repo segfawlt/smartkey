@@ -2751,7 +2751,9 @@ fn cmd_dict(args: &[String]) -> CliResult {
             if !found {
                 #[cfg(feature = "bundled-en")]
                 println!("  [bundled] en (built into binary fallback)");
-                #[cfg(not(feature = "bundled-en"))]
+                #[cfg(feature = "bundled-vi")]
+                println!("  [bundled] vi (built into binary fallback)");
+                #[cfg(not(any(feature = "bundled-en", feature = "bundled-vi")))]
                 println!("  (no language packs installed yet; install with `smartkey dict install en <path>`)");
             }
             Ok(())

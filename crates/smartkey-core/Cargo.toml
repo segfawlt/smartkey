@@ -6,8 +6,9 @@ license.workspace = true
 description = "Pure-Rust on-device PC autocorrect and deterministic backspace-learning engine"
 
 [features]
-default = ["bundled-en"]
+default = ["bundled-en", "bundled-vi"]
 bundled-en = []
+bundled-vi = []
 
 [dependencies]
 fst.workspace = true

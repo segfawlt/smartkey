@@ -9,8 +9,9 @@ description = "Panic-safe C ABI and mobile word-level FFI for SmartKey (fcitx5-l
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [features]
-default = ["bundled-en"]
+default = ["bundled-en", "bundled-vi"]
 bundled-en = ["smartkey-core/bundled-en"]
+bundled-vi = ["smartkey-core/bundled-vi"]
 
 [dependencies]
 smartkey-core = { path = "../smartkey-core", default-features = false }

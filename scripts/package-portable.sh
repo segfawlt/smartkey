@@ -113,8 +113,9 @@ ln -s smartkey "${STAGE_DIR}/bin/smartkeyctl"
 install -m 755 "${BUILD_DIR}/libsmartkey.so" "${STAGE_DIR}/lib/fcitx5/libsmartkey.so"
 strip --strip-unneeded "${STAGE_DIR}/lib/fcitx5/libsmartkey.so"
 
-# Copy default English dictionary pack
+# Copy default English & Vietnamese dictionary packs
 install -m 644 "${ROOT}/crates/smartkey-core/assets/en_lexicon.skdict" "${STAGE_DIR}/share/smartkey/dicts/en.skdict"
+install -m 644 "${ROOT}/crates/smartkey-core/assets/vi_lexicon.skdict" "${STAGE_DIR}/share/smartkey/dicts/vi.skdict"
 
 # Copy docs and license
 install -m 644 "${ROOT}/LICENSE" "${STAGE_DIR}/LICENSE"
@@ -138,8 +139,9 @@ mkdir -p "\${BIN_DIR}" "\${LIB_DIR}" "\${CONF_DIR}" "\${DICT_DIR}"
 install -m 755 "\${SCRIPT_DIR}/bin/smartkey" "\${BIN_DIR}/smartkey"
 ln -sf smartkey "\${BIN_DIR}/smartkeyctl"
 
-# Install default English dictionary
+# Install default English & Vietnamese dictionaries
 install -m 644 "\${SCRIPT_DIR}/share/smartkey/dicts/en.skdict" "\${DICT_DIR}/en.skdict"
+install -m 644 "\${SCRIPT_DIR}/share/smartkey/dicts/vi.skdict" "\${DICT_DIR}/vi.skdict"
 
 # Install libsmartkey.so
 install -m 755 "\${SCRIPT_DIR}/lib/fcitx5/libsmartkey.so" "\${LIB_DIR}/libsmartkey.so"
@@ -168,7 +170,7 @@ CONF_EOF
 echo "Installed fcitx5-smartkey ${PKGVER} (portable):"
 echo "  Binary: \${BIN_DIR}/smartkey (aliased as smartkeyctl)"
 echo "  Addon:  \${LIB_DIR}/libsmartkey.so"
-echo "  Dict:   \${DICT_DIR}/en.skdict"
+echo "  Dicts:  \${DICT_DIR}/en.skdict, \${DICT_DIR}/vi.skdict"
 echo "  Config: \${CONF_DIR}/smartkey.conf"
 
 if command -v busctl >/dev/null 2>&1 && command -v fcitx5-remote >/dev/null 2>&1 && fcitx5-remote --check >/dev/null 2>&1; then
@@ -193,7 +195,7 @@ DICT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/smartkey/dicts"
 rm -f "${BIN_DIR}/smartkey" "${BIN_DIR}/smartkeyctl"
 rm -f "${LIB_DIR}/libsmartkey.so"
 rm -f "${CONF_DIR}/smartkey.conf"
-rm -f "${DICT_DIR}/en.skdict"
+rm -f "${DICT_DIR}/en.skdict" "${DICT_DIR}/vi.skdict"
 
 echo "Removed fcitx5-smartkey from ~/.local."
 

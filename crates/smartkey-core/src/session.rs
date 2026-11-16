@@ -15,9 +15,37 @@ use crate::types::{
     AppProfile, Candidate, EvalOutcome, Explanation, InputOrigin, LangId, MatchKind,
 };
 
-/// Process-wide registry of loaded `.skdict` v3 packs keyed by language code (`"en"`, `"es"`, ...).
+enum LoadedPack {
+    Data(LatinScorer),
+    Bridge(PackLexicon),
+}
+
+impl LoadedPack {
+    fn from_lexicon(lex: PackLexicon) -> Self {
+        match lex.header().tier {
+            PackTier::Data => Self::Data(LatinScorer::new(lex)),
+            PackTier::ImeBridge => Self::Bridge(lex),
+        }
+    }
+
+    fn lexicon(&self) -> &PackLexicon {
+        match self {
+            Self::Data(s) => s.lexicon(),
+            Self::Bridge(l) => l,
+        }
+    }
+
+    fn scorer(&self) -> Option<&LatinScorer> {
+        match self {
+            Self::Data(s) => Some(s),
+            Self::Bridge(_) => None,
+        }
+    }
+}
+
+/// Process-wide registry of loaded `.skdict` v3 packs keyed by language code (`"en"`, `"vi"`, `"es"`, ...).
 pub struct LexiconRegistry {
-    packs: BTreeMap<String, LatinScorer>,
+    packs: BTreeMap<String, LoadedPack>,
     disk_langs: BTreeSet<String>,
 }
 
@@ -66,7 +94,7 @@ impl LexiconRegistry {
     /// Falls back to `bundled-en` when `"en"` was not loaded from disk and `bundled_en_fallback` is true.
     pub fn scan_dirs(
         dirs: &[PathBuf],
-        bundled_en_fallback: bool,
+        bundled_fallback: bool,
     ) -> (Self, Vec<(String, String)>) {
         let mut reg = Self::new();
         let mut notices = Vec::new();
@@ -98,7 +126,7 @@ impl LexiconRegistry {
                         let lang = lex.header().lang.clone();
                         if !reg.packs.contains_key(&lang) {
                             reg.disk_langs.insert(lang.clone());
-                            reg.packs.insert(lang, LatinScorer::new(lex));
+                            reg.packs.insert(lang, LoadedPack::from_lexicon(lex));
                         }
                     }
                     Err(LexiconError::LegacyFormat(ver)) => {
@@ -117,31 +145,45 @@ impl LexiconRegistry {
             }
         }
 
-        if bundled_en_fallback && !reg.packs.contains_key("en") {
+        if bundled_fallback && !reg.packs.contains_key("en") {
             #[cfg(feature = "bundled-en")]
             if let Ok(scorer) = LatinScorer::new_bundled() {
-                reg.packs.insert("en".to_string(), scorer);
+                reg.packs.insert("en".to_string(), LoadedPack::Data(scorer));
+            }
+        }
+        if bundled_fallback && !reg.packs.contains_key("vi") {
+            #[cfg(feature = "bundled-vi")]
+            if let Ok(lex) = PackLexicon::from_bundled_vi() {
+                reg.packs.insert("vi".to_string(), LoadedPack::Bridge(lex));
             }
         }
 
-        let _ = bundled_en_fallback;
+        let _ = bundled_fallback;
         (reg, notices)
     }
 
     pub fn load_default() -> (Self, Vec<(String, String)>) {
-        Self::scan_dirs(&Self::default_search_dirs(), cfg!(feature = "bundled-en"))
+        Self::scan_dirs(
+            &Self::default_search_dirs(),
+            cfg!(any(feature = "bundled-en", feature = "bundled-vi")),
+        )
     }
 
     pub fn insert(&mut self, lang: impl Into<String>, scorer: LatinScorer) {
-        self.packs.insert(lang.into(), scorer);
+        self.packs.insert(lang.into(), LoadedPack::Data(scorer));
+    }
+
+    pub fn insert_pack(&mut self, lang: impl Into<String>, lexicon: PackLexicon) {
+        self.packs
+            .insert(lang.into(), LoadedPack::from_lexicon(lexicon));
     }
 
     pub fn scorer(&self, lang: &str) -> Option<&LatinScorer> {
-        self.packs.get(lang)
+        self.packs.get(lang).and_then(LoadedPack::scorer)
     }
 
     pub fn lexicon(&self, lang: &str) -> Option<&PackLexicon> {
-        self.packs.get(lang).map(LatinScorer::lexicon)
+        self.packs.get(lang).map(LoadedPack::lexicon)
     }
 
     pub fn has_disk_pack(&self) -> bool {
@@ -156,6 +198,7 @@ impl LexiconRegistry {
 /// Shared process-wide engine owning the zero-copy Layer 1 registry and comment-preserving `RuleStore`.
 pub struct SmartKeyEngine {
     registry: LexiconRegistry,
+    vi_runtime_syllables: Option<Vec<Box<str>>>,
     emitted_notices: BTreeSet<(String, String)>,
     store: RuleStore,
 }
@@ -167,27 +210,26 @@ impl SmartKeyEngine {
             let lang = s.lexicon().header().lang.clone();
             registry.insert(lang, s);
         }
-        Self {
-            registry,
-            emitted_notices: BTreeSet::new(),
-            store,
-        }
+        Self::from_registry(registry, store)
     }
 
     pub fn from_registry(registry: LexiconRegistry, store: RuleStore) -> Self {
-        Self {
+        let mut engine = Self {
             registry,
+            vi_runtime_syllables: None,
             emitted_notices: BTreeSet::new(),
             store,
-        }
+        };
+        engine.refresh_vi_authority();
+        engine
     }
 
     pub fn new_from_dirs(
         dirs: &[PathBuf],
-        bundled_en_fallback: bool,
+        bundled_fallback: bool,
         store: RuleStore,
     ) -> Self {
-        let (registry, notices) = LexiconRegistry::scan_dirs(dirs, bundled_en_fallback);
+        let (registry, notices) = LexiconRegistry::scan_dirs(dirs, bundled_fallback);
         let mut engine = Self::from_registry(registry, store);
         engine.emit_notices(notices);
         engine
@@ -195,8 +237,14 @@ impl SmartKeyEngine {
 
     #[cfg(feature = "bundled-en")]
     pub fn new_bundled(store: RuleStore) -> Result<Self, crate::lexicon::LexiconError> {
+        let mut registry = LexiconRegistry::new();
         let scorer = LatinScorer::new_bundled()?;
-        Ok(Self::new(Some(scorer), store))
+        registry.insert("en", scorer);
+        #[cfg(feature = "bundled-vi")]
+        if let Ok(vi_lex) = PackLexicon::from_bundled_vi() {
+            registry.insert_pack("vi", vi_lex);
+        }
+        Ok(Self::from_registry(registry, store))
     }
 
     #[cfg(feature = "bundled-en")]
@@ -209,6 +257,104 @@ impl SmartKeyEngine {
         let mut engine = Self::from_registry(registry, store);
         engine.emit_notices(notices);
         engine
+    }
+
+    fn refresh_vi_authority(&mut self) {
+        self.vi_runtime_syllables = None;
+        let Some(path) = crate::vi_telex::resolve_lotus_dict_path() else {
+            return;
+        };
+        let Some(lotus_syls) = crate::vi_telex::load_lotus_dict_from_path(&path) else {
+            return;
+        };
+        if let Some(vi_pack) = self.registry.lexicon("vi") {
+            let pack_syls = vi_pack.syllable_dict();
+            if !pack_syls.is_empty() {
+                let (added, removed) = crate::vi_telex::diff_syllable_sets(&lotus_syls, pack_syls);
+                if added > 0 || removed > 0 {
+                    self.emit_notices(vec![(
+                        "lotus_dict_drift".to_string(),
+                        format!(
+                            "{} (+{added} -{removed} syllables vs vi pack)",
+                            path.display()
+                        ),
+                    )]);
+                }
+            }
+        }
+        self.vi_runtime_syllables = Some(lotus_syls);
+    }
+
+    fn active_vi_syllables(&self) -> &[Box<str>] {
+        if let Some(syls) = &self.vi_runtime_syllables {
+            return syls;
+        }
+        if let Some(vi_lex) = self.registry.lexicon("vi") {
+            let syls = vi_lex.syllable_dict();
+            if !syls.is_empty() {
+                return syls;
+            }
+        }
+        crate::lexicon::bundled_vi_lexicon()
+            .map(PackLexicon::syllable_dict)
+            .unwrap_or(&[])
+    }
+
+    fn vi_dict_and_store_mut(&mut self) -> (&[Box<str>], &mut RuleStore) {
+        let syls: &[Box<str>] = if let Some(syls) = &self.vi_runtime_syllables {
+            syls
+        } else if let Some(vi_lex) = self.registry.lexicon("vi") {
+            let syls = vi_lex.syllable_dict();
+            if !syls.is_empty() {
+                syls
+            } else {
+                crate::lexicon::bundled_vi_lexicon()
+                    .map(PackLexicon::syllable_dict)
+                    .unwrap_or(&[])
+            }
+        } else {
+            crate::lexicon::bundled_vi_lexicon()
+                .map(PackLexicon::syllable_dict)
+                .unwrap_or(&[])
+        };
+        (syls, &mut self.store)
+    }
+
+    fn active_vi_pack(&self) -> Option<&PackLexicon> {
+        match self.registry.lexicon("vi") {
+            Some(lex) => Some(lex),
+            None => crate::lexicon::bundled_vi_lexicon(),
+        }
+    }
+
+    pub fn is_vi_dict_word(&self, lower: &str) -> bool {
+        crate::vi_telex::is_dict_word_in(self.active_vi_syllables(), lower)
+    }
+
+    pub fn is_vi_slang_word(&self, lower: &str) -> bool {
+        !lower.is_empty()
+            && self
+                .active_vi_pack()
+                .is_some_and(|l| l.is_slang_word(lower) || l.lookup_shorthand(lower).is_some())
+    }
+
+    pub fn lookup_vi_shorthand(&self, lower: &str) -> Option<&str> {
+        if lower.is_empty() {
+            return None;
+        }
+        self.active_vi_pack()?.lookup_shorthand(lower)
+    }
+
+    fn simulate_vi_lotus(&self, raw_keys: &str, opts: crate::vi_telex::LotusOptions) -> crate::vi_telex::LotusSimulation {
+        crate::vi_telex::simulate_lotus_word_with_dict(raw_keys, opts, self.active_vi_syllables())
+    }
+
+    fn rescue_vi_telex(
+        &self,
+        raw_keys: &str,
+        opts: crate::vi_telex::LotusOptions,
+    ) -> Option<crate::vi_telex::TelexRescue> {
+        crate::vi_telex::rescue_telex_typo_with_dict(raw_keys, opts, self.active_vi_syllables())
     }
 
     fn emit_notices(&mut self, notices: Vec<(String, String)>) {
@@ -224,6 +370,7 @@ impl SmartKeyEngine {
         self.emit_notices(notices);
         let loaded_any = registry.has_disk_pack();
         self.registry = registry;
+        self.refresh_vi_authority();
         loaded_any
     }
 
@@ -303,8 +450,8 @@ impl SmartKeyEngine {
         let prev_lower = prev_raw.trim().to_lowercase();
         if prev_lower.is_empty()
             || !prev_lower.is_ascii()
-            || crate::vi_telex::is_vietnamese_dict_word(&prev_lower)
-            || crate::vi_telex::is_vietnamese_slang_word(&prev_lower)
+            || self.is_vi_dict_word(&prev_lower)
+            || self.is_vi_slang_word(&prev_lower)
         {
             return false;
         }
@@ -442,7 +589,7 @@ impl SmartKeyEngine {
 
         let lower = token.to_lowercase();
         let lotus_opts = self.store.lotus_options();
-        let sim = crate::vi_telex::simulate_lotus_word_with_options(token, lotus_opts);
+        let sim = self.simulate_vi_lotus(token, lotus_opts);
 
         // 1b. Built-in Vietnamese Shorthand Auto-Expansion (`ko -> không`, `dc -> được`, `ntn -> như thế nào`)
         //     Enabled when `expand_shorthand = true` (default). `1x BackSpace` reverts the entire expanded
@@ -461,9 +608,9 @@ impl SmartKeyEngine {
 
             if !is_all_caps_acronym && !is_single_upper_initial {
                 let committed_lower = sim.committed_at_break.to_lowercase();
-                let exp = crate::vi_telex::lookup_vietnamese_shorthand(&lower).or_else(|| {
+                let exp = self.lookup_vi_shorthand(&lower).or_else(|| {
                     if lotus_composing && committed_lower != lower {
-                        crate::vi_telex::lookup_vietnamese_shorthand(&committed_lower)
+                        self.lookup_vi_shorthand(&committed_lower)
                     } else {
                         None
                     }
@@ -495,8 +642,8 @@ impl SmartKeyEngine {
         //    (including toneless Vietnamese words like `anh`, `em`, `nha`, `con`, `cho`) or
         //    conversational Vietnamese slang (`ib`, `rep`, `onl`, `uk`, `uhm`, `okela`, `bt`, `nc`):
         if (lotus_composing && sim.is_valid_vietnamese)
-            || crate::vi_telex::is_vietnamese_dict_word(&lower)
-            || crate::vi_telex::is_vietnamese_slang_word(&lower)
+            || self.is_vi_dict_word(&lower)
+            || self.is_vi_slang_word(&lower)
         {
             let composed_lower = sim.committed_at_break.to_lowercase();
             if lotus_composing
@@ -514,8 +661,8 @@ impl SmartKeyEngine {
                 reason: MatchKind::ValidWord,
                 do_not_learn: (lotus_composing
                     && (sim.is_valid_vietnamese || sim.is_composed_vietnamese))
-                    || crate::vi_telex::is_vietnamese_dict_word(&lower)
-                    || crate::vi_telex::is_vietnamese_slang_word(&lower)
+                    || self.is_vi_dict_word(&lower)
+                    || self.is_vi_slang_word(&lower)
                     || self.store.is_personal_word(&lower),
             };
         }
@@ -565,8 +712,7 @@ impl SmartKeyEngine {
             || self.store.is_lang_only_personal_word("vi", &lower)
             || (lotus_composing && self.store.is_lang_only_personal_word("vi", &screen_lower));
         if can_rescue_vi && !shield_from_vi_rescue {
-            if let Some(rescue) = crate::vi_telex::rescue_telex_typo_with_options(token, lotus_opts)
-            {
+            if let Some(rescue) = self.rescue_vi_telex(token, lotus_opts) {
                 if !self
                     .store
                     .is_pair_blocked(&lower, &rescue.replacement.to_lowercase())
@@ -947,11 +1093,9 @@ impl SmartKeySession {
                     .next()
                     .unwrap_or("");
                 if self.lang.as_str() == "vi" && self.lotus_composing {
-                    let preedit = crate::vi_telex::simulate_lotus_word_with_options(
-                        buf,
-                        engine.store.lotus_options(),
-                    )
-                    .preedit_before_break;
+                    let preedit = engine
+                        .simulate_vi_lotus(buf, engine.store.lotus_options())
+                        .preedit_before_break;
                     !tail_token_matches(tail_token, buf)
                         && !tail_token_matches(tail_token, &preedit)
                 } else {
@@ -1128,7 +1272,6 @@ impl SmartKeySession {
         events: &mut Vec<LearnEvent>,
     ) {
         let mode = std::mem::replace(&mut self.mode, Mode::Idle);
-        let lex = engine.registry.lexicon(self.lang.as_str());
         match mode {
             Mode::EditingRestored {
                 raw_typed,
@@ -1138,6 +1281,7 @@ impl SmartKeySession {
                 is_snippet,
             } => {
                 if !is_snippet && !buf.is_empty() {
+                    let lex = engine.registry.lexicon(self.lang.as_str());
                     let evs = resolve_restored_edit(
                         &mut engine.store,
                         lex,
@@ -1167,12 +1311,17 @@ impl SmartKeySession {
                 buf,
             } => {
                 if !buf.is_empty() {
-                    self.maybe_record_vi_passthrough_repair(
-                        &mut engine.store,
-                        &orig_word,
-                        &buf,
-                        events,
-                    );
+                    {
+                        let (vi_dict, store) = engine.vi_dict_and_store_mut();
+                        self.maybe_record_vi_passthrough_repair(
+                            vi_dict,
+                            store,
+                            &orig_word,
+                            &buf,
+                            events,
+                        );
+                    }
+                    let lex = engine.registry.lexicon(self.lang.as_str());
                     let ev = record_manual_edit(
                         &mut engine.store,
                         lex,
@@ -1228,6 +1377,7 @@ impl SmartKeySession {
             } => {
                 if let Some(peak) = peak_before_bs {
                     if !buf.is_empty() {
+                        let lex = engine.registry.lexicon(self.lang.as_str());
                         let ev = record_manual_edit(
                             &mut engine.store,
                             lex,
@@ -1687,12 +1837,16 @@ impl SmartKeySession {
                     let is_space = ch == ' ' || ch == '\t';
                     let punct = if is_space { None } else { Some(ch) };
                     if !buf.is_empty() {
-                        self.maybe_record_vi_passthrough_repair(
-                            &mut engine.store,
-                            &orig_word,
-                            &buf,
-                            &mut learn_events,
-                        );
+                        {
+                            let (vi_dict, store) = engine.vi_dict_and_store_mut();
+                            self.maybe_record_vi_passthrough_repair(
+                                vi_dict,
+                                store,
+                                &orig_word,
+                                &buf,
+                                &mut learn_events,
+                            );
+                        }
                         let lex = engine.registry.lexicon(self.lang.as_str());
                         let ev = record_manual_edit(
                             &mut engine.store,
@@ -1875,6 +2029,7 @@ impl SmartKeySession {
 
     fn maybe_record_vi_passthrough_repair(
         &mut self,
+        vi_dict: &[Box<str>],
         store: &mut RuleStore,
         orig_word: &str,
         new_buf: &str,
@@ -1884,7 +2039,7 @@ impl SmartKeySession {
             return;
         }
         let opts = store.lotus_options();
-        let buf_sim = crate::vi_telex::simulate_lotus_word_with_options(new_buf, opts);
+        let buf_sim = crate::vi_telex::simulate_lotus_word_with_dict(new_buf, opts, vi_dict);
         let cand_ascii =
             if !buf_sim.is_composed_vietnamese && buf_sim.preedit_before_break.is_ascii() {
                 buf_sim.preedit_before_break.as_str()
@@ -1896,7 +2051,7 @@ impl SmartKeySession {
         if cand_ascii.len() < 2 {
             return;
         }
-        let re_sim = crate::vi_telex::simulate_lotus_word_with_options(cand_ascii, opts);
+        let re_sim = crate::vi_telex::simulate_lotus_word_with_dict(cand_ascii, opts, vi_dict);
         if re_sim.committed_at_break.eq_ignore_ascii_case(orig_word) {
             let ev = record_telex_passthrough_repair(store, cand_ascii);
             if !matches!(ev, LearnEvent::None) {
@@ -1965,7 +2120,7 @@ impl SmartKeySession {
         };
 
         let opts = engine.store.lotus_options();
-        let sim = crate::vi_telex::simulate_lotus_word_with_options(&word, opts);
+        let sim = engine.simulate_vi_lotus(&word, opts);
         let mut expected_commit = String::with_capacity(sim.committed_at_break.len() + 4);
         expected_commit.push_str(&sim.committed_at_break);
         expected_commit.push(boundary_ch);
@@ -2120,7 +2275,7 @@ impl SmartKeySession {
         let is_vi_lotus = self.lang.as_str() == "vi" && engine.store.compiled().vi_lotus_enabled;
         let lotus_opts = engine.store.lotus_options();
         let vi_sim = if is_vi_lotus && self.lotus_composing {
-            let sim = crate::vi_telex::simulate_lotus_word_with_options(&word, lotus_opts);
+            let sim = engine.simulate_vi_lotus(&word, lotus_opts);
             // If Lotus itself is performing a uinput fallback burst on an unfiltered test path,
             // step aside until `on_lotus_boundary_commit` delivers the completed commit.
             if sim.needs_uinput_restore_on_break && !boundary_already_committed {
@@ -2254,8 +2409,7 @@ impl SmartKeySession {
                         && sim.preedit_before_break.len() + 1 == word.len()
                     {
                         let base = &sim.preedit_before_break;
-                        let base_sim =
-                            crate::vi_telex::simulate_lotus_word_with_options(base, lotus_opts);
+                        let base_sim = engine.simulate_vi_lotus(base, lotus_opts);
                         if base_sim.is_valid_vietnamese && base_sim.is_composed_vietnamese {
                             let pt_ev = record_telex_passthrough_repair(&mut engine.store, base);
                             if !matches!(pt_ev, LearnEvent::None) {
@@ -2838,5 +2992,65 @@ mod tests {
         // Switching to "fr" activates French clitic prefix elision shielding:
         session.set_lang(LangId("fr".to_string()));
         assert_eq!(feed_text(&mut session, &mut engine, "l'homme "), "l'homme ");
+    }
+
+    #[test]
+    fn installed_vi_skdict_overrides_bundled_vi_and_legacy_vi_falls_back() {
+        let dict_dir = unique_tmp_dir("vi_override");
+        let header = PackHeader {
+            lang: "vi".to_string(),
+            pack_version: [0, 9, 0],
+            tier: PackTier::ImeBridge,
+            variants: vec!["vi".to_string()],
+            freq_slots: vec![0x01],
+            default_variant_idx: 0,
+            feature_flags: 0,
+        };
+        let bytes = serialize_skdict_v3(&SkdictV3Payload {
+            header: &header,
+            words_fst: &[],
+            typos_fst: &[],
+            typo_pool: &[],
+            variant_rewrites: &[],
+            bigrams: &BTreeMap::new(),
+            smash_entries: &[],
+            proper_nouns: &[],
+            shorthand: &[("zzz".to_string(), "dạ vâng".to_string())],
+            slang_set: &["customvi".to_string()],
+            rules: None,
+            syllable_dict: &["tiếng".to_string()],
+            source_manifest: &[],
+        });
+        std::fs::write(dict_dir.join("vi.skdict"), bytes).unwrap();
+
+        let engine = SmartKeyEngine::new_from_dirs(
+            std::slice::from_ref(&dict_dir),
+            true,
+            RuleStore::in_memory(Preset::Balanced),
+        );
+        assert!(engine.scorer_for("vi").is_none(), "ImeBridge pack must not expose LatinScorer");
+        assert_eq!(engine.lookup_vi_shorthand("zzz"), Some("dạ vâng"));
+        assert!(engine.is_vi_slang_word("customvi"));
+        assert_eq!(engine.lookup_vi_shorthand("ko"), None);
+
+        // Legacy v2 vi.skdict is ignored with PackNotice and falls back to bundled-vi.
+        let legacy_dir = unique_tmp_dir("vi_legacy");
+        let log_dir = unique_tmp_dir("vi_legacy_log");
+        std::fs::write(legacy_dir.join("vi.skdict"), b"SKDICT02oldvi").unwrap();
+        let mut store = RuleStore::in_memory(Preset::Balanced);
+        store.set_log_dir(Some(log_dir.clone()));
+        let legacy_eng =
+            SmartKeyEngine::new_from_dirs(std::slice::from_ref(&legacy_dir), true, store);
+        assert_eq!(legacy_eng.lookup_vi_shorthand("ko"), Some("không"));
+        let records = EventLog::read_records_in_range(&log_dir, None, None).unwrap();
+        assert!(records.iter().any(|r| matches!(
+            &r.event,
+            DiagnosticEvent::PackNotice { notice, detail }
+                if notice == "legacy_pack_ignored" && detail.contains("skdict v2")
+        )));
+
+        let _ = std::fs::remove_dir_all(&dict_dir);
+        let _ = std::fs::remove_dir_all(&legacy_dir);
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 }

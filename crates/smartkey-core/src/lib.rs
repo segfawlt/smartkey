@@ -43,6 +43,6 @@ pub use types::{
 pub use vi_telex::{
     has_any_vietnamese_rune, is_vietnamese_dict_word, is_vietnamese_slang_word,
     lookup_vietnamese_shorthand, project_shorthand_case, rescue_telex_typo,
-    rescue_telex_typo_with_options, simulate_lotus_word, simulate_lotus_word_with_options,
-    LotusOptions, LotusSimulation, TelexRescue, W2uMode,
+    rescue_telex_typo_with_options, resolve_lotus_dict_path, simulate_lotus_word,
+    simulate_lotus_word_with_options, LotusOptions, LotusSimulation, TelexRescue, W2uMode,
 };

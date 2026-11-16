@@ -1,8 +1,178 @@
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-const RAW_VI_DICT: &str = include_str!("../../../data/vietnamese.cm.dict");
-const RAW_VI_SLANG: &str = include_str!("../../../data/slang_vi.txt");
-const RAW_VI_SHORTHAND: &str = include_str!("../../../data/shorthand_vi.tsv");
+/// Resolves the installed `fcitx5-lotus` Vietnamese syllable dictionary path in priority order:
+/// `SMARTKEY_LOTUS_DICT` -> `/usr/share/fcitx5/lotus/vietnamese.cm.dict` ->
+/// `/usr/local/share/fcitx5/lotus/vietnamese.cm.dict` -> `~/.local/share/fcitx5/lotus/vietnamese.cm.dict`.
+pub fn resolve_lotus_dict_path() -> Option<PathBuf> {
+    if let Ok(env_path) = std::env::var("SMARTKEY_LOTUS_DICT") {
+        let trimmed = env_path.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    for sys in [
+        "/usr/share/fcitx5/lotus/vietnamese.cm.dict",
+        "/usr/local/share/fcitx5/lotus/vietnamese.cm.dict",
+    ] {
+        let p = PathBuf::from(sys);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Some(home) = crate::event_log::resolve_home_dir() {
+        let p = home.join(".local/share/fcitx5/lotus/vietnamese.cm.dict");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Reads and normalizes a `vietnamese.cm.dict` file into a sorted, deduplicated syllable set.
+/// Returns `None` if unreadable or empty after stripping blanks/comments.
+pub fn load_lotus_dict_from_path(path: &Path) -> Option<Vec<Box<str>>> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mut words: Vec<Box<str>> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with('#'))
+        .map(|s| s.to_string().into_boxed_str())
+        .collect();
+    words.sort_unstable();
+    words.dedup();
+    if words.is_empty() {
+        None
+    } else {
+        Some(words)
+    }
+}
+
+/// Computes `(added, removed)` set difference between two sorted, deduplicated syllable slices.
+pub fn diff_syllable_sets(lotus: &[Box<str>], pack: &[Box<str>]) -> (usize, usize) {
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    while i < lotus.len() && j < pack.len() {
+        match lotus[i].as_ref().cmp(pack[j].as_ref()) {
+            std::cmp::Ordering::Less => {
+                added += 1;
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                removed += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    added += lotus.len().saturating_sub(i);
+    removed += pack.len().saturating_sub(j);
+    (added, removed)
+}
+
+#[inline]
+pub fn is_dict_word_in(dict: &[Box<str>], word_lower: &str) -> bool {
+    !word_lower.is_empty()
+        && dict
+            .binary_search_by(|w| w.as_ref().cmp(word_lower))
+            .is_ok()
+}
+
+#[inline]
+pub fn has_dict_prefix_in(dict: &[Box<str>], word_lower: &str) -> bool {
+    if word_lower.is_empty() {
+        return false;
+    }
+    let idx = dict.partition_point(|w| w.as_ref() < word_lower);
+    dict.get(idx)
+        .is_some_and(|w| w.as_ref().starts_with(word_lower))
+}
+
+fn cached_system_lotus_dict() -> Option<&'static [Box<str>]> {
+    static SYSTEM_LOTUS: OnceLock<Option<Vec<Box<str>>>> = OnceLock::new();
+    SYSTEM_LOTUS
+        .get_or_init(|| {
+            for sys in [
+                "/usr/share/fcitx5/lotus/vietnamese.cm.dict",
+                "/usr/local/share/fcitx5/lotus/vietnamese.cm.dict",
+            ] {
+                let p = PathBuf::from(sys);
+                if p.is_file() {
+                    if let Some(words) = load_lotus_dict_from_path(&p) {
+                        return Some(words);
+                    }
+                }
+            }
+            if let Some(home) = crate::event_log::resolve_home_dir() {
+                let p = home.join(".local/share/fcitx5/lotus/vietnamese.cm.dict");
+                if p.is_file() {
+                    if let Some(words) = load_lotus_dict_from_path(&p) {
+                        return Some(words);
+                    }
+                }
+            }
+            None
+        })
+        .as_deref()
+}
+
+fn resolve_default_vi_syllables() -> Cow<'static, [Box<str>]> {
+    if let Ok(env_path) = std::env::var("SMARTKEY_LOTUS_DICT") {
+        let trimmed = env_path.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if p.is_file() {
+                if let Some(words) = load_lotus_dict_from_path(&p) {
+                    return Cow::Owned(words);
+                }
+            }
+        }
+    }
+    if let Some(sys) = cached_system_lotus_dict() {
+        return Cow::Borrowed(sys);
+    }
+    if let Some(lex) = crate::lexicon::bundled_vi_lexicon() {
+        return Cow::Borrowed(lex.syllable_dict());
+    }
+    Cow::Borrowed(&[])
+}
+
+/// Checks whether `word_lower` is an exact syllable in the active Lotus / Vietnamese dictionary.
+pub fn is_vietnamese_dict_word(word_lower: &str) -> bool {
+    if word_lower.is_empty() {
+        return false;
+    }
+    let dict = resolve_default_vi_syllables();
+    is_dict_word_in(&dict, word_lower)
+}
+
+/// Checks whether `word_lower` is in the bundled Vietnamese slang/loanword shield or shorthand trigger set.
+/// Note: Kept completely separate from `vietnamese.cm.dict` so `simulate_lotus_word` remains 1:1 with `fcitx5-lotus`.
+pub fn is_vietnamese_slang_word(word_lower: &str) -> bool {
+    if word_lower.is_empty() {
+        return false;
+    }
+    crate::lexicon::bundled_vi_lexicon()
+        .is_some_and(|lex| lex.is_slang_word(word_lower) || lex.lookup_shorthand(word_lower).is_some())
+}
+
+/// Looks up a curated unambiguous Vietnamese shorthand auto-expansion (`ko -> không`, `dc -> được`)
+/// from the bundled v3 Vietnamese pack's `SHORTHAND` section.
+pub fn lookup_vietnamese_shorthand(word_lower: &str) -> Option<&'static str> {
+    if word_lower.is_empty() {
+        return None;
+    }
+    crate::lexicon::bundled_vi_lexicon()?.lookup_shorthand(word_lower)
+}
 
 const VOWELS: [char; 72] = [
     'a', 'à', 'á', 'ả', 'ã', 'ạ', // 0..6
@@ -51,90 +221,6 @@ const LAST_CONSONANT_ROWS: &[&[&str]] = &[
 
 const VC_MATRIX: &[&[usize]] = &[&[0, 2], &[0, 1, 2], &[1, 2], &[1, 2], &[], &[], &[3], &[4]];
 
-fn vi_dict() -> &'static Vec<&'static str> {
-    static DICT: OnceLock<Vec<&'static str>> = OnceLock::new();
-    DICT.get_or_init(|| {
-        let mut words: Vec<&'static str> = RAW_VI_DICT
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        words.sort_unstable();
-        words.dedup();
-        words
-    })
-}
-
-/// Checks whether `word_lower` is an exact syllable in `vietnamese.cm.dict`.
-pub fn is_vietnamese_dict_word(word_lower: &str) -> bool {
-    if word_lower.is_empty() {
-        return false;
-    }
-    vi_dict().binary_search(&word_lower).is_ok()
-}
-
-fn vi_slang_set() -> &'static Vec<&'static str> {
-    static SLANG: OnceLock<Vec<&'static str>> = OnceLock::new();
-    SLANG.get_or_init(|| {
-        let mut words: Vec<&'static str> = RAW_VI_SLANG
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.starts_with('#'))
-            .collect();
-        for &(trig, _) in vi_shorthand_map() {
-            words.push(trig);
-        }
-        words.sort_unstable();
-        words.dedup();
-        words
-    })
-}
-
-fn vi_shorthand_map() -> &'static Vec<(&'static str, &'static str)> {
-    static MAP: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut pairs: Vec<(&'static str, &'static str)> = RAW_VI_SHORTHAND
-            .lines()
-            .filter_map(|line| {
-                let s = line.trim();
-                if s.is_empty() || s.starts_with('#') {
-                    return None;
-                }
-                let mut cols = s.split('\t');
-                let trig = cols.next()?.trim();
-                let exp = cols.next()?.trim();
-                if trig.is_empty() || exp.is_empty() {
-                    return None;
-                }
-                Some((trig, exp))
-            })
-            .collect();
-        pairs.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        pairs.dedup_by(|a, b| a.0 == b.0);
-        pairs
-    })
-}
-
-/// Checks whether `word_lower` is in the Vietnamese slang/loanword shield (`slang_vi.txt` or `shorthand_vi.tsv`).
-/// Note: Kept completely separate from `vietnamese.cm.dict` so `simulate_lotus_word` remains 1:1 with `fcitx5-lotus`.
-pub fn is_vietnamese_slang_word(word_lower: &str) -> bool {
-    if word_lower.is_empty() {
-        return false;
-    }
-    vi_slang_set().binary_search(&word_lower).is_ok()
-}
-
-/// Looks up a curated unambiguous Vietnamese shorthand auto-expansion (`ko -> không`, `dc -> được`).
-pub fn lookup_vietnamese_shorthand(word_lower: &str) -> Option<&'static str> {
-    if word_lower.is_empty() {
-        return None;
-    }
-    let map = vi_shorthand_map();
-    map.binary_search_by(|(k, _)| (*k).cmp(word_lower))
-        .ok()
-        .map(|idx| map[idx].1)
-}
-
 /// Projects user/sentence capitalization onto a canonical shorthand expansion (`Ko -> Không`, `Pls -> Please`,
 /// `idk -> I don't know`, `vn -> Việt Nam`) without lowercasing proper nouns inside the expansion.
 pub fn project_shorthand_case(
@@ -160,15 +246,14 @@ pub fn project_shorthand_case(
     out
 }
 
-/// Checks whether `word_lower` is a word or prefix of any word in `vietnamese.cm.dict`
+/// Checks whether `word_lower` is a word or prefix of any word in the active Lotus / Vietnamese dictionary
 /// (1:1 with `lotus::Dictionary::hasWordOrPrefix`).
 pub fn has_vietnamese_dict_prefix(word_lower: &str) -> bool {
     if word_lower.is_empty() {
         return false;
     }
-    let dict = vi_dict();
-    let idx = dict.partition_point(|&w| w < word_lower);
-    dict.get(idx).is_some_and(|w| w.starts_with(word_lower))
+    let dict = resolve_default_vi_syllables();
+    has_dict_prefix_in(&dict, word_lower)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1024,18 +1109,20 @@ impl LotusOptions {
     }
 }
 
-struct LotusSimEngine {
+struct LotusSimEngine<'a> {
     composition: Vec<Transformation>,
     next_id: usize,
     opts: LotusOptions,
+    dict: &'a [Box<str>],
 }
 
-impl LotusSimEngine {
-    fn with_options(opts: LotusOptions) -> Self {
+impl<'a> LotusSimEngine<'a> {
+    fn with_options(opts: LotusOptions, dict: &'a [Box<str>]) -> Self {
         Self {
             composition: Vec::new(),
             next_id: 1,
             opts,
+            dict,
         }
     }
 
@@ -1418,7 +1505,7 @@ impl LotusSimEngine {
         if check_vn_rune && !has_any_vietnamese_rune(&vn_seq) {
             return false;
         }
-        if self.opts.spell_check_with_dicts && has_vietnamese_dict_prefix(&vn_seq) {
+        if self.opts.spell_check_with_dicts && has_dict_prefix_in(self.dict, &vn_seq) {
             return false;
         }
         !is_valid_composition(&self.composition, false)
@@ -1437,7 +1524,7 @@ impl LotusSimEngine {
             return false;
         }
         if self.opts.spell_check_with_dicts {
-            return !is_vietnamese_dict_word(&vn_seq);
+            return !is_dict_word_in(self.dict, &vn_seq);
         }
         !is_valid_composition(&self.composition, true)
     }
@@ -1458,7 +1545,17 @@ pub fn simulate_lotus_word(raw_keys: &str) -> LotusSimulation {
 
 /// Simulates typing `raw_keys` in `fcitx5-lotus` under explicit `LotusOptions`.
 pub fn simulate_lotus_word_with_options(raw_keys: &str, opts: LotusOptions) -> LotusSimulation {
-    let mut eng = LotusSimEngine::with_options(opts);
+    let dict = resolve_default_vi_syllables();
+    simulate_lotus_word_with_dict(raw_keys, opts, &dict)
+}
+
+/// Simulates typing `raw_keys` in `fcitx5-lotus` against an explicit syllable authority slice.
+pub fn simulate_lotus_word_with_dict(
+    raw_keys: &str,
+    opts: LotusOptions,
+    dict: &[Box<str>],
+) -> LotusSimulation {
+    let mut eng = LotusSimEngine::with_options(opts, dict);
     for ch in raw_keys.chars() {
         let english_mode = eng.should_fallback_to_english(false);
         eng.process_key(ch, english_mode);
@@ -1477,7 +1574,7 @@ pub fn simulate_lotus_word_with_options(raw_keys: &str, opts: LotusOptions) -> L
         };
 
     let committed_lower = committed_at_break.to_lowercase();
-    let is_valid_vietnamese = is_vietnamese_dict_word(&committed_lower);
+    let is_valid_vietnamese = is_dict_word_in(dict, &committed_lower);
     let is_composed_vietnamese = has_any_vietnamese_rune(&committed_at_break);
 
     LotusSimulation {
@@ -1558,11 +1655,12 @@ fn try_candidate_repair(
     raw_typed: &str,
     screen_chars: usize,
     opts: LotusOptions,
+    dict: &[Box<str>],
 ) -> Option<TelexRescue> {
     if repaired_lower.len() < 2 {
         return None;
     }
-    let sim = simulate_lotus_word_with_options(repaired_lower, opts);
+    let sim = simulate_lotus_word_with_dict(repaired_lower, opts, dict);
     // Confidence guard:
     // 1. Must be a complete valid word in `vietnamese.cm.dict`.
     // 2. Must carry at least one Vietnamese diacritic or tone mark (`ă, â, đ, ê, ô, ơ, ư` or tones)
@@ -1642,6 +1740,16 @@ pub fn rescue_telex_typo(raw_keys: &str) -> Option<TelexRescue> {
 
 /// Attempts to rescue a broken Vietnamese Telex word under explicit `LotusOptions`.
 pub fn rescue_telex_typo_with_options(raw_keys: &str, opts: LotusOptions) -> Option<TelexRescue> {
+    let dict = resolve_default_vi_syllables();
+    rescue_telex_typo_with_dict(raw_keys, opts, &dict)
+}
+
+/// Attempts to rescue a broken Vietnamese Telex word under explicit `LotusOptions` and syllable authority.
+pub fn rescue_telex_typo_with_dict(
+    raw_keys: &str,
+    opts: LotusOptions,
+    dict: &[Box<str>],
+) -> Option<TelexRescue> {
     if raw_keys.len() < 2 || raw_keys.len() > 16 || !raw_keys.is_ascii() {
         return None;
     }
@@ -1649,7 +1757,7 @@ pub fn rescue_telex_typo_with_options(raw_keys: &str, opts: LotusOptions) -> Opt
         return None;
     }
 
-    let orig_sim = simulate_lotus_word_with_options(raw_keys, opts);
+    let orig_sim = simulate_lotus_word_with_dict(raw_keys, opts, dict);
     // If Lotus already composed this into a valid Vietnamese word, no rescue is needed.
     if orig_sim.is_valid_vietnamese {
         return None;
@@ -1669,7 +1777,7 @@ pub fn rescue_telex_typo_with_options(raw_keys: &str, opts: LotusOptions) -> Opt
             let mut cand = String::with_capacity(n - 1);
             cand.push_str(&lower[..i]);
             cand.push_str(&lower[i + 1..]);
-            if let Some(rescued) = try_candidate_repair(&cand, raw_keys, screen_chars, opts) {
+            if let Some(rescued) = try_candidate_repair(&cand, raw_keys, screen_chars, opts, dict) {
                 return Some(rescued);
             }
         }
@@ -1682,7 +1790,7 @@ pub fn rescue_telex_typo_with_options(raw_keys: &str, opts: LotusOptions) -> Opt
             let mut cand = String::with_capacity(n - 1);
             cand.push_str(&lower[..i]);
             cand.push_str(&lower[i + 1..]);
-            if let Some(rescued) = try_candidate_repair(&cand, raw_keys, screen_chars, opts) {
+            if let Some(rescued) = try_candidate_repair(&cand, raw_keys, screen_chars, opts, dict) {
                 return Some(rescued);
             }
         }
@@ -1691,7 +1799,7 @@ pub fn rescue_telex_typo_with_options(raw_keys: &str, opts: LotusOptions) -> Opt
     // 3. Multi-chatter collapse (`ttieeengs -> tieengs`, `ttieengss -> tieengs`):
     let collapsed = collapse_telex_chatter(&lower);
     if collapsed != lower {
-        if let Some(rescued) = try_candidate_repair(&collapsed, raw_keys, screen_chars, opts) {
+        if let Some(rescued) = try_candidate_repair(&collapsed, raw_keys, screen_chars, opts, dict) {
             return Some(rescued);
         }
     }
@@ -1706,7 +1814,9 @@ pub fn rescue_telex_typo_with_options(raw_keys: &str, opts: LotusOptions) -> Opt
             let mut swapped = bytes.to_vec();
             swapped.swap(i, i + 1);
             if let Ok(cand) = std::str::from_utf8(&swapped) {
-                if let Some(rescued) = try_candidate_repair(cand, raw_keys, screen_chars, opts) {
+                if let Some(rescued) =
+                    try_candidate_repair(cand, raw_keys, screen_chars, opts, dict)
+                {
                     return Some(rescued);
                 }
             }
@@ -1731,7 +1841,9 @@ pub fn rescue_telex_typo_with_options(raw_keys: &str, opts: LotusOptions) -> Opt
             let mut swapped = bytes.to_vec();
             swapped.swap(i, i + 2);
             if let Ok(cand) = std::str::from_utf8(&swapped) {
-                if let Some(rescued) = try_candidate_repair(cand, raw_keys, screen_chars, opts) {
+                if let Some(rescued) =
+                    try_candidate_repair(cand, raw_keys, screen_chars, opts, dict)
+                {
                     return Some(rescued);
                 }
             }
@@ -1760,7 +1872,7 @@ pub fn rescue_telex_typo_with_options(raw_keys: &str, opts: LotusOptions) -> Opt
                     cand[n - 1] = sub;
                     if let Ok(cand_str) = std::str::from_utf8(&cand) {
                         if let Some(rescued) =
-                            try_candidate_repair(cand_str, raw_keys, screen_chars, opts)
+                            try_candidate_repair(cand_str, raw_keys, screen_chars, opts, dict)
                         {
                             return Some(rescued);
                         }

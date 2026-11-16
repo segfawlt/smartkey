@@ -7,8 +7,9 @@ default-run = "smartkey"
 description = "Control CLI (`smartkey` / `smartkeyctl`) and maintainer corpus tools (`smartkey-dev`) for SmartKey"
 
 [features]
-default = ["bundled-en"]
+default = ["bundled-en", "bundled-vi"]
 bundled-en = ["smartkey-core/bundled-en"]
+bundled-vi = ["smartkey-core/bundled-vi"]
 
 [[bin]]
 name = "smartkey"
