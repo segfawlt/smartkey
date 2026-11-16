@@ -1981,6 +1981,17 @@ fn compile_skdict_in_memory(
     })
 }
 
+pub fn build_words_fst_bytes(entries: &[(&str, WordMeta)]) -> Vec<u8> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    sorted.dedup_by(|a, b| a.0 == b.0);
+    let mut wb = MapBuilder::memory();
+    for (w, meta) in sorted {
+        wb.insert(w.as_bytes(), meta.pack()).unwrap();
+    }
+    wb.into_inner().unwrap()
+}
+
 pub struct SkdictV3Payload<'a> {
     pub header: &'a PackHeader,
     pub words_fst: &'a [u8],

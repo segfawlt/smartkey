@@ -1,35 +1,202 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
-use crate::casing::is_abbreviation;
+use crate::casing::is_abbreviation_with_rules;
 use crate::learner::{
     record_manual_edit, record_telex_passthrough_repair, record_undo_keep_verbatim,
     record_untouched_unknown, resolve_restored_edit, LearnEvent,
 };
-use crate::lexicon::EnglishLexicon;
+use crate::lexicon::{EnglishLexicon, LexiconError, PackTier};
 use crate::scorer::{EnglishScorer, EvalContext, LanguageScorer, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::{
     AppProfile, Candidate, EvalOutcome, Explanation, InputOrigin, LangId, MatchKind,
 };
 
-/// Shared process-wide engine owning the zero-copy Layer 1 scorer and comment-preserving `RuleStore`.
+/// Process-wide registry of loaded `.skdict` v3 packs keyed by language code (`"en"`, `"es"`, ...).
+pub struct LexiconRegistry {
+    packs: BTreeMap<String, EnglishScorer>,
+    disk_langs: BTreeSet<String>,
+}
+
+impl Default for LexiconRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LexiconRegistry {
+    pub fn new() -> Self {
+        Self {
+            packs: BTreeMap::new(),
+            disk_langs: BTreeSet::new(),
+        }
+    }
+
+    /// Priority-ordered dictionary search directories:
+    /// `SMARTKEY_DICT_DIR` > user data dir > `/usr/local/share/smartkey/dicts` > `/usr/share/smartkey/dicts`.
+    pub fn default_search_dirs() -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Ok(env_dir) = std::env::var("SMARTKEY_DICT_DIR") {
+            let trimmed = env_dir.trim();
+            if !trimmed.is_empty() {
+                dirs.push(PathBuf::from(trimmed));
+            }
+        }
+        let user_dir = crate::lexicon::default_user_dict_dir();
+        if !dirs.contains(&user_dir) {
+            dirs.push(user_dir);
+        }
+        for sys in [
+            "/usr/local/share/smartkey/dicts",
+            "/usr/share/smartkey/dicts",
+        ] {
+            let p = PathBuf::from(sys);
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+        dirs
+    }
+
+    /// Scans `dirs` in priority order (earliest directory wins on conflict for the same `lang`),
+    /// collecting `"legacy_pack_ignored"` / `"invalid_pack_ignored"` notices for rejected `.skdict` files.
+    /// Falls back to `bundled-en` when `"en"` was not loaded from disk and `bundled_en_fallback` is true.
+    pub fn scan_dirs(
+        dirs: &[PathBuf],
+        bundled_en_fallback: bool,
+    ) -> (Self, Vec<(String, String)>) {
+        let mut reg = Self::new();
+        let mut notices = Vec::new();
+
+        for dir in dirs {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            let mut paths: Vec<PathBuf> = rd
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|ext| ext == "skdict") && p.is_file())
+                .collect();
+            paths.sort();
+
+            for path in paths {
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        notices.push((
+                            "invalid_pack_ignored".to_string(),
+                            format!("{} ({e})", path.display()),
+                        ));
+                        continue;
+                    }
+                };
+                match EnglishLexicon::from_owned_bytes(bytes) {
+                    Ok(lex) => {
+                        let lang = lex.header().lang.clone();
+                        if !reg.packs.contains_key(&lang) {
+                            reg.disk_langs.insert(lang.clone());
+                            reg.packs.insert(lang, EnglishScorer::new(lex));
+                        }
+                    }
+                    Err(LexiconError::LegacyFormat(ver)) => {
+                        notices.push((
+                            "legacy_pack_ignored".to_string(),
+                            format!("{} (skdict v{ver})", path.display()),
+                        ));
+                    }
+                    Err(e) => {
+                        notices.push((
+                            "invalid_pack_ignored".to_string(),
+                            format!("{} ({e})", path.display()),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if bundled_en_fallback && !reg.packs.contains_key("en") {
+            #[cfg(feature = "bundled-en")]
+            if let Ok(scorer) = EnglishScorer::new_bundled() {
+                reg.packs.insert("en".to_string(), scorer);
+            }
+        }
+
+        let _ = bundled_en_fallback;
+        (reg, notices)
+    }
+
+    pub fn load_default() -> (Self, Vec<(String, String)>) {
+        Self::scan_dirs(&Self::default_search_dirs(), cfg!(feature = "bundled-en"))
+    }
+
+    pub fn insert(&mut self, lang: impl Into<String>, scorer: EnglishScorer) {
+        self.packs.insert(lang.into(), scorer);
+    }
+
+    pub fn scorer(&self, lang: &str) -> Option<&EnglishScorer> {
+        self.packs.get(lang)
+    }
+
+    pub fn lexicon(&self, lang: &str) -> Option<&EnglishLexicon> {
+        self.packs.get(lang).map(EnglishScorer::lexicon)
+    }
+
+    pub fn has_disk_pack(&self) -> bool {
+        !self.disk_langs.is_empty()
+    }
+
+    pub fn languages(&self) -> impl Iterator<Item = &str> {
+        self.packs.keys().map(String::as_str)
+    }
+}
+
+/// Shared process-wide engine owning the zero-copy Layer 1 registry and comment-preserving `RuleStore`.
 pub struct SmartKeyEngine {
-    scorer: Option<EnglishScorer>,
+    registry: LexiconRegistry,
+    emitted_notices: BTreeSet<(String, String)>,
     store: RuleStore,
 }
 
 impl SmartKeyEngine {
     pub fn new(scorer: Option<EnglishScorer>, store: RuleStore) -> Self {
-        Self { scorer, store }
+        let mut registry = LexiconRegistry::new();
+        if let Some(s) = scorer {
+            let lang = s.lexicon().header().lang.clone();
+            registry.insert(lang, s);
+        }
+        Self {
+            registry,
+            emitted_notices: BTreeSet::new(),
+            store,
+        }
+    }
+
+    pub fn from_registry(registry: LexiconRegistry, store: RuleStore) -> Self {
+        Self {
+            registry,
+            emitted_notices: BTreeSet::new(),
+            store,
+        }
+    }
+
+    pub fn new_from_dirs(
+        dirs: &[PathBuf],
+        bundled_en_fallback: bool,
+        store: RuleStore,
+    ) -> Self {
+        let (registry, notices) = LexiconRegistry::scan_dirs(dirs, bundled_en_fallback);
+        let mut engine = Self::from_registry(registry, store);
+        engine.emit_notices(notices);
+        engine
     }
 
     #[cfg(feature = "bundled-en")]
     pub fn new_bundled(store: RuleStore) -> Result<Self, crate::lexicon::LexiconError> {
         let scorer = EnglishScorer::new_bundled()?;
-        Ok(Self {
-            scorer: Some(scorer),
-            store,
-        })
+        Ok(Self::new(Some(scorer), store))
     }
 
     #[cfg(feature = "bundled-en")]
@@ -38,40 +205,46 @@ impl SmartKeyEngine {
     }
 
     pub fn new_auto(store: RuleStore) -> Self {
-        if let Some(path) = crate::lexicon::resolve_dict_path("en") {
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(lex) = EnglishLexicon::from_owned_bytes(bytes) {
-                    return Self::new(Some(EnglishScorer::new(lex)), store);
-                }
+        let (registry, notices) = LexiconRegistry::load_default();
+        let mut engine = Self::from_registry(registry, store);
+        engine.emit_notices(notices);
+        engine
+    }
+
+    fn emit_notices(&mut self, notices: Vec<(String, String)>) {
+        for (notice, detail) in notices {
+            if self.emitted_notices.insert((notice.clone(), detail.clone())) {
+                self.store.log_pack_notice(&notice, &detail);
             }
         }
-        #[cfg(feature = "bundled-en")]
-        {
-            if let Ok(scorer) = EnglishScorer::new_bundled() {
-                return Self::new(Some(scorer), store);
-            }
-        }
-        Self::new(None, store)
     }
 
     pub fn reload_dicts(&mut self) -> bool {
-        if let Some(path) = crate::lexicon::resolve_dict_path("en") {
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(lex) = EnglishLexicon::from_owned_bytes(bytes) {
-                    self.scorer = Some(EnglishScorer::new(lex));
-                    return true;
-                }
-            }
-        }
-        false
+        let (registry, notices) = LexiconRegistry::load_default();
+        self.emit_notices(notices);
+        let loaded_any = registry.has_disk_pack();
+        self.registry = registry;
+        loaded_any
+    }
+
+    pub fn registry(&self) -> &LexiconRegistry {
+        &self.registry
     }
 
     pub fn scorer(&self) -> Option<&EnglishScorer> {
-        self.scorer.as_ref()
+        self.registry.scorer("en")
     }
 
     pub fn lexicon(&self) -> Option<&EnglishLexicon> {
-        self.scorer.as_ref().map(EnglishScorer::lexicon)
+        self.registry.lexicon("en")
+    }
+
+    pub fn scorer_for(&self, lang: &str) -> Option<&EnglishScorer> {
+        self.registry.scorer(lang)
+    }
+
+    pub fn lexicon_for(&self, lang: &str) -> Option<&EnglishLexicon> {
+        self.registry.lexicon(lang)
     }
 
     pub fn store(&self) -> &RuleStore {
@@ -194,7 +367,7 @@ impl SmartKeyEngine {
             return self.evaluate_vi_lotus_token(token, ctx, lotus_active_on_word);
         }
 
-        if let Some(scorer) = &self.scorer {
+        if let Some(scorer) = self.scorer_for(self.store.active_lang().as_str()) {
             return scorer.evaluate(token, ctx, self.store.scorer_config(), &self.store);
         }
 
@@ -425,7 +598,7 @@ impl SmartKeyEngine {
         }
 
         // 5. Fallback to Layer 1 English scorer (`dont -> don't`, `teh -> the`, `chagnes -> changes`):
-        if let Some(scorer) = &self.scorer {
+        if let Some(scorer) = self.scorer() {
             return scorer.evaluate(token, ctx, self.store.scorer_config(), &self.store);
         }
 
@@ -459,7 +632,7 @@ impl SmartKeyEngine {
                     kind,
                 });
             }
-            if let Some(scorer) = &self.scorer {
+            if let Some(scorer) = self.scorer() {
                 let en_exp = scorer.explain(token, ctx, self.store.scorer_config(), &self.store);
                 top_candidates.extend(en_exp.top_candidates);
             }
@@ -472,7 +645,7 @@ impl SmartKeyEngine {
             };
         }
 
-        if let Some(scorer) = &self.scorer {
+        if let Some(scorer) = self.scorer_for(self.store.active_lang().as_str()) {
             return scorer.explain(token, ctx, self.store.scorer_config(), &self.store);
         }
         Explanation {
@@ -818,8 +991,12 @@ impl SmartKeySession {
 
     fn flush_pending_unknown(&mut self, engine: &mut SmartKeyEngine, events: &mut Vec<LearnEvent>) {
         if let Some((lang, word)) = self.pending_unknown.take() {
-            let lex = engine.scorer.as_ref().map(|s| s.lexicon());
-            let ev = record_untouched_unknown(&mut engine.store, lex, &lang, &word);
+            let ev = record_untouched_unknown(
+                &mut engine.store,
+                engine.registry.lexicon(lang.as_str()),
+                &lang,
+                &word,
+            );
             if !matches!(ev, LearnEvent::None) {
                 events.push(ev);
             }
@@ -846,6 +1023,7 @@ impl SmartKeySession {
 
     fn update_context_after_commit(
         &mut self,
+        engine: &SmartKeyEngine,
         final_text: &str,
         punct: Option<char>,
         has_space: bool,
@@ -860,7 +1038,12 @@ impl SmartKeySession {
             if Self::ends_sentence(p) {
                 self.prev_word = None;
                 self.at_sentence_start = true;
-                self.suppress_sentence_cap = p == '.' && is_abbreviation(last_word);
+                let abbrs = engine
+                    .lexicon_for(self.lang.as_str())
+                    .map(|l| l.rules().casing.abbreviations.as_slice())
+                    .unwrap_or(&[]);
+                self.suppress_sentence_cap =
+                    p == '.' && is_abbreviation_with_rules(last_word, abbrs);
                 return;
             }
             // Non-sentence punctuation (`,`, `;`, `:`, `)`, `"`) breaks strict bigram adjacency
@@ -945,7 +1128,7 @@ impl SmartKeySession {
         events: &mut Vec<LearnEvent>,
     ) {
         let mode = std::mem::replace(&mut self.mode, Mode::Idle);
-        let lex = engine.scorer.as_ref().map(|s| s.lexicon());
+        let lex = engine.registry.lexicon(self.lang.as_str());
         match mode {
             Mode::EditingRestored {
                 raw_typed,
@@ -1443,7 +1626,7 @@ impl SmartKeySession {
                     || (!buf.is_empty() && matches!(ch, '.' | ':' | ';'))
                 {
                     if !is_snippet && !buf.is_empty() {
-                        let lex = engine.scorer.as_ref().map(|s| s.lexicon());
+                        let lex = engine.registry.lexicon(self.lang.as_str());
                         let evs = resolve_restored_edit(
                             &mut engine.store,
                             lex,
@@ -1471,7 +1654,7 @@ impl SmartKeySession {
                     }
                     let is_space = ch == ' ' || ch == '\t';
                     let punct = if is_space { None } else { Some(ch) };
-                    self.update_context_after_commit(&buf, punct, is_space);
+                    self.update_context_after_commit(engine, &buf, punct, is_space);
                     if is_space && !buf.is_empty() {
                         self.mode = Mode::AfterWord {
                             word: buf,
@@ -1510,7 +1693,7 @@ impl SmartKeySession {
                             &buf,
                             &mut learn_events,
                         );
-                        let lex = engine.scorer.as_ref().map(|s| s.lexicon());
+                        let lex = engine.registry.lexicon(self.lang.as_str());
                         let ev = record_manual_edit(
                             &mut engine.store,
                             lex,
@@ -1548,7 +1731,7 @@ impl SmartKeySession {
                             }
                         }
                     }
-                    self.update_context_after_commit(&buf, punct, is_space);
+                    self.update_context_after_commit(engine, &buf, punct, is_space);
                     if is_space && !buf.is_empty() {
                         self.mode = Mode::AfterWord {
                             word: buf,
@@ -1796,7 +1979,12 @@ impl SmartKeySession {
             let macro_body = committed_text
                 .strip_suffix(boundary_ch)
                 .unwrap_or(committed_text);
-            self.update_context_after_commit(macro_body, punct, is_space && prior_punct.is_none());
+            self.update_context_after_commit(
+                engine,
+                macro_body,
+                punct,
+                is_space && prior_punct.is_none(),
+            );
             return SessionOutput::with_events(learn_events);
         }
 
@@ -1864,7 +2052,7 @@ impl SmartKeySession {
         // do not overwrite their fresh manual edit with statistical guesses!
         if let Some(peak) = peak_before_bs {
             let check_unknown = if self.lang.as_str() != "vi" {
-                let lex = engine.scorer.as_ref().map(|s| s.lexicon());
+                let lex = engine.registry.lexicon(self.lang.as_str());
                 let ev = record_manual_edit(
                     &mut engine.store,
                     lex,
@@ -1905,6 +2093,7 @@ impl SmartKeySession {
                 }
             }
             self.update_context_after_commit(
+                engine,
                 &word,
                 effective_punct,
                 is_trigger_space && prior_punct.is_none(),
@@ -1936,6 +2125,7 @@ impl SmartKeySession {
             // step aside until `on_lotus_boundary_commit` delivers the completed commit.
             if sim.needs_uinput_restore_on_break && !boundary_already_committed {
                 self.update_context_after_commit(
+                    engine,
                     &sim.committed_at_break,
                     effective_punct,
                     is_trigger_space && prior_punct.is_none(),
@@ -1950,6 +2140,7 @@ impl SmartKeySession {
                 && !engine.should_passthrough_telex(&word, &ctx, &composed_lower)
             {
                 self.update_context_after_commit(
+                    engine,
                     &sim.committed_at_break,
                     effective_punct,
                     is_trigger_space && prior_punct.is_none(),
@@ -1991,6 +2182,7 @@ impl SmartKeySession {
                         .unwrap_or(word.as_str());
                     if replacement == on_screen_word {
                         self.update_context_after_commit(
+                            engine,
                             &replacement,
                             effective_punct,
                             is_trigger_space && prior_punct.is_none(),
@@ -2025,6 +2217,7 @@ impl SmartKeySession {
                 };
 
                 self.update_context_after_commit(
+                    engine,
                     &replacement,
                     effective_punct,
                     is_trigger_space && prior_punct.is_none(),
@@ -2087,7 +2280,7 @@ impl SmartKeySession {
                     self.pending_unknown = Some((self.lang.clone(), word.clone()));
                     if reason != MatchKind::ValidWord {
                         let (best_candidate, best_score, threshold) =
-                            if let Some(scorer) = engine.scorer() {
+                            if let Some(scorer) = engine.scorer_for(self.lang.as_str()) {
                                 let explanation = scorer.explain(
                                     &word,
                                     &ctx,
@@ -2113,23 +2306,22 @@ impl SmartKeySession {
                         );
                     }
                 } else {
-                    if reason == MatchKind::ValidWord
-                        && self.lang.as_str() == "en"
-                        && engine.store.diagnostics().event_log
-                    {
+                    if reason == MatchKind::ValidWord && engine.store.diagnostics().event_log {
                         if let (Some(prev), Some(scorer)) =
-                            (prev_before.as_deref(), engine.scorer())
+                            (prev_before.as_deref(), engine.scorer_for(self.lang.as_str()))
                         {
-                            let alt = scorer.find_real_word_context_alternative(
-                                &word,
-                                prev,
-                                engine.store.scorer_config(),
-                                &engine.store,
-                            );
-                            if let Some((cand, cand_bg, typed_bg)) = alt {
-                                engine
-                                    .store
-                                    .log_real_word_declined(&word, prev, &cand, cand_bg, typed_bg);
+                            if scorer.lexicon().header().tier == PackTier::Data {
+                                let alt = scorer.find_real_word_context_alternative(
+                                    &word,
+                                    prev,
+                                    engine.store.scorer_config(),
+                                    &engine.store,
+                                );
+                                if let Some((cand, cand_bg, typed_bg)) = alt {
+                                    engine
+                                        .store
+                                        .log_real_word_declined(&word, prev, &cand, cand_bg, typed_bg);
+                                }
                             }
                         }
                     }
@@ -2145,6 +2337,7 @@ impl SmartKeySession {
                     .map(|s| s.committed_at_break.clone())
                     .unwrap_or(word);
                 self.update_context_after_commit(
+                    engine,
                     &on_screen_final,
                     effective_punct,
                     is_trigger_space && prior_punct.is_none(),
@@ -2255,7 +2448,7 @@ impl SmartKeySession {
         engine
             .store
             .log_backspace_undo(raw_typed, rejected, UndoResolution::KeptVerbatim);
-        let lex = engine.scorer.as_ref().map(|s| s.lexicon());
+        let lex = engine.registry.lexicon(self.lang.as_str());
         record_undo_keep_verbatim(&mut engine.store, lex, &self.lang, raw_typed, rejected)
     }
 
@@ -2268,7 +2461,7 @@ impl SmartKeySession {
         fixed: &str,
     ) -> Vec<LearnEvent> {
         engine.store.set_active_lang(self.lang.clone());
-        let lex = engine.scorer.as_ref().map(|s| s.lexicon());
+        let lex = engine.registry.lexicon(self.lang.as_str());
         if let Some((raw_typed, rejected, prev_before)) = self.mobile_pending_undo.take() {
             if raw_typed.eq_ignore_ascii_case(orig) {
                 self.prev_word = Some(fixed.to_string());
@@ -2303,7 +2496,7 @@ impl SmartKeySession {
     ) -> LearnEvent {
         engine.store.set_active_lang(self.lang.clone());
         self.mobile_pending_undo = None;
-        let lex = engine.scorer.as_ref().map(|s| s.lexicon());
+        let lex = engine.registry.lexicon(self.lang.as_str());
         let ev = record_untouched_unknown(&mut engine.store, lex, &self.lang, word);
         self.prev_word = Some(word.to_string());
         ev
@@ -2353,5 +2546,297 @@ pub fn apply_key_to_buffer(client_buf: &mut String, key: KeyInput, action: &Sess
             KeyInput::Tab => client_buf.push('\t'),
             KeyInput::NavOrClick | KeyInput::FocusLost => {}
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use fst::MapBuilder;
+
+    use super::*;
+    use crate::event_log::EventLog;
+    use crate::lexicon::{
+        serialize_skdict_v3, CliticRules, LanguageRules, PackHeader, PackTier, SkdictV3Payload,
+        WordMeta,
+    };
+    use crate::store::{DiagnosticEvent, Preset};
+
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "smartkey_session_test_{tag}_{}_{}",
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn build_synthetic_v3_bytes(
+        lang: &str,
+        version: [u8; 3],
+        words: &[(&str, WordMeta)],
+        shorthand: &[(&str, &str)],
+        rules: LanguageRules,
+    ) -> Vec<u8> {
+        let mut sorted_words = words.to_vec();
+        sorted_words.sort_by(|a, b| a.0.cmp(b.0));
+        let mut wb = MapBuilder::memory();
+        for (w, meta) in sorted_words {
+            wb.insert(w.as_bytes(), meta.pack()).unwrap();
+        }
+        let mut sorted_short: Vec<(String, String)> = shorthand
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        sorted_short.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let header = PackHeader {
+            lang: lang.to_string(),
+            pack_version: version,
+            tier: PackTier::Data,
+            variants: vec![format!("{lang}_{}", lang.to_uppercase())],
+            freq_slots: vec![0x01],
+            default_variant_idx: 0,
+            feature_flags: 0,
+        };
+        serialize_skdict_v3(&SkdictV3Payload {
+            header: &header,
+            words_fst: &wb.into_inner().unwrap(),
+            typos_fst: &[],
+            typo_pool: &[],
+            variant_rewrites: &[],
+            bigrams: &BTreeMap::new(),
+            smash_entries: &[],
+            proper_nouns: &[],
+            shorthand: &sorted_short,
+            slang_set: &[],
+            rules: Some(&rules),
+            syllable_dict: &[],
+            source_manifest: &[],
+        })
+    }
+
+    fn feed_text(session: &mut SmartKeySession, engine: &mut SmartKeyEngine, text: &str) -> String {
+        let mut buf = String::new();
+        for (idx, ch) in text.chars().enumerate() {
+            let out = session.process_key(engine, KeyInput::Char(ch), (idx as u64 + 1) * 10);
+            apply_key_to_buffer(&mut buf, KeyInput::Char(ch), &out.action);
+        }
+        buf
+    }
+
+    #[test]
+    fn lexicon_registry_ignores_legacy_skdict02_emits_one_time_pack_notice_and_falls_back() {
+        let dict_dir = unique_tmp_dir("legacy_reg");
+        let log_dir = unique_tmp_dir("legacy_log");
+
+        std::fs::write(dict_dir.join("en.skdict"), b"SKDICT02legacy_payload").unwrap();
+        std::fs::write(dict_dir.join("fr.skdict"), b"NOT_A_PACK").unwrap();
+
+        let store = RuleStore::in_memory(Preset::Balanced);
+        let mut engine = SmartKeyEngine::new_from_dirs(std::slice::from_ref(&dict_dir), true, store);
+
+        // Fallback to bundled-en succeeds; invalid fr pack is ignored.
+        let en = engine.lexicon().expect("bundled en fallback");
+        assert!(en.contains_valid("the", crate::types::Dialect::Mixed));
+        assert!(engine.lexicon_for("fr").is_none());
+
+        // PackNotice must NEVER pollute learner_state.json::recent_events.
+        assert!(engine.store().state().recent_events.is_empty());
+
+        // Emitting again with the same notice/detail deduplicates (one-time PackNotice).
+        let (_, dup_notices) = LexiconRegistry::scan_dirs(std::slice::from_ref(&dict_dir), true);
+        engine.emit_notices(dup_notices);
+
+        // Simulates Fcitx5 startup order: set_log_dir arrives after SmartKeyEngine::new_auto.
+        engine.store_mut().set_log_dir(Some(log_dir.clone()));
+
+        let records = EventLog::read_records_in_range(&log_dir, None, None).unwrap();
+        let legacy_count = records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.event,
+                    DiagnosticEvent::PackNotice { notice, detail }
+                        if notice == "legacy_pack_ignored" && detail.contains("skdict v2")
+                )
+            })
+            .count();
+        let invalid_count = records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.event,
+                    DiagnosticEvent::PackNotice { notice, .. } if notice == "invalid_pack_ignored"
+                )
+            })
+            .count();
+        assert_eq!(legacy_count, 1, "records={records:?}");
+        assert_eq!(invalid_count, 1, "records={records:?}");
+
+        let _ = std::fs::remove_dir_all(&dict_dir);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn lexicon_registry_user_dir_overrides_system_dir() {
+        let user_dir = unique_tmp_dir("user_prio");
+        let sys_dir = unique_tmp_dir("sys_prio");
+
+        let user_es = build_synthetic_v3_bytes(
+            "es",
+            [0, 3, 2],
+            &[(
+                "hola",
+                WordMeta {
+                    freq0: 210,
+                    freq1: 0,
+                    variant_mask: 0x01,
+                    flags: 0,
+                    word_id: 1,
+                },
+            )],
+            &[],
+            LanguageRules::default(),
+        );
+        let sys_es = build_synthetic_v3_bytes(
+            "es",
+            [0, 3, 0],
+            &[(
+                "adios",
+                WordMeta {
+                    freq0: 200,
+                    freq1: 0,
+                    variant_mask: 0x01,
+                    flags: 0,
+                    word_id: 1,
+                },
+            )],
+            &[],
+            LanguageRules::default(),
+        );
+        std::fs::write(user_dir.join("es.skdict"), user_es).unwrap();
+        std::fs::write(sys_dir.join("es.skdict"), sys_es).unwrap();
+
+        let (reg, notices) = LexiconRegistry::scan_dirs(&[user_dir.clone(), sys_dir.clone()], false);
+        assert!(notices.is_empty());
+        let es = reg.lexicon("es").expect("es pack loaded");
+        assert_eq!(es.header().pack_version, [0, 3, 2]);
+        assert!(es.contains_valid("hola", crate::types::Dialect::Mixed));
+        assert!(!es.contains_valid("adios", crate::types::Dialect::Mixed));
+
+        let _ = std::fs::remove_dir_all(&user_dir);
+        let _ = std::fs::remove_dir_all(&sys_dir);
+    }
+
+    #[test]
+    fn multilang_session_routes_es_and_fr_packs_and_guards_learner() {
+        let es_lex = EnglishLexicon::from_owned_bytes(build_synthetic_v3_bytes(
+            "es",
+            [0, 3, 0],
+            &[
+                (
+                    "hola",
+                    WordMeta {
+                        freq0: 210,
+                        freq1: 0,
+                        variant_mask: 0x01,
+                        flags: 0,
+                        word_id: 1,
+                    },
+                ),
+                (
+                    "porque",
+                    WordMeta {
+                        freq0: 215,
+                        freq1: 0,
+                        variant_mask: 0x01,
+                        flags: 0,
+                        word_id: 2,
+                    },
+                ),
+            ],
+            &[("xq", "porque")],
+            LanguageRules {
+                capitalize_standalone_i: false,
+                ..LanguageRules::default()
+            },
+        ))
+        .unwrap();
+
+        let fr_lex = EnglishLexicon::from_owned_bytes(build_synthetic_v3_bytes(
+            "fr",
+            [0, 3, 0],
+            &[(
+                "homme",
+                WordMeta {
+                    freq0: 220,
+                    freq1: 0,
+                    variant_mask: 0x01,
+                    flags: 0,
+                    word_id: 1,
+                },
+            )],
+            &[],
+            LanguageRules {
+                clitics: CliticRules {
+                    suffixes: Vec::new(),
+                    prefixes: vec!["l".to_string()],
+                },
+                ..LanguageRules::default()
+            },
+        ))
+        .unwrap();
+
+        let mut reg = LexiconRegistry::new();
+        reg.insert("es", EnglishScorer::new(es_lex));
+        reg.insert("fr", EnglishScorer::new(fr_lex));
+
+        let mut engine = SmartKeyEngine::from_registry(reg, RuleStore::in_memory(Preset::Balanced));
+        let mut session = SmartKeySession::new();
+        session.set_lang(LangId("es".to_string()));
+
+        // Spanish shorthand expansion + capitalize_standalone_i=false routing:
+        assert_eq!(feed_text(&mut session, &mut engine, "xq i "), "porque i ");
+
+        // `explain_token` inspects active_lang ("es"):
+        engine.store_mut().set_active_lang(LangId("es".to_string()));
+        let exp = engine.explain_token("xq", &EvalContext::default());
+        assert!(matches!(
+            exp.outcome,
+            EvalOutcome::Autocorrect {
+                ref replacement,
+                kind: MatchKind::ShorthandExpansion,
+                ..
+            } if replacement == "porque"
+        ));
+
+        // Valid Spanish word untouched 3x must NOT graduate into `[lang.es].personal_dict`:
+        for _ in 0..3 {
+            let ev = session.on_mobile_untouched_commit(&mut engine, "hola");
+            assert_eq!(ev, LearnEvent::None);
+        }
+
+        // Non-ASCII accented edit in "es" (`cafe -> café`) MUST stay in `es`, never hijack to `vi`:
+        session.on_mobile_manual_fix(&mut engine, "cafe", "café");
+        let second = session.on_mobile_manual_fix(&mut engine, "cafe", "café");
+        assert!(
+            matches!(
+                second.as_slice(),
+                [LearnEvent::GraduatedCorrection { lang, orig, fixed }]
+                    if lang == "es" && orig == "cafe" && fixed == "café"
+            ),
+            "got {second:?}"
+        );
+
+        // Switching to "fr" activates French clitic prefix elision shielding:
+        session.set_lang(LangId("fr".to_string()));
+        assert_eq!(feed_text(&mut session, &mut engine, "l'homme "), "l'homme ");
     }
 }

@@ -22,7 +22,8 @@ pub use lexicon::{
 };
 pub use scorer::{EmptyUserRules, EnglishScorer, EvalContext, LanguageScorer, UserRuleView};
 pub use session::{
-    apply_key_to_buffer, KeyInput, SessionAction, SessionOutput, SmartKeyEngine, SmartKeySession,
+    apply_key_to_buffer, KeyInput, LexiconRegistry, SessionAction, SessionOutput, SmartKeyEngine,
+    SmartKeySession,
 };
 pub use store::{
     classify_builtin_program, normalize_program_id, BlockPair, CompiledRules, ConfidenceTier,

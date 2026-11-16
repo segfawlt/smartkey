@@ -8,10 +8,11 @@ use std::time::Instant;
 use serde::Serialize;
 use smartkey_core::event_log::current_epoch_ms;
 use smartkey_core::{
-    apply_key_to_buffer, normalize_program_id, AppProfile, ConfidenceTier, DiagnosticEvent,
-    Dialect, EnglishScorer, EvalContext, EvalOutcome, EventLog, KeyInput, LangId,
-    LoggedDiagnosticRecord, MatchKind, Preset, PruneKinds, PruneOptions, RuleStore, SessionAction,
-    SmartKeyEngine, SmartKeySession, UndoResolution,
+    apply_key_to_buffer, normalize_program_id, peek_skdict_header_and_manifest, AppProfile,
+    ConfidenceTier, DiagnosticEvent, Dialect, EnglishScorer, EvalContext, EvalOutcome, EventLog,
+    KeyInput, LangId, LexiconError, LoggedDiagnosticRecord, MatchKind, PackHeader, PackTier,
+    Preset, PruneKinds, PruneOptions, RuleStore, SessionAction, SmartKeyEngine, SmartKeySession,
+    UndoResolution,
 };
 
 /// Git state stamped at build time by `build.rs`: HEAD hash or tag (e.g.
@@ -39,40 +40,6 @@ fn default_config_dir() -> PathBuf {
         return home.join(".config/smartkey");
     }
     env::temp_dir().join("smartkey/config")
-}
-
-fn load_scorer() -> Result<EnglishScorer, CliError> {
-    if let Some(path) = smartkey_core::resolve_dict_path("en") {
-        match fs::read(&path) {
-            Ok(bytes) => match smartkey_core::EnglishLexicon::from_owned_bytes(bytes) {
-                Ok(lex) => return Ok(EnglishScorer::new(lex)),
-                Err(err) => {
-                    eprintln!(
-                        "warning: invalid dictionary pack at {} ({err}); falling back to bundled lexicon",
-                        path.display()
-                    );
-                }
-            },
-            Err(err) => {
-                eprintln!(
-                    "warning: could not read dictionary pack at {} ({err}); falling back to bundled lexicon",
-                    path.display()
-                );
-            }
-        }
-    }
-    #[cfg(feature = "bundled-en")]
-    {
-        EnglishScorer::new_bundled()
-            .map_err(|e| CliError::Runtime(format!("failed to load bundled lexicon: {e}")))
-    }
-    #[cfg(not(feature = "bundled-en"))]
-    {
-        Err(CliError::Runtime(
-            "en.skdict not found in dictionary directories (~/.local/share/smartkey/dicts/ or /usr/share/smartkey/dicts/)"
-                .to_string(),
-        ))
-    }
 }
 
 fn load_rule_store_mut(dir: &Path, preset: Preset) -> Result<RuleStore, CliError> {
@@ -2081,6 +2048,9 @@ fn format_diagnostic_event_line(ev: &DiagnosticEvent) -> String {
             "[--]",
             match_kind_slug(*reason)
         ),
+        DiagnosticEvent::PackNotice { notice, detail } => {
+            format!("{:<6} PACK_NOTICE ({notice}) {detail}", "[--]")
+        }
     }
 }
 
@@ -2438,8 +2408,8 @@ fn cmd_explain(args: &[String]) -> CliResult {
         match arg {
             "--help" | "-h" => {
                 println!(
-                    "USAGE:\n  smartkey explain [--json] [--lang en|vi] [--prev <word>] [--punct <char>] [--dialect mixed|us|gb] [--dir <path>] [--sentence-start] <token>\n\n\
-                     Evaluate a token against user rules, Vietnamese Telex rescue (with --lang vi), and the Layer 1 scorer."
+                    "USAGE:\n  smartkey explain [--json] [--lang <code>] [--prev <word>] [--punct <char>] [--dialect mixed|us|gb] [--dir <path>] [--sentence-start] <token>\n\n\
+                     Evaluate a token against user rules, Vietnamese Telex rescue (with --lang vi), and the loaded .skdict v3 language scorer."
                 );
                 return Ok(());
             }
@@ -2480,12 +2450,8 @@ fn cmd_explain(args: &[String]) -> CliResult {
                 i += 1;
                 let raw = args
                     .get(i)
-                    .ok_or_else(|| CliError::Usage("--lang requires an id (en|vi)".to_string()))?;
-                lang = match raw.as_str() {
-                    "vi" | "vi-lotus" | "vi_lotus" | "lotus" => LangId::vi(),
-                    "en" | "en_US" | "en_GB" => LangId::en(),
-                    other => LangId(other.to_string()),
-                };
+                    .ok_or_else(|| CliError::Usage("--lang requires a language code".to_string()))?;
+                lang = parse_lang_arg(raw)?;
             }
             "--json" => {
                 as_json = true;
@@ -2524,7 +2490,6 @@ fn cmd_explain(args: &[String]) -> CliResult {
         ));
     };
 
-    let scorer = load_scorer()?;
     let cfg_dir = dir.unwrap_or_else(default_config_dir);
     let (mut store, _) = load_rule_store_readonly(&cfg_dir, Preset::Balanced)?;
     if let Some(d) = dialect {
@@ -2532,7 +2497,7 @@ fn cmd_explain(args: &[String]) -> CliResult {
     }
     store.set_active_lang(lang);
 
-    let engine = SmartKeyEngine::new(Some(scorer), store);
+    let engine = SmartKeyEngine::new_auto(store);
     let ctx = EvalContext {
         prev_word: prev.as_deref(),
         boundary_punct: punct,
@@ -2608,78 +2573,180 @@ fn cmd_explain(args: &[String]) -> CliResult {
     Ok(())
 }
 
-fn validate_and_install_skdict(staged_path: &Path, target_path: &Path) -> Result<(), CliError> {
+fn tier_label(tier: PackTier) -> &'static str {
+    match tier {
+        PackTier::Data => "data",
+        PackTier::ImeBridge => "ime-bridge",
+    }
+}
+
+fn validate_and_install_skdict(
+    staged_path: &Path,
+    target_path: &Path,
+    expected_lang: &str,
+) -> Result<PackHeader, CliError> {
     let bytes = fs::read(staged_path).map_err(|e| CliError::Runtime(e.to_string()))?;
-    if let Err(err) = smartkey_core::EnglishLexicon::from_owned_bytes(bytes) {
+    let lex = match smartkey_core::EnglishLexicon::from_owned_bytes(bytes) {
+        Ok(lex) => lex,
+        Err(err) => {
+            let _ = fs::remove_file(staged_path);
+            return Err(CliError::Runtime(format!(
+                "invalid dictionary format: {err}"
+            )));
+        }
+    };
+    let header = lex.header().clone();
+    if header.lang != expected_lang {
         let _ = fs::remove_file(staged_path);
         return Err(CliError::Runtime(format!(
-            "invalid dictionary format: {err}"
+            "pack language mismatch: expected '{expected_lang}', found '{}'",
+            header.lang
         )));
     }
     fs::rename(staged_path, target_path).map_err(|e| {
         let _ = fs::remove_file(staged_path);
         CliError::Runtime(e.to_string())
-    })
+    })?;
+    Ok(header)
+}
+
+fn format_hex_bytes(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
+fn render_dict_list_lines(
+    scoped_dirs: &[(&str, PathBuf)],
+    verbose: bool,
+) -> (Vec<String>, bool) {
+    let mut lines = Vec::new();
+    let mut found = false;
+
+    for (scope, dir) in scoped_dirs {
+        if !dir.exists() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("skdict") && p.is_file())
+            .collect();
+        paths.sort();
+
+        for path in paths {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+            let sz = fs::metadata(&path)
+                .map(|m| m.len() as f64 / (1024.0 * 1024.0))
+                .unwrap_or(0.0);
+            let bytes = match fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    lines.push(format!(
+                        "  {scope:<8} {stem:<6} ({sz:.2} MiB) [unreadable — {e}] -> {}",
+                        path.display()
+                    ));
+                    found = true;
+                    continue;
+                }
+            };
+            match peek_skdict_header_and_manifest(&bytes) {
+                Ok((hdr, manifest)) => {
+                    lines.push(format!(
+                        "  {scope:<8} {:<6} v{}.{}.{} ({}, variants=[{}], {:.2} MiB) -> {}",
+                        hdr.lang,
+                        hdr.pack_version[0],
+                        hdr.pack_version[1],
+                        hdr.pack_version[2],
+                        tier_label(hdr.tier),
+                        hdr.variants.join(", "),
+                        sz,
+                        path.display()
+                    ));
+                    if verbose {
+                        if manifest.is_empty() {
+                            lines.push("           sources: (none)".to_string());
+                        } else {
+                            for src in manifest {
+                                lines.push(format!(
+                                    "           source: {} sha256={} license={}",
+                                    src.name,
+                                    format_hex_bytes(&src.sha256),
+                                    src.license
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(LexiconError::LegacyFormat(v)) => {
+                    lines.push(format!(
+                        "  {scope:<8} {stem:<6} ({sz:.2} MiB) [legacy v{v} — ignored; run: smartkey dict update {stem}] -> {}",
+                        path.display()
+                    ));
+                }
+                Err(e) => {
+                    lines.push(format!(
+                        "  {scope:<8} {stem:<6} ({sz:.2} MiB) [invalid — ignored: {e}] -> {}",
+                        path.display()
+                    ));
+                }
+            }
+            found = true;
+        }
+    }
+
+    (lines, found)
 }
 
 fn cmd_dict(args: &[String]) -> CliResult {
     match args.first().map(String::as_str) {
         Some("--help" | "-h") => {
             println!(
-                "USAGE:\n  smartkey dict [list|dir|install <lang> <path_or_url>|remove <lang>|update [lang]]\n  Alias: dicts\n\n\
+                "USAGE:\n  smartkey dict [list [-v|--verbose]|dir|install <lang> <path_or_url>|remove <lang>|update [lang]]\n  Alias: dicts\n\n\
                  Inspect, install, update, or remove modular .skdict language dictionary packs."
             );
             Ok(())
         }
         Some("list" | "ls") | None => {
-            if args.len() > 1 {
-                return Err(CliError::Usage(format!(
-                    "unexpected argument {:?} (usage: smartkey dict list)",
-                    args[1]
-                )));
+            let mut verbose = false;
+            for arg in args.iter().skip(1) {
+                match arg.as_str() {
+                    "-v" | "--verbose" => verbose = true,
+                    other => {
+                        return Err(CliError::Usage(format!(
+                            "unexpected argument {other:?} (usage: smartkey dict list [-v|--verbose])"
+                        )));
+                    }
+                }
             }
             println!("=== SmartKey Language Packs ===");
             let user_dir = smartkey_core::default_user_dict_dir();
             println!("User Dict Directory   : {}", user_dir.display());
             println!("System Dict Directory : /usr/share/smartkey/dicts\n");
 
-            let mut found = false;
-            if user_dir.exists() {
-                if let Ok(entries) = fs::read_dir(&user_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) == Some("skdict") {
-                            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-                            let meta = entry.metadata().ok();
-                            let sz = meta.map(|m| m.len() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0);
-                            println!("  [user]   {:<6} ({:.2} MiB) -> {}", stem, sz, path.display());
-                            found = true;
-                        }
-                    }
+            let mut scoped_dirs: Vec<(&str, PathBuf)> = Vec::new();
+            if let Ok(env_dir) = env::var("SMARTKEY_DICT_DIR") {
+                if !env_dir.trim().is_empty() {
+                    scoped_dirs.push(("[env]", PathBuf::from(env_dir.trim())));
                 }
             }
-            for sys in ["/usr/share/smartkey/dicts", "/usr/local/share/smartkey/dicts"] {
-                let sys_dir = Path::new(sys);
-                if sys_dir.exists() {
-                    if let Ok(entries) = fs::read_dir(sys_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.extension().and_then(|s| s.to_str()) == Some("skdict") {
-                                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-                                let meta = entry.metadata().ok();
-                                let sz =
-                                    meta.map(|m| m.len() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0);
-                                println!(
-                                    "  [system] {:<6} ({:.2} MiB) -> {}",
-                                    stem,
-                                    sz,
-                                    path.display()
-                                );
-                                found = true;
-                            }
-                        }
-                    }
+            scoped_dirs.push(("[user]", user_dir));
+            for sys in ["/usr/local/share/smartkey/dicts", "/usr/share/smartkey/dicts"] {
+                let p = PathBuf::from(sys);
+                if !scoped_dirs.iter().any(|(_, d)| d == &p) {
+                    scoped_dirs.push(("[system]", p));
                 }
+            }
+
+            let (lines, found) = render_dict_list_lines(&scoped_dirs, verbose);
+            for line in lines {
+                println!("{line}");
             }
             if !found {
                 #[cfg(feature = "bundled-en")]
@@ -2736,11 +2803,16 @@ fn cmd_dict(args: &[String]) -> CliResult {
                 fs::copy(&src_path, &staged_path).map_err(|e| CliError::Runtime(e.to_string()))?;
             }
 
-            validate_and_install_skdict(&staged_path, &target_path)?;
+            let hdr = validate_and_install_skdict(&staged_path, &target_path, lang)?;
 
             let reloaded = notify_fcitx5_reload();
             println!(
-                "Successfully installed {lang}.skdict to {} ({})",
+                "Successfully installed {lang}.skdict (v{}.{}.{}, tier={}, variants=[{}]) to {} ({})",
+                hdr.pack_version[0],
+                hdr.pack_version[1],
+                hdr.pack_version[2],
+                tier_label(hdr.tier),
+                hdr.variants.join(", "),
                 target_path.display(),
                 if reloaded {
                     "Fcitx5 reloaded"
@@ -2786,9 +2858,9 @@ fn cmd_dict(args: &[String]) -> CliResult {
                 ));
             }
             let lang = args.get(1).map(String::as_str).unwrap_or("en");
-            println!("Checking GitHub releases from segfawlt/smartkey-dicts for '{lang}'...");
+            println!("Checking GitHub releases from segfawlt/smartkey for '{lang}'...");
             let url = format!(
-                "https://github.com/segfawlt/smartkey-dicts/releases/latest/download/{lang}.skdict"
+                "https://github.com/segfawlt/smartkey/releases/latest/download/{lang}.skdict"
             );
             let user_dir = smartkey_core::default_user_dict_dir();
             fs::create_dir_all(&user_dir).map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -2801,10 +2873,15 @@ fn cmd_dict(args: &[String]) -> CliResult {
                 .status();
             match status {
                 Ok(s) if s.success() => {
-                    validate_and_install_skdict(&staged_path, &target_path)?;
+                    let hdr = validate_and_install_skdict(&staged_path, &target_path, lang)?;
                     let reloaded = notify_fcitx5_reload();
                     println!(
-                        "Updated {lang}.skdict at {} ({})",
+                        "Updated {lang}.skdict (v{}.{}.{}, tier={}, variants=[{}]) at {} ({})",
+                        hdr.pack_version[0],
+                        hdr.pack_version[1],
+                        hdr.pack_version[2],
+                        tier_label(hdr.tier),
+                        hdr.variants.join(", "),
                         target_path.display(),
                         if reloaded {
                             "Fcitx5 reloaded"
@@ -3307,7 +3384,6 @@ fn cmd_repl(args: &[String]) -> CliResult {
         i += 1;
     }
 
-    let scorer = load_scorer()?;
     let store = if in_memory {
         RuleStore::in_memory(Preset::Balanced)
     } else {
@@ -3321,7 +3397,7 @@ fn cmd_repl(args: &[String]) -> CliResult {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<in-memory>".to_string());
 
-    let mut engine = SmartKeyEngine::new(Some(scorer), store);
+    let mut engine = SmartKeyEngine::new_auto(store);
     let mut session = SmartKeySession::new();
     session.set_lang(lang);
     session.set_app(Some("smartkey-repl"));
@@ -4127,6 +4203,113 @@ mod tests {
         });
         assert!(prose_line.contains("APP_PROFILE"));
         assert!(!prose_line.contains("APP_BYPASS"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_dict_install_validates_v3_header_lang_and_lists_legacy_and_manifest() {
+        use std::collections::BTreeMap;
+        use smartkey_core::lexicon::{
+            build_words_fst_bytes, serialize_skdict_v3, LanguageRules, PackHeader, PackTier,
+            SkdictV3Payload, SourceManifestEntry, WordMeta,
+        };
+
+        let dir = env::temp_dir().join(format!("smartkey_cli_dict_v3_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let staged = dir.join("staged_es.skdict");
+        let target = dir.join("installed_es.skdict");
+        let legacy = dir.join("en.skdict");
+
+        let words_fst = build_words_fst_bytes(&[(
+            "hola",
+            WordMeta {
+                freq0: 210,
+                freq1: 0,
+                variant_mask: 0x01,
+                flags: 0,
+                word_id: 1,
+            },
+        )]);
+        let es_hdr = PackHeader {
+            lang: "es".to_string(),
+            pack_version: [0, 3, 4],
+            tier: PackTier::Data,
+            variants: vec!["es_ES".to_string()],
+            freq_slots: vec![0x01],
+            default_variant_idx: 0,
+            feature_flags: 0,
+        };
+        let manifest = vec![SourceManifestEntry {
+            name: "es_aosp".to_string(),
+            sha256: [0x5A; 32],
+            license: "Apache-2.0".to_string(),
+        }];
+        let es_bytes = serialize_skdict_v3(&SkdictV3Payload {
+            header: &es_hdr,
+            words_fst: &words_fst,
+            typos_fst: &[],
+            typo_pool: &[],
+            variant_rewrites: &[],
+            bigrams: &BTreeMap::new(),
+            smash_entries: &[],
+            proper_nouns: &[],
+            shorthand: &[],
+            slang_set: &[],
+            rules: Some(&LanguageRules::default()),
+            syllable_dict: &[],
+            source_manifest: &manifest,
+        });
+
+        // Wrong expected lang must fail and clean up staged file.
+        fs::write(&staged, &es_bytes).unwrap();
+        let err = validate_and_install_skdict(&staged, &target, "fr").unwrap_err();
+        assert!(
+            matches!(err, CliError::Runtime(ref m) if m.contains("pack language mismatch")),
+            "got {err:?}"
+        );
+        assert!(!staged.exists());
+        assert!(!target.exists());
+
+        // Legacy SKDICT02 must fail with unsupported legacy v2 message.
+        fs::write(&legacy, b"SKDICT02olddata").unwrap();
+        fs::write(&staged, b"SKDICT02olddata").unwrap();
+        let err_v2 = validate_and_install_skdict(&staged, &target, "en").unwrap_err();
+        assert!(
+            matches!(err_v2, CliError::Runtime(ref m) if m.contains("legacy .skdict v2 format is unsupported")),
+            "got {err_v2:?}"
+        );
+        assert!(!staged.exists());
+
+        // Matching expected lang installs cleanly and returns PackHeader.
+        fs::write(&staged, &es_bytes).unwrap();
+        let installed_hdr = validate_and_install_skdict(&staged, &target, "es").unwrap();
+        assert_eq!(installed_hdr, es_hdr);
+        assert!(target.exists());
+
+        // `dict list -v` displays legacy notice and SOURCE_MANIFEST.
+        let (lines, found) = render_dict_list_lines(&[("[user]", dir.clone())], true);
+        assert!(found);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("[legacy v2 — ignored; run: smartkey dict update en]"),
+            "lines:\n{joined}"
+        );
+        assert!(
+            joined.contains("es     v0.3.4 (data, variants=[es_ES]"),
+            "lines:\n{joined}"
+        );
+        assert!(
+            joined.contains("source: es_aosp sha256=") && joined.contains("license=Apache-2.0"),
+            "lines:\n{joined}"
+        );
+
+        let notice_line = format_diagnostic_event_line(&DiagnosticEvent::PackNotice {
+            notice: "legacy_pack_ignored".to_string(),
+            detail: "/tmp/en.skdict (skdict v2)".to_string(),
+        });
+        assert!(notice_line.contains("PACK_NOTICE (legacy_pack_ignored)"));
 
         let _ = fs::remove_dir_all(&dir);
     }
