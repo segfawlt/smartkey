@@ -286,7 +286,7 @@ impl EnglishScorer {
         let mut fuzzy_hits = Vec::new();
         self.lexicon.search_fuzzy(&core_lower, 1, &mut fuzzy_hits);
         for (w, meta) in fuzzy_hits {
-            if meta.is_offensive() || !meta.is_valid_for_dialect(config.dialect) {
+            if meta.is_offensive() || !self.lexicon.is_valid_meta(meta, config.dialect) {
                 continue;
             }
             let mapped = self.lexicon.map_dialect(&w, config.dialect);
@@ -976,10 +976,10 @@ impl EnglishScorer {
                 let Some(meta) = self.lexicon.lookup_word(mapped) else {
                     continue;
                 };
-                if meta.is_offensive() || !meta.is_valid_for_dialect(config.dialect) {
+                if meta.is_offensive() || !self.lexicon.is_valid_meta(meta, config.dialect) {
                     continue;
                 }
-                let freq = meta.effective_freq(config.dialect);
+                let freq = self.lexicon.effective_freq_meta(meta, config.dialect);
                 if freq == 0 {
                     continue;
                 }
@@ -1015,11 +1015,11 @@ impl EnglishScorer {
             for collapsed in generate_chatter_collapses(&core_lower) {
                 let mapped = self.lexicon.map_dialect(&collapsed, config.dialect);
                 if let Some(meta) = self.lexicon.lookup_word(mapped) {
-                    if !meta.is_offensive() && meta.is_valid_for_dialect(config.dialect) {
+                    if !meta.is_offensive() && self.lexicon.is_valid_meta(meta, config.dialect) {
                         push_candidate(
                             &mut pool,
                             mapped,
-                            meta.effective_freq(config.dialect),
+                            self.lexicon.effective_freq_meta(meta, config.dialect),
                             0.24,
                             MatchKind::SwitchChatter,
                             Some(0.44),
@@ -1051,12 +1051,12 @@ impl EnglishScorer {
                 for (w, meta) in fuzzy_hits {
                     let mapped = self.lexicon.map_dialect(&w, config.dialect);
                     let freq = if mapped == w {
-                        meta.effective_freq(config.dialect)
+                        self.lexicon.effective_freq_meta(meta, config.dialect)
                     } else {
                         self.lexicon
                             .lookup_word(mapped)
-                            .map(|m| m.effective_freq(config.dialect))
-                            .unwrap_or_else(|| meta.effective_freq(config.dialect))
+                            .map(|m| self.lexicon.effective_freq_meta(m, config.dialect))
+                            .unwrap_or_else(|| self.lexicon.effective_freq_meta(meta, config.dialect))
                     };
                     if char_len <= 4 {
                         let cost = weighted_keyboard_cost(&core_lower, mapped);
@@ -1262,7 +1262,8 @@ impl EnglishScorer {
             else {
                 continue;
             };
-            if !m1.is_valid_for_dialect(config.dialect) || !m2.is_valid_for_dialect(config.dialect)
+            if !self.lexicon.is_valid_meta(m1, config.dialect)
+                || !self.lexicon.is_valid_meta(m2, config.dialect)
             {
                 continue;
             }
@@ -1270,9 +1271,10 @@ impl EnglishScorer {
             if bg < 0.72 {
                 continue;
             }
-            let min_f = m1
-                .effective_freq(config.dialect)
-                .min(m2.effective_freq(config.dialect));
+            let min_f = self
+                .lexicon
+                .effective_freq_meta(m1, config.dialect)
+                .min(self.lexicon.effective_freq_meta(m2, config.dialect));
             let w1_fmt = if w1 == "i" && config.auto_capitalize_i {
                 "I"
             } else {
@@ -1307,9 +1309,10 @@ impl EnglishScorer {
             if bg < 0.75 {
                 continue;
             }
-            let min_f = m1
-                .effective_freq(config.dialect)
-                .min(m2.effective_freq(config.dialect));
+            let min_f = self
+                .lexicon
+                .effective_freq_meta(m1, config.dialect)
+                .min(self.lexicon.effective_freq_meta(m2, config.dialect));
             let joined = format!("{w1} {w2}");
             push_candidate(
                 &joined,

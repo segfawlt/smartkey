@@ -182,8 +182,8 @@ fn shorthand_toggle_and_slang_zero_fuzzy_pollution() {
             .unwrap_or_else(|| panic!("{slang:?} must be in lexicon"));
         assert!(meta.is_valid_for_dialect(Dialect::Mixed));
         assert_eq!(
-            meta.us_freq, 0,
-            "pure slang {slang:?} must have us_freq == 0 so it never pollutes fuzzy search"
+            meta.freq0, 0,
+            "pure slang {slang:?} must have freq0 == 0 so it never pollutes fuzzy search"
         );
     }
 }
