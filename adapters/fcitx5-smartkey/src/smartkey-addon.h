@@ -37,6 +37,34 @@ inline std::string normalizeProgramId(std::string_view raw) {
     return lower;
 }
 
+/// Extracts and normalizes the primary language subtag for `keyboard-*` IMs.
+/// Returns `""` for non-keyboard IMs, empty language codes (e.g. `keyboard-brai`),
+/// or `"vi"` (`keyboard-vn*`, which is not `fcitx5-lotus` Telex mode).
+inline std::string normalizeKeyboardLangCode(std::string_view imName,
+                                             std::string_view rawLangCode) {
+    if (!imName.starts_with("keyboard-")) {
+        return {};
+    }
+    const std::size_t sep = rawLangCode.find_first_of("_-");
+    const std::string_view primary = rawLangCode.substr(0, sep);
+    if (primary.empty()) {
+        return {};
+    }
+    std::string lang;
+    lang.reserve(primary.size());
+    for (const char ch : primary) {
+        if (ch >= 'A' && ch <= 'Z') {
+            lang.push_back(static_cast<char>(ch - 'A' + 'a'));
+        } else {
+            lang.push_back(ch);
+        }
+    }
+    if (lang == "vi") {
+        return {};
+    }
+    return lang;
+}
+
 inline bool matchesExactOrAppSegment(
     std::string_view prog,
     std::initializer_list<std::string_view> names) {
@@ -345,7 +373,7 @@ private:
     void onSurroundingTextUpdated(Event &event);
     void focusOutContext(InputContext *ic);
     void resetContext(InputContext *ic);
-    bool isEnglishKeyboardActive(InputContext *ic) const;
+    std::string resolveDirectKeyboardLang(InputContext *ic) const;
     bool isLotusActive(InputContext *ic) const;
     uint8_t classifyProfile(InputContext *ic, std::string_view appName,
                             const char **outReason = nullptr) const;

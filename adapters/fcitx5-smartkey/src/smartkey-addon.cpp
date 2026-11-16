@@ -20,6 +20,7 @@
 #include <fcitx-utils/keysym.h>
 #include <fcitx-utils/log.h>
 #include <fcitx/inputcontextmanager.h>
+#include <fcitx/inputmethodentry.h>
 
 namespace fcitx::smartkey {
 namespace {
@@ -223,12 +224,19 @@ void SmartKeyAddon::resetContext(InputContext *ic) {
     }
 }
 
-bool SmartKeyAddon::isEnglishKeyboardActive(InputContext *ic) const {
+std::string SmartKeyAddon::resolveDirectKeyboardLang(InputContext *ic) const {
     if (instance_ == nullptr || ic == nullptr) {
-        return false;
+        return {};
     }
     const std::string im = instance_->inputMethod(ic);
-    return im.starts_with("keyboard-");
+    if (const auto *entry = instance_->inputMethodEntry(ic)) {
+        return normalizeKeyboardLangCode(im, entry->languageCode());
+    }
+    if (im == "keyboard-us" || im.starts_with("keyboard-us-") ||
+        im == "keyboard-gb" || im.starts_with("keyboard-gb-")) {
+        return "en";
+    }
+    return {};
 }
 
 bool SmartKeyAddon::isLotusActive(InputContext *ic) const {
@@ -471,9 +479,10 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         return;
     }
 
-    const bool englishActive = isEnglishKeyboardActive(ic);
-    const bool lotusActive = !englishActive && isLotusActive(ic);
-    if (!englishActive && !lotusActive) {
+    const std::string keyboardLang = resolveDirectKeyboardLang(ic);
+    const bool directKeyboardActive = !keyboardLang.empty();
+    const bool lotusActive = !directKeyboardActive && isLotusActive(ic);
+    if (!directKeyboardActive && !lotusActive) {
         return;
     }
 
@@ -615,12 +624,12 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         return;
     }
 
-    // `englishActive` (`keyboard-*`):
+    // `directKeyboardActive` (`keyboard-*` with a resolved direct-keyboard language):
     if (instance_->isComposing(ic)) {
         return;
     }
     state->resetLotusTracking();
-    smartkey_session_set_lang(state->session(), "en");
+    smartkey_session_set_lang(state->session(), keyboardLang.c_str());
 
     bool isShortcutReset = false;
     uint8_t keyKind = SMARTKEY_KEY_CHAR;
@@ -843,9 +852,9 @@ void SmartKeyAddon::onSurroundingTextUpdated(Event &event) {
     if (ic == nullptr) {
         return;
     }
-    const bool englishActive = isEnglishKeyboardActive(ic);
-    const bool lotusActive = !englishActive && isLotusActive(ic);
-    if (!englishActive && !lotusActive) {
+    const bool directKeyboardActive = !resolveDirectKeyboardLang(ic).empty();
+    const bool lotusActive = !directKeyboardActive && isLotusActive(ic);
+    if (!directKeyboardActive && !lotusActive) {
         return;
     }
     if (!ic->capabilityFlags().test(CapabilityFlag::SurroundingText) ||
