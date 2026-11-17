@@ -11,8 +11,8 @@ pub mod types;
 pub mod vi_telex;
 
 pub use event_log::{
-    default_state_log_dir, resolve_home_dir, DiagnosticsConfig, EventLog, EventLogLevel,
-    LoggedDiagnosticRecord,
+    default_state_log_dir, parse_trace_filename_days, resolve_home_dir, DiagnosticsConfig,
+    EventLog, EventLogLevel, LoggedDiagnosticRecord,
 };
 pub use learner::{LearnEvent, SkipReason};
 pub use lexicon::{
@@ -28,8 +28,8 @@ pub use scorer::{
     EmptyUserRules, EnglishScorer, EvalContext, LanguageScorer, LatinScorer, UserRuleView,
 };
 pub use session::{
-    apply_key_to_buffer, KeyInput, LexiconRegistry, SessionAction, SessionOutput, SmartKeyEngine,
-    SmartKeySession,
+    apply_key_to_buffer, KeyInput, LexiconRegistry, SessionAction, SessionDebugSnapshot,
+    SessionOutput, SmartKeyEngine, SmartKeySession,
 };
 pub use store::{
     classify_builtin_program, normalize_program_id, BlockPair, CompiledRules, ConfidenceTier,

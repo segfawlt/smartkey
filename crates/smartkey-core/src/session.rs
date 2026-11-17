@@ -366,6 +366,7 @@ impl SmartKeyEngine {
     }
 
     pub fn reload_dicts(&mut self) -> bool {
+        self.store.reload_if_modified();
         let (registry, notices) = LexiconRegistry::load_default();
         self.emit_notices(notices);
         let loaded_any = registry.has_disk_pack();
@@ -946,6 +947,18 @@ enum Mode {
     },
 }
 
+/// Zero-allocation borrowed snapshot of `SmartKeySession`'s live shadow buffer and mode
+/// for the flight-recorder diagnostic trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionDebugSnapshot<'a> {
+    pub mode: &'static str,
+    pub active_buf: &'a str,
+    pub aux_text: &'a str,
+    pub prev_word: &'a str,
+    pub trailing_count: usize,
+    pub lotus_composing: bool,
+}
+
 /// Per-window (`InputContext`) shadow-buffer state machine.
 pub struct SmartKeySession {
     profile: AppProfile,
@@ -1030,6 +1043,74 @@ impl SmartKeySession {
 
     pub fn in_markdown_code(&self) -> bool {
         self.in_markdown_code
+    }
+
+    /// Returns a zero-allocation borrowed snapshot of the session's current state machine mode
+    /// and shadow buffer for flight-recorder tracing.
+    pub fn debug_snapshot(&self) -> SessionDebugSnapshot<'_> {
+        let (mode, active_buf, aux_text, trailing_count) = match &self.mode {
+            Mode::Idle => ("Idle", "", "", 0),
+            Mode::Composing {
+                buf,
+                peak_before_bs,
+                ..
+            } => (
+                "Composing",
+                buf.as_str(),
+                peak_before_bs.as_deref().unwrap_or(""),
+                0,
+            ),
+            Mode::PendingTrailingDot {
+                word,
+                peak_before_bs,
+                ..
+            } => (
+                "PendingDot",
+                word.as_str(),
+                peak_before_bs.as_deref().unwrap_or(""),
+                1,
+            ),
+            Mode::PendingSemicolon {
+                word,
+                peak_before_bs,
+                ..
+            } => (
+                "PendingSemi",
+                word.as_str(),
+                peak_before_bs.as_deref().unwrap_or(""),
+                1,
+            ),
+            Mode::AfterWord {
+                word,
+                trailing_spaces,
+                ..
+            } => ("AfterWord", word.as_str(), "", *trailing_spaces),
+            Mode::JustAutocorrected {
+                raw_typed,
+                applied,
+                trailing_boundaries,
+                ..
+            } => (
+                "JustAutocorrected",
+                applied.as_str(),
+                raw_typed.as_str(),
+                trailing_boundaries.chars().count(),
+            ),
+            Mode::EditingRestored { raw_typed, buf, .. } => {
+                ("EditingRestored", buf.as_str(), raw_typed.as_str(), 0)
+            }
+            Mode::EditingPrevious { orig_word, buf, .. } => {
+                ("EditingPrevious", buf.as_str(), orig_word.as_str(), 0)
+            }
+        };
+        SessionDebugSnapshot {
+            mode,
+            active_buf,
+            aux_text,
+            prev_word: self.prev_word.as_deref().unwrap_or(""),
+            trailing_count,
+            lotus_composing: self.lotus_composing,
+        }
     }
 
     fn reset_state_only(&mut self) {

@@ -72,6 +72,7 @@ vi_lotus = true                 # Zero-fork Vietnamese Telex typo rescue & bilin
 # Durable decision & learning provenance log (`~/.local/state/smartkey/logs/events-YYYY-MM-DD.jsonl`).
 [diagnostics]
 event_log = true                # Durable decision log on/off
+trace_log = false               # Low-overhead keystroke & screen flight recorder (smartkey trace on|off)
 log_level = "interesting"       # "interesting" | "all" ("all" = every committed word)
 keep_days = 14                  # Prune logs older than N days (0 = keep forever)
 near_miss_band = 0.5            # Log declined unknowns scoring >= band * threshold
@@ -3650,6 +3651,7 @@ impl RuleStore {
                 Some("plugins.vi_lotus")
             }
             "event_log" | "diagnostics.event_log" => Some("diagnostics.event_log"),
+            "trace_log" | "diagnostics.trace_log" => Some("diagnostics.trace_log"),
             "log_level" | "diagnostics.log_level" => Some("diagnostics.log_level"),
             "keep_days" | "diagnostics.keep_days" => Some("diagnostics.keep_days"),
             "near_miss_band" | "diagnostics.near_miss_band" => Some("diagnostics.near_miss_band"),
@@ -3677,6 +3679,7 @@ impl RuleStore {
             "settings.expand_shorthand",
             "plugins.vi_lotus",
             "diagnostics.event_log",
+            "diagnostics.trace_log",
             "diagnostics.log_level",
             "diagnostics.keep_days",
             "diagnostics.near_miss_band",
@@ -3715,6 +3718,7 @@ impl RuleStore {
             "settings.expand_shorthand" => sc.expand_shorthand.to_string(),
             "plugins.vi_lotus" => c.vi_lotus_enabled.to_string(),
             "diagnostics.event_log" => c.diagnostics.event_log.to_string(),
+            "diagnostics.trace_log" => c.diagnostics.trace_log.to_string(),
             "diagnostics.log_level" => match c.diagnostics.log_level {
                 EventLogLevel::Interesting => "interesting".to_string(),
                 EventLogLevel::All => "all".to_string(),
@@ -3845,6 +3849,9 @@ impl RuleStore {
             "plugins.vi_lotus" => TomlPatch::Bool("plugins", "vi_lotus", parse_bool(raw_value)?),
             "diagnostics.event_log" => {
                 TomlPatch::Bool("diagnostics", "event_log", parse_bool(raw_value)?)
+            }
+            "diagnostics.trace_log" => {
+                TomlPatch::Bool("diagnostics", "trace_log", parse_bool(raw_value)?)
             }
             "diagnostics.log_level" => {
                 let s = match raw_value.trim().to_ascii_lowercase().as_str() {
@@ -4063,6 +4070,9 @@ impl RuleStore {
         if let Some(diag) = doc.get("diagnostics").and_then(Item::as_table) {
             if let Some(b) = diag.get("event_log").and_then(Item::as_bool) {
                 out.diagnostics.event_log = b;
+            }
+            if let Some(b) = diag.get("trace_log").and_then(Item::as_bool) {
+                out.diagnostics.trace_log = b;
             }
             if let Some(lvl) = diag.get("log_level").and_then(Item::as_str) {
                 out.diagnostics.log_level = EventLogLevel::parse(lvl);

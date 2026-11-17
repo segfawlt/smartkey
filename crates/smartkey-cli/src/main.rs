@@ -1,11 +1,12 @@
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use smartkey_core::event_log::current_epoch_ms;
 use smartkey_core::{
     apply_key_to_buffer, normalize_program_id, peek_skdict_header_and_manifest, AppProfile,
@@ -187,6 +188,7 @@ fn inspect_im_environment() -> (bool, Vec<String>) {
 struct StatusJson {
     enabled: bool,
     vi_lotus_enabled: bool,
+    trace_log: bool,
     fcitx5_running: bool,
     addon_library: Option<String>,
     rules_path: String,
@@ -265,6 +267,7 @@ fn cmd_status(args: &[String]) -> CliResult {
         let payload = StatusJson {
             enabled: c.enabled,
             vi_lotus_enabled: c.vi_lotus_enabled,
+            trace_log: c.diagnostics.trace_log,
             fcitx5_running: fcitx_up,
             addon_library: addon_so.map(|p| p.display().to_string()),
             rules_path: expected_rules_path.display().to_string(),
@@ -295,6 +298,14 @@ fn cmd_status(args: &[String]) -> CliResult {
             "ENABLED (vi-lotus)"
         } else {
             "DISABLED (vi-lotus)"
+        }
+    );
+    println!(
+        "Trace Recorder       : {}",
+        if c.diagnostics.trace_log {
+            "ENABLED (flight-recorder active)"
+        } else {
+            "disabled (run `smartkey trace on` to record)"
         }
     );
     println!(
@@ -2370,6 +2381,549 @@ fn cmd_log(args: &[String]) -> CliResult {
     Ok(())
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct TraceRecord {
+    v: u8,
+    ts_ms: u64,
+    mono_ms: u64,
+    dt_ms: u64,
+    ic: u32,
+    app: String,
+    fe: String,
+    im: String,
+    ev: String,
+    out: String,
+    sym: Option<String>,
+    code: Option<u32>,
+    mods: Option<u32>,
+    ch: Option<String>,
+    del: Option<u32>,
+    txt: Option<String>,
+    s0: String,
+    s1: Option<String>,
+    burst: u8,
+    act: u8,
+    pend: Option<String>,
+    q: Option<u32>,
+    sync: u8,
+    scr: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TraceFileJson {
+    name: String,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct TraceStatusJson {
+    trace_log: bool,
+    rules_path: String,
+    initialized: bool,
+    log_dir: String,
+    file_count: usize,
+    total_bytes: u64,
+    files: Vec<TraceFileJson>,
+}
+
+struct TraceFileEntry {
+    utc_days: i64,
+    order: u8,
+    name: String,
+    path: PathBuf,
+    bytes: u64,
+}
+
+fn discover_trace_files(dir: &Path) -> io::Result<Vec<TraceFileEntry>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(utc_days) = smartkey_core::parse_trace_filename_days(&name) else {
+            continue;
+        };
+        let order = if name.ends_with(".jsonl.1") { 0 } else { 1 };
+        let path = entry.path();
+        let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        files.push(TraceFileEntry {
+            utc_days,
+            order,
+            name,
+            path,
+            bytes,
+        });
+    }
+    files.sort_by(|a, b| {
+        a.utc_days
+            .cmp(&b.utc_days)
+            .then_with(|| a.order.cmp(&b.order))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(files)
+}
+
+fn format_trace_line(rec: &TraceRecord) -> String {
+    let ts_str = format!(
+        "{}.{:03}",
+        format_local_timestamp(rec.ts_ms),
+        rec.ts_ms % 1000
+    );
+    let app_tag = if rec.app.is_empty() { "-" } else { &rec.app };
+    let fe_tag = if rec.fe.is_empty() { "-" } else { &rec.fe };
+    let im_tag = if rec.im.is_empty() { "-" } else { &rec.im };
+
+    let mut parts = vec![
+        ts_str,
+        format!("+{}ms", rec.dt_ms),
+        format!("ic#{}", rec.ic),
+        format!("{app_tag}({fe_tag}/{im_tag})"),
+        rec.ev.to_ascii_uppercase(),
+        rec.out.clone(),
+    ];
+
+    if let Some(del) = rec.del {
+        parts.push(format!("del={del}"));
+    }
+    if let Some(ref txt) = rec.txt {
+        parts.push(format!("txt={txt:?}"));
+    }
+    if let Some(ref ch) = rec.ch {
+        parts.push(format!("ch={ch:?}"));
+    } else if let Some(ref sym) = rec.sym {
+        if let Some(mods) = rec.mods.filter(|&m| m != 0) {
+            parts.push(format!("sym={sym}+0x{mods:x}"));
+        } else {
+            parts.push(format!("sym={sym}"));
+        }
+    }
+
+    let state_str = match rec.s1.as_deref() {
+        Some(s1) if !s1.is_empty() && s1 != rec.s0 => format!("{} -> {s1}", rec.s0),
+        _ => rec.s0.clone(),
+    };
+    if !state_str.is_empty() {
+        parts.push(state_str);
+    }
+
+    let mut flags = format!("b={} a={}", rec.burst, rec.act);
+    if let Some(ref pend) = rec.pend {
+        flags.push_str(&format!(" pend={pend:?}"));
+    }
+    if let Some(q) = rec.q {
+        flags.push_str(&format!(" q={q}"));
+    }
+    flags.push_str(&format!(" sy={}", rec.sync));
+    parts.push(format!("[{flags}]"));
+
+    if let Some(ref scr) = rec.scr {
+        parts.push(format!("scr={scr:?}"));
+    }
+
+    parts.join(" ")
+}
+
+fn query_trace_tail(
+    log_dir: &Path,
+    start_ms: Option<u64>,
+    end_ms: Option<u64>,
+    app_filter: Option<&str>,
+    grep_pat: Option<&str>,
+    format_human: bool,
+    limit: usize,
+) -> Result<(usize, VecDeque<(String, String)>), CliError> {
+    let start_days = start_ms.map(|ms| (ms / 86_400_000) as i64 - 1);
+    let end_days = end_ms.map(|ms| (ms / 86_400_000) as i64 + 1);
+
+    let files = discover_trace_files(log_dir).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let mut total_matching = 0usize;
+    let mut ring: VecDeque<(String, String)> = VecDeque::with_capacity(limit.min(4096));
+
+    for file in files {
+        if let Some(lo) = start_days {
+            if file.utc_days < lo {
+                continue;
+            }
+        }
+        if let Some(hi) = end_days {
+            if file.utc_days > hi {
+                continue;
+            }
+        }
+        let f = fs::File::open(&file.path).map_err(|e| CliError::Runtime(e.to_string()))?;
+        let reader = io::BufReader::new(f);
+        for line_res in reader.lines() {
+            let Ok(raw_line) = line_res else {
+                break;
+            };
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<TraceRecord>(trimmed) else {
+                continue;
+            };
+            if let Some(s) = start_ms {
+                if rec.ts_ms < s {
+                    continue;
+                }
+            }
+            if let Some(e) = end_ms {
+                if rec.ts_ms >= e {
+                    continue;
+                }
+            }
+            if let Some(pat) = app_filter {
+                if !rec.app.to_lowercase().contains(pat) {
+                    continue;
+                }
+            }
+            let formatted = if grep_pat.is_some() || format_human {
+                format_trace_line(&rec)
+            } else {
+                String::new()
+            };
+            if let Some(pat) = grep_pat {
+                if !trimmed.to_lowercase().contains(pat)
+                    && !formatted.to_lowercase().contains(pat)
+                {
+                    continue;
+                }
+            }
+
+            total_matching += 1;
+            if limit > 0 {
+                if ring.len() == limit {
+                    ring.pop_front();
+                }
+                ring.push_back((trimmed.to_string(), formatted));
+            }
+        }
+    }
+
+    Ok((total_matching, ring))
+}
+
+fn print_trace_help() {
+    println!(
+        "USAGE:\n  \
+         smartkey trace [show|tail] [--today|--yesterday|--since <spec>] [--app <app>] [--grep <substr>] [--json] [-n|--limit <N>] [--dir <path>] [--log-dir <path>]\n  \
+         smartkey trace on|off [--dir <path>]\n  \
+         smartkey trace status [--json] [--dir <path>] [--log-dir <path>]\n  \
+         smartkey trace clear [--dir <path>] [--log-dir <path>]\n\n\
+         Control or inspect the ultra-low-overhead Fcitx5 flight-recorder trace log.\n\
+         Bypassed apps, terminals, password, URL, email, and numeric inputs are never traced.\n\
+         Trace JSONL logs live in: {}",
+        smartkey_core::default_state_log_dir().display()
+    );
+}
+
+fn cmd_trace(args: &[String]) -> CliResult {
+    let mut dir = default_config_dir();
+    let mut log_dir: Option<PathBuf> = None;
+    let mut limit: usize = 80;
+    let mut limit_set = false;
+    let mut as_json = false;
+    let mut clear_flag = false;
+    let mut today = false;
+    let mut yesterday = false;
+    let mut since_raw: Option<String> = None;
+    let mut grep_pat: Option<String> = None;
+    let mut app_filter: Option<String> = None;
+    let mut pos: Vec<&str> = Vec::new();
+    let mut end_of_flags = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if end_of_flags {
+            pos.push(arg);
+            i += 1;
+            continue;
+        }
+        match arg {
+            "--help" | "-h" => {
+                print_trace_help();
+                return Ok(());
+            }
+            "--" => {
+                end_of_flags = true;
+            }
+            "--dir" => {
+                i += 1;
+                let p = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--dir requires a path".to_string()))?;
+                dir = PathBuf::from(p);
+            }
+            "--log-dir" => {
+                i += 1;
+                let p = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--log-dir requires a path".to_string()))?;
+                log_dir = Some(PathBuf::from(p));
+            }
+            "--limit" | "-n" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--limit requires a number".to_string()))?;
+                limit = raw.parse::<usize>().map_err(|_| {
+                    CliError::Usage(format!("invalid --limit {raw:?} (expected integer)"))
+                })?;
+                limit_set = true;
+            }
+            "--since" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| {
+                    CliError::Usage(
+                        "--since requires a duration (e.g. 30m, 2h, 7d) or YYYY-MM-DD".to_string(),
+                    )
+                })?;
+                since_raw = Some(raw.clone());
+            }
+            "--grep" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--grep requires a pattern".to_string()))?;
+                grep_pat = Some(raw.to_lowercase());
+            }
+            "--app" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--app requires an app name".to_string()))?;
+                app_filter = Some(raw.to_lowercase());
+            }
+            "--today" => {
+                today = true;
+            }
+            "--yesterday" => {
+                yesterday = true;
+            }
+            "--json" => {
+                as_json = true;
+            }
+            "--clear" => {
+                clear_flag = true;
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag {other} (run `smartkey trace --help` for usage)"
+                )));
+            }
+            other => pos.push(other),
+        }
+        i += 1;
+    }
+
+    if pos.len() > 1 {
+        return Err(CliError::Usage(format!(
+            "unexpected argument {:?} (run `smartkey trace --help` for usage)",
+            pos[1]
+        )));
+    }
+
+    let time_flags_count =
+        usize::from(today) + usize::from(yesterday) + usize::from(since_raw.is_some());
+    if time_flags_count > 1 {
+        return Err(CliError::Usage(
+            "--today, --yesterday, and --since are mutually exclusive".to_string(),
+        ));
+    }
+
+    let action = if clear_flag {
+        match pos.first().copied() {
+            None | Some("clear") => "clear",
+            Some(other) => {
+                return Err(CliError::Usage(format!(
+                    "--clear cannot be combined with subcommand {other:?}"
+                )));
+            }
+        }
+    } else {
+        pos.first().copied().unwrap_or("show")
+    };
+
+    let effective_log_dir = log_dir
+        .clone()
+        .unwrap_or_else(smartkey_core::default_state_log_dir);
+    let has_show_filters = time_flags_count > 0
+        || grep_pat.is_some()
+        || app_filter.is_some()
+        || limit_set;
+
+    match action {
+        "on" | "enable" | "off" | "disable" => {
+            if has_show_filters || as_json || log_dir.is_some() {
+                return Err(CliError::Usage(format!(
+                    "`smartkey trace {action}` only accepts [--dir <path>]"
+                )));
+            }
+            let enable = matches!(action, "on" | "enable");
+            let mut store = load_rule_store_mut(&dir, Preset::Balanced)?;
+            let (_, effective) = store
+                .set_setting("diagnostics.trace_log", if enable { "true" } else { "false" })
+                .map_err(map_store_err)?;
+            let reloaded = notify_fcitx5_reload();
+            println!(
+                "Trace recorder {} (diagnostics.trace_log = {effective}, {})",
+                if enable { "enabled" } else { "disabled" },
+                if reloaded {
+                    "Fcitx5 reloaded"
+                } else {
+                    "saved to rules.toml; will apply on next focus change"
+                }
+            );
+            if enable {
+                println!(
+                    "Privacy guarantee: bypass apps, terminals, password, URL, email, and numeric fields are never traced."
+                );
+                println!("Log directory: {}", effective_log_dir.display());
+            }
+            Ok(())
+        }
+        "status" => {
+            if has_show_filters {
+                return Err(CliError::Usage(
+                    "`smartkey trace status` does not accept query/limit filters".to_string(),
+                ));
+            }
+            let (store, initialized) = load_rule_store_readonly(&dir, Preset::Balanced)?;
+            let enabled = store.compiled().diagnostics.trace_log;
+            let expected_rules_path = dir.join("rules.toml");
+            let files = discover_trace_files(&effective_log_dir)
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            let total_bytes: u64 = files.iter().map(|f| f.bytes).sum();
+
+            if as_json {
+                let payload = TraceStatusJson {
+                    trace_log: enabled,
+                    rules_path: expected_rules_path.display().to_string(),
+                    initialized,
+                    log_dir: effective_log_dir.display().to_string(),
+                    file_count: files.len(),
+                    total_bytes,
+                    files: files
+                        .into_iter()
+                        .map(|f| TraceFileJson {
+                            name: f.name,
+                            bytes: f.bytes,
+                        })
+                        .collect(),
+                };
+                println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                return Ok(());
+            }
+
+            println!("=== SmartKey Trace Recorder ===");
+            println!(
+                "State                : {}",
+                if enabled { "ENABLED" } else { "DISABLED" }
+            );
+            println!(
+                "Rules File           : {}",
+                if initialized {
+                    expected_rules_path.display().to_string()
+                } else {
+                    format!("{} (not initialized yet)", expected_rules_path.display())
+                }
+            );
+            println!("Log Directory        : {}", effective_log_dir.display());
+            println!(
+                "Trace Files          : {} file(s), {} bytes total",
+                files.len(),
+                total_bytes
+            );
+            for f in &files {
+                println!("  {}  ({} bytes)", f.name, f.bytes);
+            }
+            Ok(())
+        }
+        "clear" => {
+            if has_show_filters || as_json {
+                return Err(CliError::Usage(
+                    "`smartkey trace clear` only accepts [--dir <path>] [--log-dir <path>]"
+                        .to_string(),
+                ));
+            }
+            let removed = EventLog::clear_trace_files(&effective_log_dir)
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            let _ = notify_fcitx5_reload();
+            println!(
+                "Removed {removed} trace file(s) from {}",
+                effective_log_dir.display()
+            );
+            Ok(())
+        }
+        "show" | "tail" => {
+            let (store, _) = load_rule_store_readonly(&dir, Preset::Balanced)?;
+            let enabled = store.compiled().diagnostics.trace_log;
+            let now_ms = current_epoch_ms();
+            let (start_ms, end_ms) = if today {
+                (Some(local_midnight_epoch_ms(now_ms, 0)), None)
+            } else if yesterday {
+                (
+                    Some(local_midnight_epoch_ms(now_ms, -1)),
+                    Some(local_midnight_epoch_ms(now_ms, 0)),
+                )
+            } else if let Some(ref raw_since) = since_raw {
+                (Some(parse_since_spec(raw_since, now_ms)?), None)
+            } else {
+                (None, None)
+            };
+
+            let (total_matching, ring) = query_trace_tail(
+                &effective_log_dir,
+                start_ms,
+                end_ms,
+                app_filter.as_deref(),
+                grep_pat.as_deref(),
+                !as_json,
+                limit,
+            )?;
+
+            if as_json {
+                for (raw_line, _) in &ring {
+                    println!("{raw_line}");
+                }
+                return Ok(());
+            }
+
+            println!(
+                "=== SmartKey Flight-Recorder Trace ({}) ===",
+                if enabled { "ENABLED" } else { "DISABLED" }
+            );
+            println!("Log Directory        : {}", effective_log_dir.display());
+            println!(
+                "Matching Records     : {} total (showing {}, oldest -> newest)",
+                total_matching,
+                ring.len()
+            );
+            if ring.is_empty() {
+                println!(
+                    "\n(no matching trace records; run `smartkey trace on` to start recording)"
+                );
+                return Ok(());
+            }
+            println!();
+            for (_, formatted) in &ring {
+                println!("  {formatted}");
+            }
+            Ok(())
+        }
+        other => Err(CliError::Usage(format!(
+            "unknown trace subcommand {other:?} (run `smartkey trace --help` for usage)"
+        ))),
+    }
+}
+
 fn parse_dialect_flag(raw: &str) -> Result<Dialect, CliError> {
     match raw.trim() {
         "mixed" | "Mixed" | "auto" => Ok(Dialect::Mixed),
@@ -3524,6 +4078,8 @@ COMMANDS:
   reload                                                 Reload configuration & dictionary packs in Fcitx5
   log [fixed|manual|unfixed] [--today|--yesterday|--since <spec>] [--grep <p>] [--json] [-n <N>] [--clear]
                                                          Query diagnostic counters & durable JSONL event logs
+  trace [show|on|off|status|clear] [--app <a>] [--since <spec>] [--grep <p>] [--json] [-n <N>]
+                                                         Control or inspect the low-overhead Fcitx5 flight-recorder trace log
   rules [list|staged|prune|add|remove] ... [--json] [--dir <path>]
                                                          Inspect confidence, staged queues, prune stale rules, or edit rules
   config [list|get <key>|set <key> <val>] [--json]       Inspect or update settings & diagnostics in rules.toml
@@ -3541,6 +4097,7 @@ COMMANDS:
 PATHS:
   Config & brain : ~/.config/smartkey/rules.toml
   Event logs     : ~/.local/state/smartkey/logs/events-YYYY-MM-DD.jsonl
+  Trace logs     : ~/.local/state/smartkey/logs/trace-YYYY-MM-DD.jsonl
   Pass `<COMMAND> --help` for per-command options. Exit codes: 0 ok, 1 runtime error, 2 usage error.",
         env!("CARGO_PKG_VERSION")
     );
@@ -3557,6 +4114,7 @@ fn run_cli(args: &[String]) -> CliResult {
         Some("rules") => cmd_rules(&args[1..]),
         Some("config" | "cfg") => cmd_config(&args[1..]),
         Some("log") => cmd_log(&args[1..]),
+        Some("trace") => cmd_trace(&args[1..]),
         Some("explain") => cmd_explain(&args[1..]),
         Some("app" | "apps") => cmd_app(&args[1..]),
         Some("plugin" | "plugins") => cmd_plugin(&args[1..]),
@@ -3643,13 +4201,13 @@ mod tests {
 
         // Per-command `--help` exits Ok(())
         for sub in [
-            "status", "enable", "reload", "init", "rules", "config", "log", "explain", "app",
-            "plugin", "dict", "repl",
+            "status", "enable", "reload", "init", "rules", "config", "log", "trace", "explain",
+            "app", "plugin", "dict", "repl",
         ] {
             assert_eq!(run_cli(&vec_args(&[sub, "--help"])), Ok(()));
         }
 
-        // Read-only `status` / `rules` / `config` / `log` / `app` must NOT create config directories when missing
+        // Read-only `status` / `rules` / `config` / `log` / `trace` / `app` must NOT create config directories when missing
         let uninit_dir =
             env::temp_dir().join(format!("smartkey_cli_readonly_{}", std::process::id()));
         let _ = fs::remove_dir_all(&uninit_dir);
@@ -3658,6 +4216,18 @@ mod tests {
         assert_eq!(run_cli(&vec_args(&["rules", "--dir", dir_str])), Ok(()));
         assert_eq!(run_cli(&vec_args(&["config", "--dir", dir_str])), Ok(()));
         assert_eq!(run_cli(&vec_args(&["log", "--dir", dir_str])), Ok(()));
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "trace", "status", "--dir", dir_str, "--log-dir", dir_str
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "trace", "--app", "zen", "--dir", dir_str, "--log-dir", dir_str
+            ])),
+            Ok(())
+        );
         assert_eq!(run_cli(&vec_args(&["app", "--dir", dir_str])), Ok(()));
         assert_eq!(
             run_cli(&vec_args(&["app", "classify", "zcode", "--dir", dir_str])),
@@ -4314,5 +4884,121 @@ mod tests {
         assert!(notice_line.contains("PACK_NOTICE (legacy_pack_ignored)"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_trace_subcommand_lifecycle_and_filtering() {
+        let base = env::temp_dir().join(format!(
+            "smartkey_cli_trace_{}_{}",
+            std::process::id(),
+            current_epoch_ms()
+        ));
+        let cfg_dir = base.join("cfg");
+        let log_dir = base.join("logs");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&cfg_dir).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+
+        let cfg_str = cfg_dir.to_str().unwrap();
+        let log_str = log_dir.to_str().unwrap();
+
+        // 1. Toggle trace recorder on -> verify rules.toml & status
+        assert_eq!(run_cli(&vec_args(&["trace", "on", "--dir", cfg_str])), Ok(()));
+        let (store_on, _) = load_rule_store_readonly(&cfg_dir, Preset::Balanced).unwrap();
+        assert!(store_on.compiled().diagnostics.trace_log);
+        assert_eq!(
+            run_cli(&vec_args(&["status", "--json", "--dir", cfg_str])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "trace",
+                "status",
+                "--json",
+                "--dir",
+                cfg_str,
+                "--log-dir",
+                log_str
+            ])),
+            Ok(())
+        );
+
+        // 2. Write rotated `.1` + active `.jsonl` trace files plus an untouched `events-*.jsonl`
+        let rot_file = log_dir.join("trace-2026-11-18.jsonl.1");
+        let active_file = log_dir.join("trace-2026-11-18.jsonl");
+        let events_file = log_dir.join("events-2026-11-18.jsonl");
+        fs::write(
+            &rot_file,
+            concat!(
+                r#"{"v":1,"ts_ms":1794960000100,"mono_ms":100,"dt_ms":0,"ic":1,"app":"firefox","fe":"wayland_v2","im":"lotus","ev":"pre_key","out":"lotus_char","ch":"a","s0":"Idle","s1":"Composing(a)","burst":0,"act":0,"sync":1}"#,
+                "\n",
+                r#"{"v":1,"ts_ms":1794960000200,"mono_ms":200,"dt_ms":100,"ic":2,"app":"zen","fe":"wayland_v2","im":"lotus","ev":"commit","out":"lotus_boundary_replace","txt":"nsinh ","s0":"Composing(nsinh)","s1":"JustAutocorrected(nính<-nsinh,tb=1)","burst":0,"act":1,"sync":0,"scr":"cần |nsinh"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &active_file,
+            concat!(
+                r#"{"v":1,"ts_ms":1794960000300,"mono_ms":300,"dt_ms":100,"ic":2,"app":"zen","fe":"wayland_v2","im":"lotus","ev":"replace","out":"forward_bs_delay15ms","del":6,"txt":"cần nính ","s0":"JustAutocorrected(nính<-nsinh,tb=1)","burst":0,"act":0,"sync":0,"scr":"cần |sinh"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(&events_file, "{\"v\":1}\n").unwrap();
+
+        // Chronological read across .1 then .jsonl, plus app/grep/limit filters
+        let (tot_all, all_rows) = query_trace_tail(&log_dir, None, None, None, None, true, 80).unwrap();
+        assert_eq!(tot_all, 3);
+        assert_eq!(all_rows.len(), 3);
+        assert!(all_rows[0].1.contains("firefox(wayland_v2/lotus)"));
+        assert!(all_rows[1].1.contains("nsinh") && all_rows[1].1.contains("scr=\"cần |nsinh\""));
+        assert!(all_rows[2].1.contains("scr=\"cần |sinh\""));
+
+        let (tot_zen, zen_rows) =
+            query_trace_tail(&log_dir, None, None, Some("zen"), Some("nsinh"), true, 1).unwrap();
+        assert_eq!(tot_zen, 2);
+        assert_eq!(zen_rows.len(), 1);
+        assert!(zen_rows[0].1.contains("forward_bs_delay15ms"));
+
+        // CLI invocation paths for filtering & mutually exclusive flags
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "trace", "show", "--dir", cfg_str, "--log-dir", log_str
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "trace", "--app", "zen", "--grep", "nsinh", "-n", "1", "--json", "--dir",
+                cfg_str, "--log-dir", log_str
+            ])),
+            Ok(())
+        );
+        assert!(matches!(
+            run_cli(&vec_args(&["trace", "--today", "--yesterday"])),
+            Err(CliError::Usage(_))
+        ));
+
+        // 3. `trace clear` removes trace files while preserving `events-*.jsonl`
+        assert_eq!(
+            run_cli(&vec_args(&[
+                "trace", "clear", "--dir", cfg_str, "--log-dir", log_str
+            ])),
+            Ok(())
+        );
+        assert!(!rot_file.exists());
+        assert!(!active_file.exists());
+        assert!(events_file.exists());
+
+        // 4. Turn trace off
+        assert_eq!(
+            run_cli(&vec_args(&["trace", "off", "--dir", cfg_str])),
+            Ok(())
+        );
+        let (store_off, _) = load_rule_store_readonly(&cfg_dir, Preset::Balanced).unwrap();
+        assert!(!store_off.compiled().diagnostics.trace_log);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

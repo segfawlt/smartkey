@@ -6,12 +6,20 @@
 #define FCITX5_SMARTKEY_ADDON_H
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <fcntl.h>
+#include <filesystem>
 #include <initializer_list>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -334,9 +342,431 @@ struct LotusBridgeTracker {
     }
 };
 
+/// Appends RFC 8259 JSON-escaped UTF-8 to `out`, substituting `\ufffd` for invalid UTF-8 bytes
+/// so every emitted trace line is guaranteed valid UTF-8 JSON.
+inline void appendJsonEscaped(std::string &out, std::string_view sv) {
+    const std::size_t n = sv.size();
+    std::size_t i = 0;
+    while (i < n) {
+        const unsigned char b0 = static_cast<unsigned char>(sv[i]);
+        if (b0 < 0x80) {
+            switch (b0) {
+            case '"':
+                out.append("\\\"");
+                break;
+            case '\\':
+                out.append("\\\\");
+                break;
+            case '\b':
+                out.append("\\b");
+                break;
+            case '\f':
+                out.append("\\f");
+                break;
+            case '\n':
+                out.append("\\n");
+                break;
+            case '\r':
+                out.append("\\r");
+                break;
+            case '\t':
+                out.append("\\t");
+                break;
+            default:
+                if (b0 < 0x20 || b0 == 0x7F) {
+                    char buf[7]{};
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", b0);
+                    out.append(buf, 6);
+                } else {
+                    out.push_back(static_cast<char>(b0));
+                }
+                break;
+            }
+            ++i;
+            continue;
+        }
+        if (b0 >= 0xC2 && b0 <= 0xDF && i + 1 < n) {
+            const unsigned char b1 = static_cast<unsigned char>(sv[i + 1]);
+            if ((b1 & 0xC0) == 0x80) {
+                out.append(sv.data() + i, 2);
+                i += 2;
+                continue;
+            }
+        } else if (b0 >= 0xE0 && b0 <= 0xEF && i + 2 < n) {
+            const unsigned char b1 = static_cast<unsigned char>(sv[i + 1]);
+            const unsigned char b2 = static_cast<unsigned char>(sv[i + 2]);
+            const bool validLead = (b0 != 0xE0 || b1 >= 0xA0) &&
+                                   (b0 != 0xED || b1 <= 0x9F);
+            if (validLead && (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80) {
+                out.append(sv.data() + i, 3);
+                i += 3;
+                continue;
+            }
+        } else if (b0 >= 0xF0 && b0 <= 0xF4 && i + 3 < n) {
+            const unsigned char b1 = static_cast<unsigned char>(sv[i + 1]);
+            const unsigned char b2 = static_cast<unsigned char>(sv[i + 2]);
+            const unsigned char b3 = static_cast<unsigned char>(sv[i + 3]);
+            const bool validLead = (b0 != 0xF0 || b1 >= 0x90) &&
+                                   (b0 != 0xF4 || b1 <= 0x8F);
+            if (validLead && (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 &&
+                (b3 & 0xC0) == 0x80) {
+                out.append(sv.data() + i, 4);
+                i += 4;
+                continue;
+            }
+        }
+        out.append("\\ufffd");
+        ++i;
+    }
+}
+
+inline void appendJsonString(std::string &out, std::string_view sv) {
+    out.push_back('"');
+    appendJsonEscaped(out, sv);
+    out.push_back('"');
+}
+
+/// Extracts a bounded Unicode-scalar window around `cursorChars` (Fcitx5 SurroundingText uses
+/// Unicode scalar counts, not UTF-8 byte offsets), marking the cursor with `|`.
+inline std::string extractSurroundingSlice(std::string_view text,
+                                           uint32_t cursorChars,
+                                           uint32_t anchorChars,
+                                           uint32_t maxBefore = 24,
+                                           uint32_t maxAfter = 8) {
+    if (cursorChars > 16384) {
+        return "<cursor=" + std::to_string(cursorChars) +
+               " bytes=" + std::to_string(text.size()) + ">";
+    }
+
+    auto nextCpOffset = [text](std::size_t idx) -> std::size_t {
+        if (idx >= text.size()) {
+            return text.size();
+        }
+        const unsigned char b = static_cast<unsigned char>(text[idx]);
+        std::size_t len = 1;
+        if (b < 0x80) {
+            len = 1;
+        } else if ((b & 0xE0) == 0xC0) {
+            len = 2;
+        } else if ((b & 0xF0) == 0xE0) {
+            len = 3;
+        } else if ((b & 0xF8) == 0xF0) {
+            len = 4;
+        }
+        if (idx + len > text.size()) {
+            return text.size();
+        }
+        for (std::size_t k = 1; k < len; ++k) {
+            if ((static_cast<unsigned char>(text[idx + k]) & 0xC0) != 0x80) {
+                return idx + 1;
+            }
+        }
+        return idx + len;
+    };
+
+    const std::size_t ringCap = static_cast<std::size_t>(maxBefore) + 1;
+    std::size_t stackRing[65]{};
+    std::vector<std::size_t> heapRing;
+    std::size_t *ring = stackRing;
+    if (ringCap > 65) {
+        heapRing.resize(ringCap, 0);
+        ring = heapRing.data();
+    }
+
+    std::size_t cursorByte = 0;
+    for (uint32_t cp = 0; cp < cursorChars; ++cp) {
+        if (cursorByte >= text.size()) {
+            return "<invalid-cursor>";
+        }
+        cursorByte = nextCpOffset(cursorByte);
+        ring[(cp + 1) % ringCap] = cursorByte;
+    }
+
+    const bool truncatedBefore = cursorChars > maxBefore;
+    const std::size_t beforeStartByte =
+        truncatedBefore ? ring[(cursorChars - maxBefore) % ringCap] : 0;
+
+    std::size_t afterEndByte = cursorByte;
+    for (uint32_t a = 0; a < maxAfter && afterEndByte < text.size(); ++a) {
+        afterEndByte = nextCpOffset(afterEndByte);
+    }
+    const bool truncatedAfter = afterEndByte < text.size();
+
+    std::string out;
+    out.reserve((cursorByte - beforeStartByte) + (afterEndByte - cursorByte) + 24);
+    if (truncatedBefore) {
+        out.append("\xE2\x80\xA6");
+    }
+    out.append(text.substr(beforeStartByte, cursorByte - beforeStartByte));
+    out.push_back('|');
+    out.append(text.substr(cursorByte, afterEndByte - cursorByte));
+    if (truncatedAfter) {
+        out.append("\xE2\x80\xA6");
+    }
+    if (anchorChars != cursorChars) {
+        out.append(" [sel=");
+        out.append(std::to_string(anchorChars));
+        out.push_back(']');
+    }
+    return out;
+}
+
+inline std::string formatSessionCompact(const SmartKeySessionSnapshot &snap) {
+    const std::string_view mode =
+        snap.mode_utf8 != nullptr ? std::string_view(snap.mode_utf8) : "Unknown";
+    const std::string_view buf =
+        (snap.buf_utf8 != nullptr && snap.buf_byte_len > 0)
+            ? std::string_view(snap.buf_utf8, snap.buf_byte_len)
+            : std::string_view{};
+    const std::string_view aux =
+        (snap.aux_utf8 != nullptr && snap.aux_byte_len > 0)
+            ? std::string_view(snap.aux_utf8, snap.aux_byte_len)
+            : std::string_view{};
+    const std::string_view prev =
+        (snap.prev_utf8 != nullptr && snap.prev_byte_len > 0)
+            ? std::string_view(snap.prev_utf8, snap.prev_byte_len)
+            : std::string_view{};
+
+    std::string out;
+    out.reserve(mode.size() + buf.size() + aux.size() + prev.size() + 24);
+    if (mode == "Idle") {
+        out.append("Idle");
+    } else if (mode == "Composing") {
+        out.append("Composing(");
+        out.append(buf);
+        if (!aux.empty()) {
+            out.append(",peak=");
+            out.append(aux);
+        }
+        out.push_back(')');
+    } else if (mode == "PendingDot" || mode == "PendingSemi") {
+        out.append(mode);
+        out.push_back('(');
+        out.append(buf);
+        out.push_back(')');
+    } else if (mode == "AfterWord") {
+        out.append("AfterWord(");
+        out.append(buf);
+        out.append(",sp=");
+        out.append(std::to_string(snap.trailing_count));
+        out.push_back(')');
+    } else if (mode == "JustAutocorrected") {
+        out.append("JustAutocorrected(");
+        out.append(buf);
+        out.append("<-");
+        out.append(aux);
+        out.append(",tb=");
+        out.append(std::to_string(snap.trailing_count));
+        out.push_back(')');
+    } else if (mode == "EditingRestored" || mode == "EditingPrevious") {
+        out.append(mode);
+        out.push_back('(');
+        out.append(buf);
+        out.append("<-");
+        out.append(aux);
+        out.push_back(')');
+    } else {
+        out.append(mode);
+    }
+    if (!prev.empty()) {
+        out.append("[prev=");
+        out.append(prev);
+        out.push_back(']');
+    }
+    if (!snap.lotus_composing) {
+        out.append("[lc=0]");
+    }
+    return out;
+}
+
+struct SurroundingTraceDedup {
+    bool valid = false;
+    uint32_t cursor = 0;
+    uint32_t anchor = 0;
+    bool synced = false;
+    std::string slice;
+
+    bool shouldEmit(uint32_t c, uint32_t a, bool sy, std::string_view sl) {
+        if (valid && cursor == c && anchor == a && synced == sy && slice == sl) {
+            return false;
+        }
+        valid = true;
+        cursor = c;
+        anchor = a;
+        synced = sy;
+        slice.assign(sl);
+        return true;
+    }
+
+    void reset() {
+        valid = false;
+        slice.clear();
+    }
+};
+
+class TraceLogger {
+public:
+    static constexpr uint64_t kDefaultMaxFileBytes = 16ULL * 1024ULL * 1024ULL;
+
+    TraceLogger() { lineBuf_.reserve(512); }
+    ~TraceLogger() { closeIfOpen(); }
+
+    TraceLogger(const TraceLogger &) = delete;
+    TraceLogger &operator=(const TraceLogger &) = delete;
+
+    void setLogDir(std::filesystem::path dir) {
+        closeIfOpen();
+        logDir_ = std::move(dir);
+    }
+
+    void setMaxFileBytes(uint64_t maxBytes) {
+        maxFileBytes_ = maxBytes > 0 ? maxBytes : 1;
+    }
+
+    bool isOpen() const { return fd_ >= 0; }
+
+    void closeIfOpen() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+        openUtcDay_ = -1;
+        bytesWritten_ = 0;
+    }
+
+    static std::string formatUtcDate(int64_t utcDays) {
+        const int64_t z = utcDays + 719468;
+        const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+        const uint32_t doe = static_cast<uint32_t>(z - era * 146097);
+        const uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        const int64_t y = static_cast<int64_t>(yoe) + era * 400;
+        const uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        const uint32_t mp = (5 * doy + 2) / 153;
+        const uint32_t d = doy - (153 * mp + 2) / 5 + 1;
+        const uint32_t m = mp < 10 ? mp + 3 : mp - 9;
+        const int year = static_cast<int>(m <= 2 ? y + 1 : y);
+        char buf[36]{};
+        std::snprintf(buf, sizeof(buf), "%04d-%02u-%02u", year, m, d);
+        return std::string(buf);
+    }
+
+    uint64_t nextDeltaMs(uint64_t monoMs) {
+        if (!hasLastMono_) {
+            hasLastMono_ = true;
+            lastMonoMs_ = monoMs;
+            return 0;
+        }
+        const uint64_t delta = monoMs >= lastMonoMs_ ? (monoMs - lastMonoMs_) : 0;
+        lastMonoMs_ = monoMs;
+        return delta;
+    }
+
+    std::string &beginLine() {
+        lineBuf_.clear();
+        return lineBuf_;
+    }
+
+    void commitLine(uint64_t epochMs) {
+        lineBuf_.push_back('\n');
+        ensureOpen(epochMs);
+        if (fd_ < 0) {
+            return;
+        }
+        const char *ptr = lineBuf_.data();
+        std::size_t remaining = lineBuf_.size();
+        while (remaining > 0) {
+            const ssize_t n = ::write(fd_, ptr, remaining);
+            if (n > 0) {
+                const auto written = static_cast<std::size_t>(n);
+                ptr += written;
+                remaining -= written;
+                bytesWritten_ += written;
+            } else if (n < 0 && errno == EINTR) {
+                continue;
+            } else {
+                closeIfOpen();
+                break;
+            }
+        }
+    }
+
+private:
+    std::filesystem::path pathForDay(int64_t utcDay, bool rotated) const {
+        std::string name = "trace-";
+        name += formatUtcDate(utcDay);
+        name += rotated ? ".jsonl.1" : ".jsonl";
+        return logDir_ / name;
+    }
+
+    void rotateActiveFile(int64_t utcDay) {
+        closeIfOpen();
+        const auto activePath = pathForDay(utcDay, false);
+        const auto rotatedPath = pathForDay(utcDay, true);
+        std::error_code ec;
+        std::filesystem::rename(activePath, rotatedPath, ec);
+        fd_ = ::open(activePath.c_str(),
+                     O_CREAT | O_WRONLY | O_TRUNC | O_APPEND | O_CLOEXEC,
+                     0600);
+        if (fd_ >= 0) {
+            (void)::fchmod(fd_, 0600);
+            openUtcDay_ = utcDay;
+            bytesWritten_ = 0;
+        }
+    }
+
+    void ensureOpen(uint64_t epochMs) {
+        if (logDir_.empty()) {
+            return;
+        }
+        const int64_t utcDay = static_cast<int64_t>(epochMs / 86400000ULL);
+        if (fd_ >= 0 && openUtcDay_ != utcDay) {
+            closeIfOpen();
+        }
+        if (fd_ >= 0 && bytesWritten_ >= maxFileBytes_) {
+            rotateActiveFile(utcDay);
+        }
+        if (fd_ >= 0) {
+            return;
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(logDir_, ec);
+        (void)::chmod(logDir_.c_str(), 0700);
+        const auto activePath = pathForDay(utcDay, false);
+        fd_ = ::open(activePath.c_str(),
+                     O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0600);
+        if (fd_ < 0) {
+            return;
+        }
+        (void)::fchmod(fd_, 0600);
+        struct stat st{};
+        if (::fstat(fd_, &st) == 0 && st.st_size > 0) {
+            bytesWritten_ = static_cast<uint64_t>(st.st_size);
+        } else {
+            bytesWritten_ = 0;
+        }
+        openUtcDay_ = utcDay;
+        if (bytesWritten_ >= maxFileBytes_) {
+            rotateActiveFile(utcDay);
+        }
+    }
+
+    std::filesystem::path logDir_;
+    int fd_ = -1;
+    int64_t openUtcDay_ = -1;
+    uint64_t bytesWritten_ = 0;
+    uint64_t maxFileBytes_ = kDefaultMaxFileBytes;
+    uint64_t lastMonoMs_ = 0;
+    bool hasLastMono_ = false;
+    std::string lineBuf_;
+};
+
 class SmartKeyState final : public InputContextProperty {
 public:
-    SmartKeyState() : session_(smartkey_session_new()) {}
+    SmartKeyState() : session_(smartkey_session_new()) {
+        static std::atomic<uint32_t> nextId{1};
+        icId_ = nextId.fetch_add(1, std::memory_order_relaxed);
+    }
     ~SmartKeyState() override {
         cancelPendingDelayedCommit();
         if (session_ != nullptr) {
@@ -349,6 +779,7 @@ public:
     SmartKeyState &operator=(const SmartKeyState &) = delete;
 
     SmartKeySessionHandle *session() const { return session_; }
+    uint32_t icId() const { return icId_; }
 
     void armLotusBurst(uint64_t nowMs) { lotus_.armBurst(nowMs); }
     void rearmLotusBurstEcho(uint64_t nowMs) { lotus_.rearmBurstEcho(nowMs); }
@@ -372,6 +803,9 @@ public:
     bool takeLotusActivityInWord() { return lotus_.takeActivityInWord(); }
 
     void pushPostBoundaryChar(uint32_t cp) { lotus_.pushPostBoundaryChar(cp); }
+    std::size_t postBoundaryQueueLen() const {
+        return lotus_.pendingPostBoundaryChars.size();
+    }
     std::vector<uint32_t> takePostBoundaryChars() {
         return lotus_.takePostBoundaryChars();
     }
@@ -393,7 +827,17 @@ public:
 
     void markClientMutated() { surroundingSync_.markClientMutated(); }
     void markSurroundingUpdated() { surroundingSync_.markSurroundingUpdated(); }
-    void resetSurroundingSync() { surroundingSync_.reset(); }
+    void resetSurroundingSync() {
+        surroundingSync_.reset();
+        surroundDedup_.reset();
+    }
+    bool isSurroundingSynced() const {
+        return surroundingSync_.surroundingSynced;
+    }
+    bool shouldEmitSurroundTrace(uint32_t c, uint32_t a, bool sy,
+                                 std::string_view sl) {
+        return surroundDedup_.shouldEmit(c, a, sy, sl);
+    }
     bool canUseDeleteSurrounding(bool hasSurroundingCap,
                                  bool isSurroundingValid, uint32_t cursor,
                                  uint32_t deleteChars,
@@ -452,8 +896,10 @@ public:
 
 private:
     SmartKeySessionHandle *session_ = nullptr;
+    uint32_t icId_ = 0;
     LotusBridgeTracker lotus_{};
     SurroundingSyncTracker surroundingSync_{};
+    SurroundingTraceDedup surroundDedup_{};
     SelfReplaceResetGuard selfReplaceGuard_{};
     std::string pendingDelayedCommit_;
     std::unique_ptr<EventSourceTime> delayedCommitTimer_;
@@ -477,11 +923,14 @@ private:
     void onSurroundingTextUpdated(Event &event);
     void focusOutContext(InputContext *ic);
     void onInputContextReset(InputContext *ic);
+    void onSwitchInputMethod(InputContext *ic);
     void resetContext(InputContext *ic);
     std::string resolveDirectKeyboardLang(InputContext *ic) const;
     bool isLotusActive(InputContext *ic) const;
     uint8_t classifyProfile(InputContext *ic, std::string_view appName,
                             const char **outReason = nullptr) const;
+    bool isTraceActive();
+    bool canTraceContext(InputContext *ic, std::string_view appName);
     void flushPendingDelayedCommit(InputContext *ic, SmartKeyState *state);
     void applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
                               const SmartKeyAction &act);
@@ -492,6 +941,7 @@ private:
     Instance *instance_ = nullptr;
     SmartKeyEngineHandle *engine_ = nullptr;
     FactoryFor<SmartKeyState> factory_;
+    TraceLogger trace_{};
     std::vector<std::unique_ptr<HandlerTableEntry<EventHandler>>> eventWatchers_;
 };
 

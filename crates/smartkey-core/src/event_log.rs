@@ -45,6 +45,7 @@ impl EventLogLevel {
 #[serde(default)]
 pub struct DiagnosticsConfig {
     pub event_log: bool,
+    pub trace_log: bool,
     pub log_level: EventLogLevel,
     pub keep_days: u32,
     pub near_miss_band: f32,
@@ -55,6 +56,7 @@ impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
             event_log: true,
+            trace_log: false,
             log_level: EventLogLevel::Interesting,
             keep_days: 14,
             near_miss_band: 0.5,
@@ -160,9 +162,8 @@ pub fn date_string(epoch_ms: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn parse_event_filename_days(file_name: &str) -> Option<i64> {
-    let stem = file_name.strip_prefix("events-")?.strip_suffix(".jsonl")?;
-    let mut parts = stem.split('-');
+fn parse_ymd_days(ymd: &str) -> Option<i64> {
+    let mut parts = ymd.split('-');
     let y_str = parts.next()?;
     let m_str = parts.next()?;
     let d_str = parts.next()?;
@@ -176,6 +177,20 @@ fn parse_event_filename_days(file_name: &str) -> Option<i64> {
         return None;
     }
     Some(days_from_civil(y, m, d))
+}
+
+fn parse_event_filename_days(file_name: &str) -> Option<i64> {
+    let stem = file_name.strip_prefix("events-")?.strip_suffix(".jsonl")?;
+    parse_ymd_days(stem)
+}
+
+/// Parses UTC day index from `trace-YYYY-MM-DD.jsonl` or rotated `trace-YYYY-MM-DD.jsonl.1`.
+pub fn parse_trace_filename_days(file_name: &str) -> Option<i64> {
+    let rest = file_name.strip_prefix("trace-")?;
+    let stem = rest
+        .strip_suffix(".jsonl.1")
+        .or_else(|| rest.strip_suffix(".jsonl"))?;
+    parse_ymd_days(stem)
 }
 
 /// Append-only day-partitioned JSONL writer.
@@ -309,7 +324,9 @@ impl EventLog {
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
-            if let Some(file_days) = parse_event_filename_days(&name) {
+            let file_days = parse_event_filename_days(&name)
+                .or_else(|| parse_trace_filename_days(&name));
+            if let Some(file_days) = file_days {
                 if today_days - file_days >= keep_days as i64 {
                     let _ = fs::remove_file(entry.path());
                 }
@@ -317,7 +334,27 @@ impl EventLog {
         }
     }
 
-    /// Removes all `events-YYYY-MM-DD.jsonl` files in `dir`, returning the number of deleted files.
+    /// Removes all `trace-YYYY-MM-DD.jsonl*` files in `dir`, returning the number of deleted files.
+    pub fn clear_trace_files(dir: &Path) -> io::Result<usize> {
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0usize;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if parse_trace_filename_days(&name).is_some() {
+                fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Removes all `events-YYYY-MM-DD.jsonl` and `trace-YYYY-MM-DD.jsonl*` files in `dir`,
+    /// returning the number of deleted files.
     pub fn clear_all_files(dir: &Path) -> io::Result<usize> {
         if !dir.exists() {
             return Ok(0);
@@ -328,7 +365,9 @@ impl EventLog {
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
-            if parse_event_filename_days(&name).is_some() {
+            if parse_event_filename_days(&name).is_some()
+                || parse_trace_filename_days(&name).is_some()
+            {
                 fs::remove_file(entry.path())?;
                 removed += 1;
             }
@@ -481,5 +520,73 @@ mod tests {
 
         cfg.event_log = false;
         assert!(!EventLog::should_record(&cfg, &near_miss));
+    }
+
+    #[test]
+    fn trace_filenames_prune_and_clear_trace_files_preserve_event_logs() {
+        assert_eq!(
+            parse_trace_filename_days("trace-2026-11-18.jsonl"),
+            Some(days_from_civil(2026, 11, 18))
+        );
+        assert_eq!(
+            parse_trace_filename_days("trace-2026-11-18.jsonl.1"),
+            Some(days_from_civil(2026, 11, 18))
+        );
+        assert_eq!(parse_trace_filename_days("events-2026-11-18.jsonl"), None);
+        assert_eq!(parse_trace_filename_days("trace-2026-11-18.jsonl.2"), None);
+        assert_eq!(parse_trace_filename_days("trace-bad.jsonl"), None);
+
+        let dir = std::env::temp_dir().join(format!(
+            "smartkey_trace_prune_{}_{}",
+            std::process::id(),
+            current_epoch_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let old_trace = dir.join("trace-2026-10-01.jsonl");
+        let old_trace_rot = dir.join("trace-2026-10-01.jsonl.1");
+        let fresh_trace = dir.join("trace-2026-11-18.jsonl");
+        let fresh_trace_rot = dir.join("trace-2026-11-18.jsonl.1");
+        let old_events = dir.join("events-2026-10-01.jsonl");
+        let fresh_events = dir.join("events-2026-11-18.jsonl");
+        for p in [
+            &old_trace,
+            &old_trace_rot,
+            &fresh_trace,
+            &fresh_trace_rot,
+            &old_events,
+            &fresh_events,
+        ] {
+            fs::write(p, "{}\n").unwrap();
+        }
+
+        // `prune_old_files` removes stale trace + trace.1 + events files.
+        let now_ms = (days_from_civil(2026, 11, 18) as u64) * 86_400_000 + 1_000;
+        EventLog::prune_old_files(&dir, now_ms, 14);
+        assert!(!old_trace.exists());
+        assert!(!old_trace_rot.exists());
+        assert!(!old_events.exists());
+        assert!(fresh_trace.exists());
+        assert!(fresh_trace_rot.exists());
+        assert!(fresh_events.exists());
+
+        // `clear_trace_files` deletes trace-*.jsonl* while preserving events-*.jsonl.
+        let removed_trace = EventLog::clear_trace_files(&dir).unwrap();
+        assert_eq!(removed_trace, 2);
+        assert!(!fresh_trace.exists());
+        assert!(!fresh_trace_rot.exists());
+        assert!(fresh_events.exists());
+
+        // Recreate fresh trace + verify `clear_all_files` removes both events and traces.
+        fs::write(&fresh_trace, "{}\n").unwrap();
+        fs::write(&fresh_trace_rot, "{}\n").unwrap();
+        let removed_all = EventLog::clear_all_files(&dir).unwrap();
+        assert_eq!(removed_all, 3);
+        assert!(!fresh_trace.exists());
+        assert!(!fresh_trace_rot.exists());
+        assert!(!fresh_events.exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

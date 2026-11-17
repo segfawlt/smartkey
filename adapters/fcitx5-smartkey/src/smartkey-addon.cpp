@@ -34,6 +34,154 @@ uint64_t monotonicNowMs() {
             .count());
 }
 
+uint64_t epochNowMs() {
+    using namespace std::chrono;
+    return static_cast<uint64_t>(
+        duration_cast<milliseconds>(system_clock::now().time_since_epoch())
+            .count());
+}
+
+std::string encodeUtf8(uint32_t cp) {
+    std::string out;
+    if (cp <= 0x7F) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0x10FFFF) {
+        out.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+    return out;
+}
+
+std::string snapshotSessionCompact(SmartKeySessionHandle *session) {
+    if (session == nullptr) {
+        return {};
+    }
+    SmartKeySessionSnapshot snap{};
+    if (!smartkey_session_debug_snapshot(session, &snap)) {
+        return {};
+    }
+    return formatSessionCompact(snap);
+}
+
+struct TraceEventFields {
+    std::string_view ev;
+    std::string_view out;
+    bool hasKey = false;
+    Key rawKey{};
+    std::string ch;
+    bool hasDel = false;
+    uint32_t del = 0;
+    bool hasTxt = false;
+    std::string txt;
+    std::string s0;
+    std::string s1;
+    bool hasScr = false;
+    std::string scr;
+};
+
+void emitTraceRecord(TraceLogger &trace, InputContext *ic, SmartKeyState *state,
+                     std::string_view appName, std::string_view imName,
+                     uint64_t monoMs, const TraceEventFields &f) {
+    if (ic == nullptr || state == nullptr) {
+        return;
+    }
+    const uint64_t tsMs = epochNowMs();
+    const uint64_t dtMs = trace.nextDeltaMs(monoMs);
+
+    std::string &line = trace.beginLine();
+    line.append("{\"v\":1,\"ts_ms\":");
+    line.append(std::to_string(tsMs));
+    line.append(",\"mono_ms\":");
+    line.append(std::to_string(monoMs));
+    line.append(",\"dt_ms\":");
+    line.append(std::to_string(dtMs));
+    line.append(",\"ic\":");
+    line.append(std::to_string(state->icId()));
+    line.append(",\"app\":");
+    appendJsonString(line, appName);
+    line.append(",\"fe\":");
+    appendJsonString(line, ic->frontendName());
+    line.append(",\"im\":");
+    appendJsonString(line, imName);
+    line.append(",\"ev\":");
+    appendJsonString(line, f.ev);
+    line.append(",\"out\":");
+    appendJsonString(line, f.out);
+
+    if (f.hasKey) {
+        const std::string symStr = Key::keySymToString(f.rawKey.sym());
+        if (!symStr.empty()) {
+            line.append(",\"sym\":");
+            appendJsonString(line, symStr);
+        }
+        line.append(",\"code\":");
+        line.append(std::to_string(static_cast<uint32_t>(f.rawKey.code())));
+        const uint32_t mods = f.rawKey.states().toInteger();
+        if (mods != 0) {
+            line.append(",\"mods\":");
+            line.append(std::to_string(mods));
+        }
+        if (!f.ch.empty()) {
+            line.append(",\"ch\":");
+            appendJsonString(line, f.ch);
+        }
+    }
+
+    if (f.hasDel) {
+        line.append(",\"del\":");
+        line.append(std::to_string(f.del));
+    }
+    if (f.hasTxt) {
+        line.append(",\"txt\":");
+        appendJsonString(line, f.txt);
+    }
+
+    line.append(",\"s0\":");
+    appendJsonString(line, f.s0);
+    if (!f.s1.empty() && f.s1 != f.s0) {
+        line.append(",\"s1\":");
+        appendJsonString(line, f.s1);
+    }
+
+    line.append(",\"burst\":");
+    line.push_back(state->isInLotusBurst(monoMs) ? '1' : '0');
+    line.append(",\"act\":");
+    line.push_back(state->hasLotusActivityInWord() ? '1' : '0');
+    if (state->hasPendingBoundary()) {
+        line.append(",\"pend\":");
+        appendJsonString(line, encodeUtf8(state->pendingBoundaryCp()));
+    }
+    if (const std::size_t qLen = state->postBoundaryQueueLen(); qLen > 0) {
+        line.append(",\"q\":");
+        line.append(std::to_string(qLen));
+    }
+    line.append(",\"sync\":");
+    line.push_back(state->isSurroundingSynced() ? '1' : '0');
+
+    if (f.hasScr) {
+        line.append(",\"scr\":");
+        appendJsonString(line, f.scr);
+    } else if (ic->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
+               ic->surroundingText().isValid()) {
+        const auto &st = ic->surroundingText();
+        line.append(",\"scr\":");
+        appendJsonString(
+            line, extractSurroundingSlice(st.text(), st.cursor(), st.anchor()));
+    }
+
+    line.push_back('}');
+    trace.commitLine(tsMs);
+}
+
 std::filesystem::path resolveHomeDir() {
     if (const char *home = std::getenv("HOME");
         home != nullptr && home[0] != '\0') {
@@ -104,6 +252,7 @@ SmartKeyAddon::SmartKeyAddon(Instance *instance)
         return;
     }
     smartkey_engine_set_log_dir(engine_, logDir.c_str());
+    trace_.setLogDir(resolveStateLogDir());
 
     FCITX_INFO() << "SmartKey loaded (rules: " << rulesPath
                  << ", state: " << statePath << ")";
@@ -165,7 +314,11 @@ SmartKeyAddon::SmartKeyAddon(Instance *instance)
         }));
     eventWatchers_.emplace_back(instance_->watchEvent(
         EventType::InputContextSwitchInputMethod,
-        EventWatcherPhase::PreInputMethod, resetWatcher));
+        EventWatcherPhase::PreInputMethod,
+        [this](Event &event) {
+            auto &icEvent = static_cast<InputContextEvent &>(event);
+            onSwitchInputMethod(icEvent.inputContext());
+        }));
 }
 
 SmartKeyAddon::~SmartKeyAddon() {
@@ -180,6 +333,7 @@ SmartKeyAddon::~SmartKeyAddon() {
 }
 
 void SmartKeyAddon::reloadConfig() {
+    trace_.closeIfOpen();
     if (engine_ == nullptr || instance_ == nullptr) {
         return;
     }
@@ -200,12 +354,42 @@ void SmartKeyAddon::reloadConfig() {
 
 void SmartKeyAddon::save() { reloadConfig(); }
 
+bool SmartKeyAddon::isTraceActive() {
+    const bool active =
+        engine_ != nullptr && smartkey_engine_is_trace_enabled(engine_);
+    if (!active) {
+        trace_.closeIfOpen();
+    }
+    return active;
+}
+
+bool SmartKeyAddon::canTraceContext(InputContext *ic,
+                                    std::string_view appName) {
+    return ic != nullptr && isTraceActive() &&
+           classifyProfile(ic, appName, nullptr) != SMARTKEY_PROFILE_BYPASS;
+}
+
 void SmartKeyAddon::focusOutContext(InputContext *ic) {
     if (ic == nullptr || engine_ == nullptr || !factory_.registered()) {
         return;
     }
     auto *state = ic->propertyFor(&factory_);
     if (state != nullptr) {
+        const uint64_t nowMs = monotonicNowMs();
+        const bool traceEnabled = isTraceActive();
+        const std::string appName =
+            traceEnabled ? normalizeProgramId(ic->program()) : std::string{};
+        const bool traceEligible =
+            traceEnabled &&
+            classifyProfile(ic, appName, nullptr) != SMARTKEY_PROFILE_BYPASS;
+        const std::string s0 =
+            traceEligible ? snapshotSessionCompact(state->session())
+                          : std::string{};
+        const bool shouldTrace =
+            traceEligible &&
+            (!resolveDirectKeyboardLang(ic).empty() || isLotusActive(ic) ||
+             s0 != "Idle" || state->hasPendingBoundary() ||
+             state->isInLotusBurst(nowMs));
         flushPendingDelayedCommit(ic, state);
         state->clearSelfReplaceGuard();
         state->resetLotusTracking();
@@ -214,7 +398,17 @@ void SmartKeyAddon::focusOutContext(InputContext *ic) {
             SmartKeyAction unused{};
             smartkey_session_process_key(state->session(), engine_,
                                          SMARTKEY_KEY_FOCUS_LOST, 0,
-                                         monotonicNowMs(), &unused);
+                                         nowMs, &unused);
+        }
+        if (shouldTrace) {
+            TraceEventFields f{};
+            f.ev = "focus_out";
+            f.out = "executed";
+            f.s0 = s0;
+            f.s1 = snapshotSessionCompact(state->session());
+            const std::string imName =
+                instance_ != nullptr ? instance_->inputMethod(ic) : "";
+            emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
         }
     }
 }
@@ -224,10 +418,81 @@ void SmartKeyAddon::onInputContextReset(InputContext *ic) {
         return;
     }
     auto *state = ic->propertyFor(&factory_);
-    if (state != nullptr && state->shouldIgnoreClientReset(monotonicNowMs())) {
+    const uint64_t nowMs = monotonicNowMs();
+    const bool traceEnabled = isTraceActive();
+    const std::string appName =
+        traceEnabled ? normalizeProgramId(ic->program()) : std::string{};
+    const bool traceEligible =
+        traceEnabled &&
+        classifyProfile(ic, appName, nullptr) != SMARTKEY_PROFILE_BYPASS;
+    const std::string s0 =
+        (traceEligible && state != nullptr)
+            ? snapshotSessionCompact(state->session())
+            : std::string{};
+    const bool shouldTrace =
+        traceEligible && state != nullptr &&
+        (!resolveDirectKeyboardLang(ic).empty() || isLotusActive(ic) ||
+         s0 != "Idle" || state->hasPendingBoundary() ||
+         state->isInLotusBurst(nowMs));
+
+    if (state != nullptr && state->shouldIgnoreClientReset(nowMs)) {
+        if (shouldTrace) {
+            TraceEventFields f{};
+            f.ev = "ic_reset";
+            f.out = "ignored_self_guard";
+            f.s0 = s0;
+            const std::string imName =
+                instance_ != nullptr ? instance_->inputMethod(ic) : "";
+            emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+        }
         return;
     }
     resetContext(ic);
+    if (shouldTrace) {
+        TraceEventFields f{};
+        f.ev = "ic_reset";
+        f.out = "executed";
+        f.s0 = s0;
+        f.s1 = snapshotSessionCompact(state->session());
+        const std::string imName =
+            instance_ != nullptr ? instance_->inputMethod(ic) : "";
+        emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+    }
+}
+
+void SmartKeyAddon::onSwitchInputMethod(InputContext *ic) {
+    if (ic == nullptr || engine_ == nullptr || !factory_.registered()) {
+        return;
+    }
+    auto *state = ic->propertyFor(&factory_);
+    const uint64_t nowMs = monotonicNowMs();
+    const bool traceEnabled = isTraceActive();
+    const std::string appName =
+        traceEnabled ? normalizeProgramId(ic->program()) : std::string{};
+    const bool traceEligible =
+        traceEnabled &&
+        classifyProfile(ic, appName, nullptr) != SMARTKEY_PROFILE_BYPASS;
+    const std::string s0 =
+        (traceEligible && state != nullptr)
+            ? snapshotSessionCompact(state->session())
+            : std::string{};
+    const bool shouldTrace =
+        traceEligible && state != nullptr &&
+        (!resolveDirectKeyboardLang(ic).empty() || isLotusActive(ic) ||
+         s0 != "Idle" || state->hasPendingBoundary() ||
+         state->isInLotusBurst(nowMs));
+    const std::string imName =
+        shouldTrace && instance_ != nullptr ? instance_->inputMethod(ic) : "";
+
+    resetContext(ic);
+    if (shouldTrace) {
+        TraceEventFields f{};
+        f.ev = "im_switch";
+        f.out = "executed";
+        f.s0 = s0;
+        f.s1 = snapshotSessionCompact(state->session());
+        emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+    }
 }
 
 void SmartKeyAddon::resetContext(InputContext *ic) {
@@ -352,26 +617,6 @@ uint8_t SmartKeyAddon::classifyProfile(InputContext *ic,
 
 namespace {
 
-std::string encodeUtf8(uint32_t cp) {
-    std::string out;
-    if (cp <= 0x7F) {
-        out.push_back(static_cast<char>(cp));
-    } else if (cp <= 0x7FF) {
-        out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
-        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    } else if (cp <= 0xFFFF) {
-        out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
-        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    } else if (cp <= 0x10FFFF) {
-        out.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
-        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
-        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    }
-    return out;
-}
-
 uint32_t countUtf8Chars(std::string_view s) {
     uint32_t count = 0;
     for (unsigned char b : s) {
@@ -467,16 +712,38 @@ void SmartKeyAddon::flushPendingDelayedCommit(InputContext *ic,
     }
     const std::string text = state->takePendingDelayedCommit();
     if (!text.empty()) {
-        state->markSelfReplace(monotonicNowMs());
+        const uint64_t nowMs = monotonicNowMs();
+        state->markSelfReplace(nowMs);
         ScopedSelfCommit guard(state);
         state->markClientMutated();
         ic->commitString(text);
+        if (isTraceActive()) {
+            const std::string appName = normalizeProgramId(ic->program());
+            if (classifyProfile(ic, appName, nullptr) !=
+                SMARTKEY_PROFILE_BYPASS) {
+                TraceEventFields f{};
+                f.ev = "delayed_flush";
+                f.out = "committed";
+                f.hasTxt = true;
+                f.txt = text;
+                f.s0 = snapshotSessionCompact(state->session());
+                const std::string imName =
+                    instance_ != nullptr ? instance_->inputMethod(ic) : "";
+                emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+            }
+        }
     }
 }
 
 void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
                                          const SmartKeyAction &act) {
     flushPendingDelayedCommit(ic, state);
+
+    const std::string insertStr =
+        (act.insert_utf8 != nullptr && act.insert_byte_len > 0)
+            ? std::string(act.insert_utf8, act.insert_byte_len)
+            : std::string{};
+    std::string_view replaceOut;
 
     // Note: `fcitx::SurroundingText::cursor()` and `InputContext::deleteSurroundingText`
     // both operate in Unicode character counts (`surroundingtext.h:40`), matching `act.delete_chars`.
@@ -491,13 +758,13 @@ void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
                 ic->surroundingText().isValid(),
                 ic->surroundingText().cursor(), act.delete_chars,
                 ic->frontendName())) {
+            replaceOut = "delete_surround";
             ic->deleteSurroundingText(-static_cast<int>(act.delete_chars),
                                       act.delete_chars);
             state->markClientMutated();
-            if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
+            if (!insertStr.empty()) {
                 ScopedSelfCommit guard(state);
-                ic->commitString(
-                    std::string(act.insert_utf8, act.insert_byte_len));
+                ic->commitString(insertStr);
             }
         } else {
             const Key bsKey(FcitxKey_BackSpace);
@@ -506,8 +773,7 @@ void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
                 ic->forwardKey(bsKey, true);
             }
             state->markClientMutated();
-            if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
-                std::string insertStr(act.insert_utf8, act.insert_byte_len);
+            if (!insertStr.empty()) {
                 if (isWaylandFrontend(ic->frontendName()) &&
                     instance_ != nullptr) {
                     constexpr uint64_t kWaylandPostBackspaceDelayUsec = 15000;
@@ -529,25 +795,53 @@ void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
                             return false;
                         });
                     if (timer) {
-                        state->setPendingDelayedCommit(std::move(insertStr),
+                        replaceOut = "forward_bs_delay15ms";
+                        state->setPendingDelayedCommit(insertStr,
                                                        std::move(timer));
                     } else {
+                        replaceOut = "forward_bs_sync";
                         ScopedSelfCommit guard(state);
                         state->markClientMutated();
                         ic->commitString(insertStr);
                     }
                 } else {
+                    replaceOut = "forward_bs_sync";
                     ScopedSelfCommit guard(state);
                     state->markClientMutated();
                     ic->commitString(insertStr);
                 }
+            } else {
+                replaceOut = "forward_bs_sync";
             }
         }
-    } else if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
+    } else if (!insertStr.empty()) {
+        replaceOut = "insert_only";
         state->markSelfReplace(monotonicNowMs());
         ScopedSelfCommit guard(state);
         state->markClientMutated();
-        ic->commitString(std::string(act.insert_utf8, act.insert_byte_len));
+        ic->commitString(insertStr);
+    } else {
+        return;
+    }
+
+    if (isTraceActive()) {
+        const std::string appName = normalizeProgramId(ic->program());
+        if (classifyProfile(ic, appName, nullptr) != SMARTKEY_PROFILE_BYPASS) {
+            TraceEventFields f{};
+            f.ev = "replace";
+            f.out = replaceOut;
+            f.hasDel = true;
+            f.del = act.delete_chars;
+            if (!insertStr.empty()) {
+                f.hasTxt = true;
+                f.txt = insertStr;
+            }
+            f.s0 = snapshotSessionCompact(state->session());
+            const std::string imName =
+                instance_ != nullptr ? instance_->inputMethod(ic) : "";
+            emitTraceRecord(trace_, ic, state, appName, imName, monotonicNowMs(),
+                            f);
+        }
     }
 }
 
@@ -598,10 +892,32 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
     }
 
     const uint64_t nowMs = monotonicNowMs();
+    const bool trace = isTraceActive();
+    const std::string imName =
+        (trace && instance_ != nullptr) ? instance_->inputMethod(ic) : "";
+    const Key rawKey = keyEvent.rawKey();
+    const bool isModKey = rawKey.isModifier() || keyEvent.key().isModifier();
+
+    auto emitPreKey = [&](std::string_view out, const std::string &s0,
+                          const std::string &s1, const std::string &ch) {
+        if (!trace) {
+            return;
+        }
+        TraceEventFields f{};
+        f.ev = "pre_key";
+        f.out = out;
+        f.hasKey = true;
+        f.rawKey = rawKey;
+        f.ch = ch;
+        f.s0 = s0;
+        f.s1 = s1;
+        emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+    };
 
     if (lotusActive) {
         smartkey_session_set_lang(state->session(), "vi");
-        const Key rawKey = keyEvent.rawKey();
+        const std::string s0 =
+            trace ? snapshotSessionCompact(state->session()) : std::string{};
 
         // `fcitx5-lotus-server` terminates every uinput replacement burst with `FcitxKey_Pause`.
         // Re-arm the echo grace window across `Pause` (rather than clearing to 0) so chained
@@ -610,6 +926,10 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
             state->markLotusActivity();
             state->rearmLotusBurstEcho(nowMs);
             state->setSuppressPostKey(true);
+            if (trace) {
+                emitPreKey("lotus_pause", s0,
+                           snapshotSessionCompact(state->session()), {});
+            }
             return;
         }
 
@@ -625,6 +945,10 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
             state->markLotusActivity();
             state->rearmLotusBurstEcho(nowMs);
             state->setSuppressPostKey(true);
+            if (trace) {
+                emitPreKey("lotus_echo_bs", s0,
+                           snapshotSessionCompact(state->session()), {});
+            }
             return;
         }
 
@@ -632,8 +956,16 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         uint8_t keyKind = SMARTKEY_KEY_CHAR;
         uint32_t codepoint = 0;
         if (!decodeKeyEvent(keyEvent, isShortcutReset, keyKind, codepoint)) {
+            if (trace && !isModKey) {
+                emitPreKey("decode_skip", s0, s0, {});
+            }
             return;
         }
+        const std::string chUtf8 =
+            (trace && keyKind == SMARTKEY_KEY_CHAR && codepoint >= 0x20 &&
+             codepoint != 0x7F)
+                ? encodeUtf8(codepoint)
+                : std::string{};
 
         // On Wayland compositors without echoFrontend, `LotusWlrVirtualKeyboard` emits
         // precomposed non-ASCII runes or ASCII chars mapped onto `kTextKeys[0..11]` (XKB 10..21).
@@ -652,10 +984,19 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
             if (state->hasPendingBoundary()) {
                 state->appendVkBoundaryCommit(encodeUtf8(codepoint));
                 if (codepoint == state->pendingBoundaryCp()) {
+                    if (trace) {
+                        emitPreKey("vk_boundary_pass", s0,
+                                   snapshotSessionCompact(state->session()),
+                                   chUtf8);
+                    }
                     return;
                 }
             }
             state->setSuppressPostKey(true);
+            if (trace) {
+                emitPreKey("vk_synth", s0,
+                           snapshotSessionCompact(state->session()), chUtf8);
+            }
             return;
         }
 
@@ -668,12 +1009,17 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
             smartkey_session_process_key(state->session(), engine_,
                                          SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
                                          &unused);
+            if (trace) {
+                emitPreKey("shortcut_reset", s0,
+                           snapshotSessionCompact(state->session()), chUtf8);
+            }
             return;
         }
 
         // If a previous boundary key is waiting for a Lotus burst commit and the user already
         // types non-boundary letter(s) of the next word into `LotusState::bufferedKeys_`,
         // queue them for replay after `onCommitString` finishes evaluating the prior word.
+        bool boundaryAbortedNav = false;
         if (state->hasPendingBoundary()) {
             if (keyKind == SMARTKEY_KEY_CHAR &&
                 !isSmartKeyBoundaryChar(codepoint) &&
@@ -685,8 +1031,14 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
                 }
                 state->markClientMutated();
                 state->setSuppressPostKey(true);
+                if (trace) {
+                    emitPreKey("queued_post_boundary", s0,
+                               snapshotSessionCompact(state->session()),
+                               chUtf8);
+                }
                 return;
             }
+            boundaryAbortedNav = true;
             state->clearPendingBoundary();
             state->takeLotusActivityInWord();
             SmartKeyAction unused{};
@@ -710,6 +1062,11 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
             smartkey_session_process_key(state->session(), engine_,
                                          SMARTKEY_KEY_CHAR, codepoint, nowMs,
                                          &unused);
+            if (trace) {
+                emitPreKey(boundaryAbortedNav ? "boundary_aborted_nav+lotus_char"
+                                              : "lotus_char",
+                           s0, snapshotSessionCompact(state->session()), chUtf8);
+            }
             return;
         }
 
@@ -717,18 +1074,37 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         // `Enter`, `Tab`, and cursor nav: defer to `onPostKeyEvent` (if Lotus forwards) or
         // `onCommitString` (if Lotus filters the boundary to restore/commit).
         state->markClientMutated();
+        std::string_view outLabel;
         if (keyKind == SMARTKEY_KEY_CHAR && isSmartKeyBoundaryChar(codepoint)) {
             state->armLotusBurst(nowMs);
             state->setPendingBoundary(codepoint);
+            outLabel = boundaryAbortedNav
+                           ? "boundary_aborted_nav+lotus_defer_boundary"
+                           : "lotus_defer_boundary";
         } else {
             state->clearPendingBoundary();
+            outLabel = boundaryAbortedNav
+                           ? "boundary_aborted_nav+lotus_defer_other"
+                           : "lotus_defer_other";
+        }
+        if (trace) {
+            emitPreKey(outLabel, s0, snapshotSessionCompact(state->session()),
+                       chUtf8);
         }
         return;
     }
 
     // `directKeyboardActive` (`keyboard-*` with a resolved direct-keyboard language):
+    const std::string s0 =
+        trace ? snapshotSessionCompact(state->session()) : std::string{};
     if (instance_->isComposing(ic)) {
         state->markClientMutated();
+        if (trace && !isModKey) {
+            const uint32_t rawCp = Key::keySymToUnicode(rawKey.sym());
+            const std::string rawCh =
+                (rawCp >= 0x20 && rawCp != 0x7F) ? encodeUtf8(rawCp) : "";
+            emitPreKey("direct_composing_skip", s0, s0, rawCh);
+        }
         return;
     }
     state->resetLotusTracking();
@@ -738,8 +1114,16 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
     uint8_t keyKind = SMARTKEY_KEY_CHAR;
     uint32_t codepoint = 0;
     if (!decodeKeyEvent(keyEvent, isShortcutReset, keyKind, codepoint)) {
+        if (trace && !isModKey) {
+            emitPreKey("decode_skip", s0, s0, {});
+        }
         return;
     }
+    const std::string chUtf8 =
+        (trace && keyKind == SMARTKEY_KEY_CHAR && codepoint >= 0x20 &&
+         codepoint != 0x7F)
+            ? encodeUtf8(codepoint)
+            : std::string{};
 
     flushPendingDelayedCommit(ic, state);
 
@@ -749,6 +1133,10 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         smartkey_session_process_key(state->session(), engine_,
                                      SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
                                      &unused);
+        if (trace) {
+            emitPreKey("shortcut_reset", s0,
+                       snapshotSessionCompact(state->session()), chUtf8);
+        }
         return;
     }
 
@@ -756,13 +1144,25 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
     if (!smartkey_session_process_key(state->session(), engine_, keyKind,
                                       codepoint, nowMs, &act)) {
         state->markClientMutated();
+        if (trace) {
+            emitPreKey("direct_pass", s0,
+                       snapshotSessionCompact(state->session()), chUtf8);
+        }
         return;
     }
 
     if (act.kind == SMARTKEY_ACTION_REPLACE) {
+        if (trace) {
+            emitPreKey("direct_replace", s0,
+                       snapshotSessionCompact(state->session()), chUtf8);
+        }
         applyReplaceAction(ic, state, keyEvent, act);
     } else {
         state->markClientMutated();
+        if (trace) {
+            emitPreKey("direct_pass", s0,
+                       snapshotSessionCompact(state->session()), chUtf8);
+        }
     }
 }
 
@@ -781,7 +1181,29 @@ void SmartKeyAddon::onPostKeyEvent(KeyEvent &keyEvent) {
         return;
     }
 
+    const uint64_t nowMs = monotonicNowMs();
     if (state->takeSuppressPostKey()) {
+        if (isTraceActive() && !keyEvent.rawKey().isModifier() &&
+            !keyEvent.key().isModifier()) {
+            const std::string appName = normalizeProgramId(ic->program());
+            if (classifyProfile(ic, appName, nullptr) !=
+                SMARTKEY_PROFILE_BYPASS) {
+                TraceEventFields f{};
+                f.ev = "post_key";
+                f.out = "suppressed";
+                f.hasKey = true;
+                f.rawKey = keyEvent.rawKey();
+                const uint32_t rawCp =
+                    Key::keySymToUnicode(keyEvent.rawKey().sym());
+                if (rawCp >= 0x20 && rawCp != 0x7F) {
+                    f.ch = encodeUtf8(rawCp);
+                }
+                f.s0 = snapshotSessionCompact(state->session());
+                const std::string imName =
+                    instance_ != nullptr ? instance_->inputMethod(ic) : "";
+                emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+            }
+        }
         return;
     }
 
@@ -814,23 +1236,35 @@ void SmartKeyAddon::onPostKeyEvent(KeyEvent &keyEvent) {
         return;
     }
 
+    const bool trace = isTraceActive();
+    const std::string imName =
+        (trace && instance_ != nullptr) ? instance_->inputMethod(ic) : "";
+    const std::string chUtf8 =
+        (trace && keyKind == SMARTKEY_KEY_CHAR && codepoint >= 0x20 &&
+         codepoint != 0x7F)
+            ? encodeUtf8(codepoint)
+            : std::string{};
+
     // On Wayland compositors without echoFrontend, `LotusWlrVirtualKeyboard` emits the
     // boundary-restore sequence via virtual key events ending with the boundary char itself.
     if (state->hasPendingBoundary() && !state->vkBoundaryCommit().empty() &&
         keyKind == SMARTKEY_KEY_CHAR &&
         codepoint == state->pendingBoundaryCp()) {
+        const std::string s0 =
+            trace ? snapshotSessionCompact(state->session()) : std::string{};
         const uint32_t boundaryCp = state->takePendingBoundary();
         const std::string vkCommit = state->takeVkBoundaryCommit();
         const auto queuedChars = state->takePostBoundaryChars();
         state->takeLotusActivityInWord();
         state->clearLotusBurst();
 
-        const uint64_t nowMs = monotonicNowMs();
         SmartKeyAction act{};
-        if (smartkey_session_on_lotus_commit(state->session(), engine_,
+        const bool isReplace =
+            smartkey_session_on_lotus_commit(state->session(), engine_,
                                              boundaryCp, vkCommit.c_str(),
                                              nowMs, &act) &&
-            act.kind == SMARTKEY_ACTION_REPLACE) {
+            act.kind == SMARTKEY_ACTION_REPLACE;
+        if (isReplace) {
             if (act.delete_chars > 0) {
                 act.delete_chars -= 1;
             }
@@ -839,28 +1273,60 @@ void SmartKeyAddon::onPostKeyEvent(KeyEvent &keyEvent) {
             state->markClientMutated();
         }
         replayPostBoundaryChars(state, engine_, queuedChars, nowMs);
+        if (trace) {
+            TraceEventFields f{};
+            f.ev = "post_key";
+            f.out = isReplace ? "vk_boundary_replace" : "vk_boundary_pass";
+            f.hasKey = true;
+            f.rawKey = keyEvent.rawKey();
+            f.ch = chUtf8;
+            f.s0 = s0;
+            f.s1 = snapshotSessionCompact(state->session());
+            emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+        }
         return;
     }
 
     // Reaching `PostInputMethod` on a boundary/edit/nav key proves `LotusState::keyEvent`
     // forwarded this key without filtering it.
+    const std::string s0 =
+        trace ? snapshotSessionCompact(state->session()) : std::string{};
     state->clearLotusBurst();
     state->clearPendingBoundary();
     const bool lotusMutatedWord = state->takeLotusActivityInWord();
     smartkey_session_set_lotus_composing(state->session(), lotusMutatedWord);
 
-    const uint64_t nowMs = monotonicNowMs();
     SmartKeyAction act{};
-    if (!smartkey_session_process_key(state->session(), engine_, keyKind,
-                                      codepoint, nowMs, &act)) {
-        state->markClientMutated();
-        return;
-    }
-
-    if (act.kind == SMARTKEY_ACTION_REPLACE) {
+    const bool ok = smartkey_session_process_key(state->session(), engine_,
+                                                 keyKind, codepoint, nowMs,
+                                                 &act);
+    const bool isReplace = ok && act.kind == SMARTKEY_ACTION_REPLACE;
+    if (isReplace) {
+        if (trace) {
+            TraceEventFields f{};
+            f.ev = "post_key";
+            f.out = "forwarded_replace";
+            f.hasKey = true;
+            f.rawKey = keyEvent.rawKey();
+            f.ch = chUtf8;
+            f.s0 = s0;
+            f.s1 = snapshotSessionCompact(state->session());
+            emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+        }
         applyReplaceAction(ic, state, keyEvent, act);
     } else {
         state->markClientMutated();
+        if (trace) {
+            TraceEventFields f{};
+            f.ev = "post_key";
+            f.out = "forwarded_pass";
+            f.hasKey = true;
+            f.rawKey = keyEvent.rawKey();
+            f.ch = chUtf8;
+            f.s0 = s0;
+            f.s1 = snapshotSessionCompact(state->session());
+            emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+        }
     }
 }
 
@@ -873,8 +1339,26 @@ void SmartKeyAddon::onCommitString(CommitStringEvent &commitEvent) {
         return;
     }
     auto *state = ic->propertyFor(&factory_);
-    if (state == nullptr || state->session() == nullptr ||
-        state->isSelfCommitting()) {
+    if (state == nullptr || state->session() == nullptr) {
+        return;
+    }
+    if (state->isSelfCommitting()) {
+        if (isTraceActive()) {
+            const std::string appName = normalizeProgramId(ic->program());
+            if (classifyProfile(ic, appName, nullptr) !=
+                SMARTKEY_PROFILE_BYPASS) {
+                TraceEventFields f{};
+                f.ev = "commit";
+                f.out = "self_commit";
+                f.hasTxt = true;
+                f.txt = commitEvent.text();
+                f.s0 = snapshotSessionCompact(state->session());
+                const std::string imName =
+                    instance_ != nullptr ? instance_->inputMethod(ic) : "";
+                emitTraceRecord(trace_, ic, state, appName, imName,
+                                monotonicNowMs(), f);
+            }
+        }
         return;
     }
     state->markClientMutated();
@@ -884,6 +1368,22 @@ void SmartKeyAddon::onCommitString(CommitStringEvent &commitEvent) {
 
     state->markLotusActivity();
     if (!state->hasPendingBoundary()) {
+        if (isTraceActive()) {
+            const std::string appName = normalizeProgramId(ic->program());
+            if (classifyProfile(ic, appName, nullptr) !=
+                SMARTKEY_PROFILE_BYPASS) {
+                TraceEventFields f{};
+                f.ev = "commit";
+                f.out = "lotus_no_pending_boundary";
+                f.hasTxt = true;
+                f.txt = commitEvent.text();
+                f.s0 = snapshotSessionCompact(state->session());
+                const std::string imName =
+                    instance_ != nullptr ? instance_->inputMethod(ic) : "";
+                emitTraceRecord(trace_, ic, state, appName, imName,
+                                monotonicNowMs(), f);
+            }
+        }
         return;
     }
 
@@ -896,6 +1396,10 @@ void SmartKeyAddon::onCommitString(CommitStringEvent &commitEvent) {
         return;
     }
 
+    const uint64_t nowMs = monotonicNowMs();
+    const bool trace = isTraceActive();
+    const std::string imName =
+        (trace && instance_ != nullptr) ? instance_->inputMethod(ic) : "";
     const std::string &committed = commitEvent.text();
     const std::string boundaryUtf8 = encodeUtf8(state->pendingBoundaryCp());
     const std::size_t pos =
@@ -905,10 +1409,23 @@ void SmartKeyAddon::onCommitString(CommitStringEvent &commitEvent) {
         // `LotusState::replayBufferedKeys()` while the boundary key is still buffered).
         // Keep `pendingBoundary` intact and extend the burst window so the chained burst's
         // synthetic echoes stay suppressed until the boundary commit arrives.
-        state->rearmLotusBurstEcho(monotonicNowMs());
+        const std::string s0 =
+            trace ? snapshotSessionCompact(state->session()) : std::string{};
+        state->rearmLotusBurstEcho(nowMs);
+        if (trace) {
+            TraceEventFields f{};
+            f.ev = "commit";
+            f.out = "lotus_intermediate_burst";
+            f.hasTxt = true;
+            f.txt = committed;
+            f.s0 = s0;
+            emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+        }
         return;
     }
 
+    const std::string s0 =
+        trace ? snapshotSessionCompact(state->session()) : std::string{};
     smartkey_session_set_lang(state->session(), "vi");
     const std::string wordCommitPart =
         committed.substr(0, pos + boundaryUtf8.size());
@@ -919,13 +1436,13 @@ void SmartKeyAddon::onCommitString(CommitStringEvent &commitEvent) {
     state->takeLotusActivityInWord();
     state->clearLotusBurst();
 
-    const uint64_t nowMs = monotonicNowMs();
     SmartKeyAction act{};
     const bool hasAction = smartkey_session_on_lotus_commit(
         state->session(), engine_, boundaryCp, wordCommitPart.c_str(), nowMs,
         &act);
+    const bool isReplace = hasAction && act.kind == SMARTKEY_ACTION_REPLACE;
 
-    if (hasAction && act.kind == SMARTKEY_ACTION_REPLACE) {
+    if (isReplace) {
         if (afterBoundaryPart.empty()) {
             applyDeleteAndCommit(ic, state, act);
         } else {
@@ -945,6 +1462,16 @@ void SmartKeyAddon::onCommitString(CommitStringEvent &commitEvent) {
     }
 
     replayPostBoundaryChars(state, engine_, queuedChars, nowMs);
+    if (trace) {
+        TraceEventFields f{};
+        f.ev = "commit";
+        f.out = isReplace ? "lotus_boundary_replace" : "lotus_boundary_pass";
+        f.hasTxt = true;
+        f.txt = committed;
+        f.s0 = s0;
+        f.s1 = snapshotSessionCompact(state->session());
+        emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+    }
 }
 
 void SmartKeyAddon::onUpdatePreedit(Event &event) {
@@ -985,16 +1512,64 @@ void SmartKeyAddon::onSurroundingTextUpdated(Event &event) {
         return;
     }
     const uint64_t nowMs = monotonicNowMs();
+    const auto &st = ic->surroundingText();
     if (state->isSelfCommitting() ||
         (lotusActive &&
          (state->isInLotusBurst(nowMs) || state->hasPendingBoundary()))) {
+        if (isTraceActive()) {
+            const std::string appName = normalizeProgramId(ic->program());
+            if (classifyProfile(ic, appName, nullptr) !=
+                SMARTKEY_PROFILE_BYPASS) {
+                std::string slice = extractSurroundingSlice(
+                    st.text(), st.cursor(), st.anchor());
+                if (state->shouldEmitSurroundTrace(
+                        st.cursor(), st.anchor(), state->isSurroundingSynced(),
+                        slice)) {
+                    TraceEventFields f{};
+                    f.ev = "surround";
+                    f.out = "skipped_guard";
+                    f.s0 = snapshotSessionCompact(state->session());
+                    f.hasScr = true;
+                    f.scr = std::move(slice);
+                    const std::string imName =
+                        instance_ != nullptr ? instance_->inputMethod(ic) : "";
+                    emitTraceRecord(trace_, ic, state, appName, imName, nowMs,
+                                    f);
+                }
+            }
+        }
         return;
     }
     state->markSurroundingUpdated();
-    const auto &st = ic->surroundingText();
+    const bool trace = isTraceActive();
+    const std::string s0 =
+        trace ? snapshotSessionCompact(state->session()) : std::string{};
     smartkey_session_reconcile_surrounding(state->session(), engine_,
                                            st.text().c_str(), st.cursor(),
                                            nowMs);
+    if (trace) {
+        const std::string appName = normalizeProgramId(ic->program());
+        if (classifyProfile(ic, appName, nullptr) != SMARTKEY_PROFILE_BYPASS) {
+            const std::string s1 = snapshotSessionCompact(state->session());
+            std::string slice =
+                extractSurroundingSlice(st.text(), st.cursor(), st.anchor());
+            const bool changedSession = (s0 != s1);
+            const bool dedupDiff = state->shouldEmitSurroundTrace(
+                st.cursor(), st.anchor(), state->isSurroundingSynced(), slice);
+            if (changedSession || dedupDiff) {
+                TraceEventFields f{};
+                f.ev = "surround";
+                f.out = changedSession ? "reconcile_reset" : "synced";
+                f.s0 = s0;
+                f.s1 = s1;
+                f.hasScr = true;
+                f.scr = std::move(slice);
+                const std::string imName =
+                    instance_ != nullptr ? instance_->inputMethod(ic) : "";
+                emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+            }
+        }
+    }
 }
 
 } // namespace fcitx::smartkey

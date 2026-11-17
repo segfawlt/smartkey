@@ -103,6 +103,30 @@ void smartkey_engine_log_app_event(
 );
 
 /*
+ * Low-overhead flight-recorder trace snapshot.
+ * `buf_utf8`, `aux_utf8`, and `prev_utf8` are borrowed slices owned by
+ * `SmartKeySessionHandle` (NOT NUL-terminated; inspect `*_byte_len`) and stay
+ * valid until the next mutating call on that session.
+ */
+typedef struct SmartKeySessionSnapshot {
+    const char* mode_utf8;      /* Static NUL-terminated ASCII string ("Idle", "Composing", ...) */
+    const char* buf_utf8;       /* Borrowed UTF-8 bytes (NOT NUL-terminated; use buf_byte_len) */
+    uint32_t buf_byte_len;
+    const char* aux_utf8;       /* Borrowed UTF-8 bytes (raw_typed / orig_word / peak; use aux_byte_len) */
+    uint32_t aux_byte_len;
+    const char* prev_utf8;      /* Borrowed UTF-8 bytes (prev_word; use prev_byte_len) */
+    uint32_t prev_byte_len;
+    uint32_t trailing_count;
+    bool lotus_composing;
+} SmartKeySessionSnapshot;
+
+bool smartkey_engine_is_trace_enabled(const SmartKeyEngineHandle* engine);
+bool smartkey_session_debug_snapshot(
+    const SmartKeySessionHandle* session,
+    SmartKeySessionSnapshot* out_snapshot
+);
+
+/*
  * Legacy override-only helper retained for ABI compatibility.
  * Prefer `smartkey_engine_classify_app` for unified app classification.
  */

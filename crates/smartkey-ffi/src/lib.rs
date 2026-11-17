@@ -52,6 +52,36 @@ impl Default for SmartKeyAction {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SmartKeySessionSnapshot {
+    pub mode_utf8: *const c_char,
+    pub buf_utf8: *const c_char,
+    pub buf_byte_len: u32,
+    pub aux_utf8: *const c_char,
+    pub aux_byte_len: u32,
+    pub prev_utf8: *const c_char,
+    pub prev_byte_len: u32,
+    pub trailing_count: u32,
+    pub lotus_composing: bool,
+}
+
+impl Default for SmartKeySessionSnapshot {
+    fn default() -> Self {
+        Self {
+            mode_utf8: c"Idle".as_ptr(),
+            buf_utf8: c"".as_ptr(),
+            buf_byte_len: 0,
+            aux_utf8: c"".as_ptr(),
+            aux_byte_len: 0,
+            prev_utf8: c"".as_ptr(),
+            prev_byte_len: 0,
+            trailing_count: 0,
+            lotus_composing: true,
+        }
+    }
+}
+
 /// Single-threaded engine handle owned by the C/C++ host event loop.
 /// Not `Send` or `Sync` (enforced via `_not_send_sync`); poisoned if an internal panic is caught.
 pub struct SmartKeyEngineHandle {
@@ -142,6 +172,17 @@ unsafe fn with_engine_mut<R>(
             default
         }
     }
+}
+
+unsafe fn with_session_ref<R>(
+    session: *const SmartKeySessionHandle,
+    default: R,
+    f: impl FnOnce(&SmartKeySession) -> R,
+) -> R {
+    if session.is_null() || (*session).poisoned {
+        return default;
+    }
+    catch_unwind(AssertUnwindSafe(|| f(&(*session).inner))).unwrap_or(default)
 }
 
 unsafe fn with_session_mut<R>(
@@ -355,6 +396,69 @@ pub unsafe extern "C" fn smartkey_engine_log_app_event(
         let prof = decode_profile(profile);
         eng.store_mut().log_app_bypass(app, prof, reason);
     });
+}
+
+fn static_mode_cstr(mode: &str) -> *const c_char {
+    match mode {
+        "Idle" => c"Idle".as_ptr(),
+        "Composing" => c"Composing".as_ptr(),
+        "PendingDot" => c"PendingDot".as_ptr(),
+        "PendingSemi" => c"PendingSemi".as_ptr(),
+        "AfterWord" => c"AfterWord".as_ptr(),
+        "JustAutocorrected" => c"JustAutocorrected".as_ptr(),
+        "EditingRestored" => c"EditingRestored".as_ptr(),
+        "EditingPrevious" => c"EditingPrevious".as_ptr(),
+        _ => c"Unknown".as_ptr(),
+    }
+}
+
+fn borrowed_str_parts(s: &str) -> (*const c_char, u32) {
+    if s.is_empty() {
+        (c"".as_ptr(), 0)
+    } else {
+        (
+            s.as_ptr() as *const c_char,
+            s.len().min(u32::MAX as usize) as u32,
+        )
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_is_trace_enabled(
+    engine: *const SmartKeyEngineHandle,
+) -> bool {
+    with_engine_ref(engine, false, |eng| {
+        eng.store().compiled().diagnostics.trace_log
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_session_debug_snapshot(
+    session: *const SmartKeySessionHandle,
+    out_snapshot: *mut SmartKeySessionSnapshot,
+) -> bool {
+    if out_snapshot.is_null() {
+        return false;
+    }
+    *out_snapshot = SmartKeySessionSnapshot::default();
+    with_session_ref(session, false, |sess| {
+        let snap = sess.debug_snapshot();
+        let (buf_utf8, buf_byte_len) = borrowed_str_parts(snap.active_buf);
+        let (aux_utf8, aux_byte_len) = borrowed_str_parts(snap.aux_text);
+        let (prev_utf8, prev_byte_len) = borrowed_str_parts(snap.prev_word);
+        *out_snapshot = SmartKeySessionSnapshot {
+            mode_utf8: static_mode_cstr(snap.mode),
+            buf_utf8,
+            buf_byte_len,
+            aux_utf8,
+            aux_byte_len,
+            prev_utf8,
+            prev_byte_len,
+            trailing_count: snap.trailing_count.min(u32::MAX as usize) as u32,
+            lotus_composing: snap.lotus_composing,
+        };
+        true
+    })
 }
 
 fn static_reason_cstr(reason: &str) -> *const c_char {
@@ -743,6 +847,121 @@ mod tests {
         check("", SMARTKEY_PROFILE_BYPASS, "unknown-app-policy");
 
         unsafe { smartkey_engine_free(eng) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ffi_trace_enabled_and_debug_snapshot_across_session_modes() {
+        let dir = std::env::temp_dir().join(format!(
+            "smartkey_ffi_trace_{}_{}",
+            std::process::id(),
+            smartkey_core::event_log::current_epoch_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rules = dir.join("rules.toml");
+        let state = dir.join("state.json");
+        std::fs::write(&rules, "[diagnostics]\ntrace_log = false\n").unwrap();
+
+        let c_rules = CString::new(rules.to_str().unwrap()).unwrap();
+        let c_state = CString::new(state.to_str().unwrap()).unwrap();
+        let eng = unsafe {
+            smartkey_engine_new(c_rules.as_ptr(), c_state.as_ptr(), SMARTKEY_PRESET_BALANCED)
+        };
+        assert!(!eng.is_null());
+        let sess = smartkey_session_new();
+        assert!(!sess.is_null());
+
+        assert!(!unsafe { smartkey_engine_is_trace_enabled(eng) });
+        std::fs::write(&rules, "[diagnostics]\ntrace_log = true\n").unwrap();
+        assert!(unsafe { smartkey_engine_reload_dicts(eng) });
+        assert!(unsafe { smartkey_engine_is_trace_enabled(eng) });
+
+        let read_snap = || -> (String, String, String, String, u32, bool) {
+            let mut snap = SmartKeySessionSnapshot::default();
+            assert!(unsafe { smartkey_session_debug_snapshot(sess, &mut snap) });
+            let slice = |ptr: *const c_char, len: u32| -> String {
+                if ptr.is_null() || len == 0 {
+                    String::new()
+                } else {
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+                    std::str::from_utf8(bytes).unwrap().to_string()
+                }
+            };
+            let mode = unsafe { CStr::from_ptr(snap.mode_utf8) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            (
+                mode,
+                slice(snap.buf_utf8, snap.buf_byte_len),
+                slice(snap.aux_utf8, snap.aux_byte_len),
+                slice(snap.prev_utf8, snap.prev_byte_len),
+                snap.trailing_count,
+                snap.lotus_composing,
+            )
+        };
+
+        assert_eq!(
+            read_snap(),
+            ("Idle".to_string(), "".to_string(), "".to_string(), "".to_string(), 0, true)
+        );
+
+        let mut act = SmartKeyAction::default();
+        for (idx, cp) in ['t' as u32, 'e' as u32, 'h' as u32].into_iter().enumerate() {
+            assert!(unsafe {
+                smartkey_session_process_key(
+                    sess,
+                    eng,
+                    SMARTKEY_KEY_CHAR,
+                    cp,
+                    100 + idx as u64 * 10,
+                    &mut act,
+                )
+            });
+            assert_eq!(act.kind, SMARTKEY_ACTION_PASS_THROUGH);
+        }
+        assert_eq!(
+            read_snap(),
+            ("Composing".to_string(), "teh".to_string(), "".to_string(), "".to_string(), 0, true)
+        );
+
+        assert!(unsafe {
+            smartkey_session_process_key(sess, eng, SMARTKEY_KEY_CHAR, ' ' as u32, 150, &mut act)
+        });
+        assert_eq!(act.kind, SMARTKEY_ACTION_REPLACE);
+        assert_eq!(
+            read_snap(),
+            (
+                "JustAutocorrected".to_string(),
+                "the".to_string(),
+                "teh".to_string(),
+                "the".to_string(),
+                1,
+                true
+            )
+        );
+
+        assert!(unsafe {
+            smartkey_session_process_key(sess, eng, SMARTKEY_KEY_BACKSPACE, 0, 200, &mut act)
+        });
+        assert_eq!(act.kind, SMARTKEY_ACTION_REPLACE);
+        assert_eq!(
+            read_snap(),
+            (
+                "EditingRestored".to_string(),
+                "teh".to_string(),
+                "teh".to_string(),
+                "".to_string(),
+                0,
+                true
+            )
+        );
+
+        unsafe {
+            smartkey_session_free(sess);
+            smartkey_engine_free(eng);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

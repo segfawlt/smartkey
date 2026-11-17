@@ -264,12 +264,153 @@ void verifyWaylandSurroundingSyncAndDelayedTimer() {
     assert(!resetGuard.shouldIgnoreClientReset(false, false, 1050));
 }
 
+void verifyTraceRecorderHelpers() {
+    using namespace fcitx::smartkey;
+
+    // JSON escaping: quotes, backslashes, newlines, control chars, Vietnamese UTF-8, invalid UTF-8
+    {
+        std::string escaped;
+        appendJsonEscaped(escaped, "say \"hi\"\\slash\n\x01 cần sinh ");
+        const unsigned char badByte = 0xFF;
+        std::string badStr(1, static_cast<char>(badByte));
+        appendJsonEscaped(escaped, badStr);
+        assert(escaped.find("\\\"hi\\\"") != std::string::npos);
+        assert(escaped.find("\\\\slash") != std::string::npos);
+        assert(escaped.find("\\u0001") != std::string::npos);
+        assert(escaped.find("cần sinh") != std::string::npos);
+        assert(escaped.find("\\n") != std::string::npos);
+        assert(escaped.find("\\ufffd") != std::string::npos);
+    }
+
+    // Unicode scalar SurroundingText slicing (multi-byte UTF-8 safe)
+    {
+        const std::string text = "cần sinh";
+        assert(extractSurroundingSlice(text, 4, 4) == "cần |sinh");
+        assert(extractSurroundingSlice("", 0, 0) == "|");
+        assert(extractSurroundingSlice(text, 4, 4, 2, 2) ==
+               "\xE2\x80\xA6n |si\xE2\x80\xA6");
+        assert(extractSurroundingSlice(text, 4, 1) == "cần |sinh [sel=1]");
+        assert(extractSurroundingSlice(text, 99, 99) == "<invalid-cursor>");
+        assert(extractSurroundingSlice(text, 20000, 20000) ==
+               "<cursor=20000 bytes=" + std::to_string(text.size()) + ">");
+    }
+
+    // Session snapshot compact formatter across all modes + prev + lotus_composing
+    {
+        SmartKeySessionSnapshot idle{};
+        assert(formatSessionCompact(idle) == "Idle");
+
+        SmartKeySessionSnapshot comp{};
+        comp.mode_utf8 = "Composing";
+        comp.buf_utf8 = "caafn";
+        comp.buf_byte_len = 5;
+        comp.lotus_composing = true;
+        assert(formatSessionCompact(comp) == "Composing(caafn)");
+        comp.aux_utf8 = "caafnx";
+        comp.aux_byte_len = 6;
+        assert(formatSessionCompact(comp) == "Composing(caafn,peak=caafnx)");
+
+        SmartKeySessionSnapshot after{};
+        after.mode_utf8 = "AfterWord";
+        after.buf_utf8 = "cần";
+        after.buf_byte_len = static_cast<uint32_t>(std::string_view("cần").size());
+        after.trailing_count = 1;
+        after.lotus_composing = true;
+        assert(formatSessionCompact(after) == "AfterWord(cần,sp=1)");
+
+        SmartKeySessionSnapshot just{};
+        just.mode_utf8 = "JustAutocorrected";
+        just.buf_utf8 = "nính";
+        just.buf_byte_len = static_cast<uint32_t>(std::string_view("nính").size());
+        just.aux_utf8 = "nsinh";
+        just.aux_byte_len = 5;
+        just.prev_utf8 = "cần";
+        just.prev_byte_len = static_cast<uint32_t>(std::string_view("cần").size());
+        just.trailing_count = 1;
+        just.lotus_composing = false;
+        assert(formatSessionCompact(just) ==
+               "JustAutocorrected(nính<-nsinh,tb=1)[prev=cần][lc=0]");
+
+        SmartKeySessionSnapshot restored{};
+        restored.mode_utf8 = "EditingRestored";
+        restored.buf_utf8 = "nsin";
+        restored.buf_byte_len = 4;
+        restored.aux_utf8 = "nsinh";
+        restored.aux_byte_len = 5;
+        restored.lotus_composing = true;
+        assert(formatSessionCompact(restored) == "EditingRestored(nsin<-nsinh)");
+    }
+
+    // SurroundingTraceDedup suppresses consecutive identical snapshots
+    {
+        SurroundingTraceDedup dedup{};
+        assert(dedup.shouldEmit(4, 4, true, "cần |sinh"));
+        assert(!dedup.shouldEmit(4, 4, true, "cần |sinh"));
+        assert(dedup.shouldEmit(5, 5, true, "cần s|inh"));
+        assert(!dedup.shouldEmit(5, 5, true, "cần s|inh"));
+        assert(dedup.shouldEmit(5, 5, false, "cần s|inh"));
+        dedup.reset();
+        assert(dedup.shouldEmit(5, 5, false, "cần s|inh"));
+    }
+
+    // TraceLogger: 0600 file permissions, .1 rotation when maxFileBytes is exceeded, and closeIfOpen
+    {
+        namespace fs = std::filesystem;
+        const fs::path logDir =
+            fs::temp_directory_path() /
+            ("fcitx5_smartkey_trace_" + std::to_string(::getpid()));
+        fs::remove_all(logDir);
+
+        TraceLogger logger;
+        logger.setLogDir(logDir);
+        logger.setMaxFileBytes(180);
+
+        // 2026-11-18T00:00:00Z in epoch ms (1794528000000? Let's compute exact UTC day 20775)
+        const uint64_t fixedEpochMs = 1794528000000ULL; // 2026-11-13
+        const std::string expectedDay =
+            TraceLogger::formatUtcDate(static_cast<int64_t>(fixedEpochMs / 86400000ULL));
+
+        auto writeRec = [&](std::string_view word) {
+            auto &line = logger.beginLine();
+            line.append("{\"v\":1,\"ts_ms\":");
+            line.append(std::to_string(fixedEpochMs));
+            line.append(",\"ev\":\"pre_key\",\"app\":\"zen\",\"txt\":");
+            appendJsonString(line, word);
+            line.append(",\"scr\":\"cần |sinh\",\"pad\":\"012345678901234567890123456789\"}");
+            logger.commitLine(fixedEpochMs);
+        };
+
+        writeRec("first");
+        assert(logger.isOpen());
+        const fs::path activePath = logDir / ("trace-" + expectedDay + ".jsonl");
+        const fs::path rotPath = logDir / ("trace-" + expectedDay + ".jsonl.1");
+        assert(fs::exists(activePath));
+
+        struct stat st{};
+        assert(::stat(activePath.c_str(), &st) == 0);
+        assert((st.st_mode & 0777) == 0600);
+
+        // Exceed 180 bytes so next write triggers `.1` rotation.
+        writeRec("second-to-exceed-threshold");
+        assert(!fs::exists(rotPath));
+        writeRec("third-after-rotate");
+        assert(fs::exists(rotPath));
+        assert(fs::exists(activePath));
+        assert(fs::file_size(activePath) > 0 && fs::file_size(activePath) < 180);
+
+        logger.closeIfOpen();
+        assert(!logger.isOpen());
+        fs::remove_all(logDir);
+    }
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
     verifyProfileClassification();
     verifyKeyboardLangNormalization();
     verifyWaylandSurroundingSyncAndDelayedTimer();
+    verifyTraceRecorderHelpers();
     if (argc < 2) {
         std::cerr << "usage: addon_load_smoke <libsmartkey.so>\n";
         return 2;
@@ -285,11 +426,13 @@ int main(int argc, char *argv[]) {
 
     const fs::path dataHome = tmpRoot / "data";
     const fs::path cfgHome = tmpRoot / "config";
+    const fs::path stateHome = tmpRoot / "state";
     const fs::path addonLibDir = tmpRoot / "local_lib" / "fcitx5";
     const fs::path addonConfDir = dataHome / "fcitx5" / "addon";
     fs::create_directories(addonLibDir);
     fs::create_directories(addonConfDir);
     fs::create_directories(cfgHome);
+    fs::create_directories(stateHome);
 
     const fs::path installedSo = addonLibDir / "libsmartkey.so";
     fs::copy_file(soSrc, installedSo);
@@ -308,6 +451,7 @@ int main(int argc, char *argv[]) {
 
     ::setenv("XDG_CONFIG_HOME", cfgHome.c_str(), 1);
     ::setenv("XDG_DATA_HOME", dataHome.c_str(), 1);
+    ::setenv("XDG_STATE_HOME", stateHome.c_str(), 1);
     ::unsetenv("FCITX_ADDON_DIRS");
 
     {
