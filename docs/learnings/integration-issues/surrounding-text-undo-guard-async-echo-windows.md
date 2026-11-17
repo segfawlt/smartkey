@@ -39,6 +39,7 @@ Self-commits, Lotus bursts, and pending boundary commits are filtered before rea
 
 - Keep `reconcile_surrounding_guards_displaced_cursor_undo` (`learning_eval.rs`) and `test_vi_lotus_sentence_start_english_passthrough_and_surrounding_undo_guard` (`vi_lotus_eval.rs`) in CI.
 - Never remove the `isSelfCommitting()` / `isInLotusBurst()` / `hasPendingBoundary()` guards from `onSurroundingTextUpdated`.
+- Related: [SurroundingText Unicode-Scalar Cursor Indexing vs UTF-8 Slicing](./surrounding-text-utf8-scalar-cursor-slicing.md).
 
 ## References
 
