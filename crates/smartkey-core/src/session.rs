@@ -802,6 +802,40 @@ impl SmartKeyEngine {
             top_candidates: Vec::new(),
         }
     }
+
+    /// Records an untouched unknown word into Layer 2 (`3x -> personal_dict`), skipping raw
+    /// unswitched Vietnamese Telex syllables (`>= 4` ASCII chars that compose to a valid accented
+    /// Vietnamese word) when typing in English mode without prior undo confirmation.
+    pub fn record_untouched_unknown_token(&mut self, lang: &LangId, word: &str) -> LearnEvent {
+        if lang.as_str() == "en" {
+            let trimmed = word.trim();
+            let lower = trimmed.to_lowercase();
+            if trimmed.len() >= 4
+                && trimmed.is_ascii()
+                && !self.store.is_personal_word(&lower)
+                && !self
+                    .registry
+                    .lexicon("en")
+                    .is_some_and(|l| l.contains_any_variant_or_elided(&lower))
+            {
+                let undo_prefix = format!("en:{lower}->");
+                let has_prior_undo = self
+                    .store
+                    .state()
+                    .staged_undo_keep
+                    .iter()
+                    .any(|(k, &v)| v >= 1 && k.starts_with(&undo_prefix));
+                if !has_prior_undo {
+                    let sim = self.simulate_vi_lotus(&lower, self.store.lotus_options());
+                    if sim.is_valid_vietnamese && sim.is_composed_vietnamese {
+                        return LearnEvent::None;
+                    }
+                }
+            }
+        }
+        let lex = self.registry.lexicon(lang.as_str());
+        record_untouched_unknown(&mut self.store, lex, lang, word)
+    }
 }
 
 /// Normalized input event delivered by the host adapter (`fcitx5`, CLI REPL, or test harness)
@@ -1023,6 +1057,8 @@ impl SmartKeySession {
     ) {
         let echo_guard_ms = if self.lang.as_str() == "vi" && self.lotus_composing {
             400
+        } else if matches!(self.mode, Mode::EditingRestored { .. }) {
+            180
         } else {
             80
         };
@@ -1135,12 +1171,7 @@ impl SmartKeySession {
 
     fn flush_pending_unknown(&mut self, engine: &mut SmartKeyEngine, events: &mut Vec<LearnEvent>) {
         if let Some((lang, word)) = self.pending_unknown.take() {
-            let ev = record_untouched_unknown(
-                &mut engine.store,
-                engine.registry.lexicon(lang.as_str()),
-                &lang,
-                &word,
-            );
+            let ev = engine.record_untouched_unknown_token(&lang, &word);
             if !matches!(ev, LearnEvent::None) {
                 events.push(ev);
             }
@@ -2678,8 +2709,7 @@ impl SmartKeySession {
     ) -> LearnEvent {
         engine.store.set_active_lang(self.lang.clone());
         self.mobile_pending_undo = None;
-        let lex = engine.registry.lexicon(self.lang.as_str());
-        let ev = record_untouched_unknown(&mut engine.store, lex, &self.lang, word);
+        let ev = engine.record_untouched_unknown_token(&self.lang, word);
         self.prev_word = Some(word.to_string());
         ev
     }

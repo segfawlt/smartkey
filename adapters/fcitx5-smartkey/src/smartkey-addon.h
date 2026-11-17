@@ -225,6 +225,23 @@ struct SurroundingSyncTracker {
     }
 };
 
+/// Suppresses client-emitted `InputContextReset` echoes triggered by SmartKey's own
+/// BackSpace + commit replacement burst (common on GTK/Gecko Wayland frontends during undo).
+struct SelfReplaceResetGuard {
+    static constexpr uint64_t kGuardMs = 150;
+
+    uint64_t deadlineMs = 0;
+
+    void markSelfReplace(uint64_t nowMs) { deadlineMs = nowMs + kGuardMs; }
+    void clear() { deadlineMs = 0; }
+    bool shouldIgnoreClientReset(bool isSelfCommitting,
+                                 bool hasPendingDelayedCommit,
+                                 uint64_t nowMs) const {
+        return isSelfCommitting || hasPendingDelayedCommit ||
+               (deadlineMs != 0 && nowMs <= deadlineMs);
+    }
+};
+
 /// Pure state machine tracking `fcitx5-lotus` uinput replacement bursts, synthetic echo suppression,
 /// and pending filtered word-break boundaries (`CommitStringEvent` deferred evaluation).
 struct LotusBridgeTracker {
@@ -412,6 +429,18 @@ public:
         pendingDelayedCommit_.clear();
     }
 
+    static constexpr uint64_t kSelfReplaceResetGuardMs =
+        SelfReplaceResetGuard::kGuardMs;
+
+    void markSelfReplace(uint64_t nowMs) {
+        selfReplaceGuard_.markSelfReplace(nowMs);
+    }
+    void clearSelfReplaceGuard() { selfReplaceGuard_.clear(); }
+    bool shouldIgnoreClientReset(uint64_t nowMs) const {
+        return selfReplaceGuard_.shouldIgnoreClientReset(
+            isSelfCommitting(), hasPendingDelayedCommit(), nowMs);
+    }
+
     bool shouldLogProfileTransition(uint8_t profile, std::string_view reason) {
         if (lastLoggedProfile_ == profile && lastLoggedReason_ == reason) {
             return false;
@@ -425,6 +454,7 @@ private:
     SmartKeySessionHandle *session_ = nullptr;
     LotusBridgeTracker lotus_{};
     SurroundingSyncTracker surroundingSync_{};
+    SelfReplaceResetGuard selfReplaceGuard_{};
     std::string pendingDelayedCommit_;
     std::unique_ptr<EventSourceTime> delayedCommitTimer_;
     uint8_t lastLoggedProfile_ = 0xFF;
@@ -446,6 +476,7 @@ private:
     void onUpdatePreedit(Event &event);
     void onSurroundingTextUpdated(Event &event);
     void focusOutContext(InputContext *ic);
+    void onInputContextReset(InputContext *ic);
     void resetContext(InputContext *ic);
     std::string resolveDirectKeyboardLang(InputContext *ic) const;
     bool isLotusActive(InputContext *ic) const;

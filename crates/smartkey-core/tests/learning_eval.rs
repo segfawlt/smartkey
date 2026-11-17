@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use proptest::prelude::*;
 use serde::Deserialize;
 use smartkey_core::{
-    apply_key_to_buffer, Candidate, DiagnosticEvent, KeyInput, LangId, LearnEvent, MatchKind,
-    Preset, RuleStore, SessionAction, SkipReason, SmartKeyEngine, SmartKeySession, UndoResolution,
-    UserRuleView,
+    apply_key_to_buffer, Candidate, DiagnosticEvent, EvalContext, EvalOutcome, KeyInput, LangId,
+    LearnEvent, MatchKind, Preset, RuleStore, SessionAction, SkipReason, SmartKeyEngine,
+    SmartKeySession, UndoResolution, UserRuleView,
 };
 
 fn workspace_root() -> PathBuf {
@@ -2115,5 +2115,100 @@ fn sentence_start_untouched_oov_followed_by_lowercase_graduates_lowercase_and_sk
             .map(String::as_str),
         Some("zyxkorp"),
         "sentence-start OOV followed by lowercase uses must graduate as lowercase"
+    );
+}
+
+#[test]
+fn english_mode_skips_untouched_raw_telex_words_but_keeps_3char_brands() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut s = SmartKeySession::new();
+    let mut b = String::new();
+
+    feed_keys(
+        &mut s,
+        &mut engine,
+        &mut b,
+        "chuwa and chuwa and chuwa.<ENTER>chawcs and chawcs and chawcs.<ENTER>",
+    );
+    assert!(!engine.store().is_personal_word("chuwa"));
+    assert!(!engine.store().is_personal_word("chawcs"));
+    assert!(!engine
+        .store()
+        .state()
+        .untouched_unknowns
+        .contains_key("en:chuwa"));
+    assert!(!engine
+        .store()
+        .state()
+        .untouched_unknowns
+        .contains_key("en:chawcs"));
+
+    feed_keys(&mut s, &mut engine, &mut b, "dux and dux and dux.<ENTER>");
+    assert!(
+        engine.store().is_personal_word("dux"),
+        "3-char brand tokens must remain eligible for English personal_dict graduation"
+    );
+}
+
+#[test]
+fn dev_terms_textbox_shielded_and_accidental_undo_block_heals_on_1x_manual_fix() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+
+    // 1. `"textbox"` is now in bundled `dev_terms.txt` (`ValidWord`), so fixing it without
+    //    preceding context hits Guard 2 (`ValidWordNoContext`) and never learns a global rule.
+    assert!(matches!(
+        engine.evaluate_token("textbox", &EvalContext::default()),
+        EvalOutcome::Unchanged {
+            reason: MatchKind::ValidWord,
+            ..
+        }
+    ));
+    let mut s = SmartKeySession::new();
+    let mut b = String::new();
+    feed_keys(
+        &mut s,
+        &mut engine,
+        &mut b,
+        "textbox <CBS>textbook <ENTER>textbox <CBS>textbook <ENTER>",
+    );
+    assert!(
+        engine.store().lookup_correction("textbox").is_none(),
+        "valid dev compound `textbox` must never graduate to [corrections] without context"
+    );
+
+    // 2. Accidental `1x BackSpace` + Space block on a known typo (`"somewher" -> "somewhere"`)
+    //    heals immediately upon `1x` manual repair (`"somewher" -> "somewhere"`).
+    let mut s2 = SmartKeySession::new();
+    let mut b2 = String::new();
+    feed_keys(&mut s2, &mut engine, &mut b2, "somewher <BS> ");
+    assert_eq!(b2, "somewher ");
+    assert!(engine.store().is_pair_blocked("somewher", "somewhere"));
+
+    feed_keys(&mut s2, &mut engine, &mut b2, "somewher <CBS>somewhere ");
+    assert!(
+        !engine.store().is_pair_blocked("somewher", "somewhere"),
+        "1x manual repair of a dictionary typo must heal an accidental undo blocklist entry"
+    );
+
+    let mut b3 = String::new();
+    feed_keys(&mut s2, &mut engine, &mut b3, "somewher ");
+    assert_eq!(b3, "somewhere ");
+
+    // 3. `reconcile_surrounding` ignores client echoes for 180ms while in `EditingRestored`.
+    let mut s3 = SmartKeySession::new();
+    for ch in "machien ".chars() {
+        s3.process_key(&mut engine, KeyInput::Char(ch), 1_000);
+    }
+    let bs_out = s3.process_key(&mut engine, KeyInput::BackSpace, 1_100);
+    assert!(matches!(
+        bs_out.action,
+        SessionAction::Replace { ref insert, .. } if insert == "machien"
+    ));
+    s3.reconcile_surrounding(&mut engine, "machine ", 8, 1_220);
+    assert!(
+        !engine.store().is_pair_blocked("machien", "machine"),
+        "Wayland surrounding echo at +120ms during EditingRestored must not block (machien -> machine)"
     );
 }

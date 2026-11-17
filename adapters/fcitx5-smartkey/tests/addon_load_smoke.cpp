@@ -246,6 +246,22 @@ void verifyWaylandSurroundingSyncAndDelayedTimer() {
     assert(loop.exec());
     assert(timerFired);
     assert(delayedTimer == nullptr);
+
+    // Self-replace reset-echo guard prevents GTK/Gecko Wayland `InputContextReset` bursts
+    // within 150ms of SmartKey's BackSpace+commit replacement from wiping `EditingRestored`.
+    using fcitx::smartkey::SelfReplaceResetGuard;
+    SelfReplaceResetGuard resetGuard{};
+    assert(!resetGuard.shouldIgnoreClientReset(false, false, 1000));
+    assert(resetGuard.shouldIgnoreClientReset(true, false, 1000));
+    assert(resetGuard.shouldIgnoreClientReset(false, true, 1000));
+
+    resetGuard.markSelfReplace(1000);
+    assert(resetGuard.shouldIgnoreClientReset(false, false, 1050));
+    assert(resetGuard.shouldIgnoreClientReset(false, false, 1150));
+    assert(!resetGuard.shouldIgnoreClientReset(false, false, 1151));
+
+    resetGuard.clear();
+    assert(!resetGuard.shouldIgnoreClientReset(false, false, 1050));
 }
 
 } // namespace

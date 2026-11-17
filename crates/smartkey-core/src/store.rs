@@ -3070,10 +3070,9 @@ impl RuleStore {
     }
 
     fn remove_blocklist_pair_entry(&mut self, typed_l: &str, rejected_l: &str) -> bool {
-        let removed = self
-            .compiled
-            .blocklist
-            .remove(&(typed_l.to_string(), rejected_l.to_string()));
+        let pair = (typed_l.to_string(), rejected_l.to_string());
+        self.session_blocked_pairs.remove(&pair);
+        let removed = self.compiled.blocklist.remove(&pair);
         if let Some(arr) = self.doc.get_mut("blocklist").and_then(Item::as_array_mut) {
             arr.retain(|v| {
                 !v.as_inline_table().is_some_and(|tbl| {

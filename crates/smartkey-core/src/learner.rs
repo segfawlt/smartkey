@@ -984,6 +984,20 @@ fn record_manual_edit_inner(
                 fixed: target_to_save,
             };
         }
+        if !target_is_novel_unknown && store.is_pair_blocked(&orig_lower, &fixed_lower) {
+            let eff_lex = if effective_lang == *lang {
+                lexicon
+            } else {
+                None
+            };
+            clear_pair_rejection(
+                store,
+                eff_lex,
+                &effective_lang,
+                &orig_lower,
+                &target_to_save,
+            );
+        }
         let _ = store.flush_state();
         return LearnEvent::StagedCorrection {
             lang: effective_lang.0,

@@ -8,6 +8,7 @@ api
 apis
 app
 apps
+appimage
 arch
 archlinux
 arg
@@ -53,6 +54,8 @@ cmake
 codebase
 codec
 codegen
+colorscheme
+colorschemes
 commit
 commits
 compaction
@@ -655,6 +658,8 @@ telex
 temp
 termios
 tex
+textbox
+textboxes
 tldr
 tls
 tmp
@@ -791,6 +796,8 @@ workflow
 workflows
 workspace
 workspaces
+worktree
+worktrees
 wrapper
 wrappers
 wsl

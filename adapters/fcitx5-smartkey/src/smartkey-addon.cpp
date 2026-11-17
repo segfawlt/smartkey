@@ -159,7 +159,10 @@ SmartKeyAddon::SmartKeyAddon(Instance *instance)
         resetWatcher));
     eventWatchers_.emplace_back(instance_->watchEvent(
         EventType::InputContextReset, EventWatcherPhase::PreInputMethod,
-        resetWatcher));
+        [this](Event &event) {
+            auto &icEvent = static_cast<InputContextEvent &>(event);
+            onInputContextReset(icEvent.inputContext());
+        }));
     eventWatchers_.emplace_back(instance_->watchEvent(
         EventType::InputContextSwitchInputMethod,
         EventWatcherPhase::PreInputMethod, resetWatcher));
@@ -204,6 +207,7 @@ void SmartKeyAddon::focusOutContext(InputContext *ic) {
     auto *state = ic->propertyFor(&factory_);
     if (state != nullptr) {
         flushPendingDelayedCommit(ic, state);
+        state->clearSelfReplaceGuard();
         state->resetLotusTracking();
         state->resetSurroundingSync();
         if (state->session() != nullptr) {
@@ -215,6 +219,17 @@ void SmartKeyAddon::focusOutContext(InputContext *ic) {
     }
 }
 
+void SmartKeyAddon::onInputContextReset(InputContext *ic) {
+    if (ic == nullptr || engine_ == nullptr || !factory_.registered()) {
+        return;
+    }
+    auto *state = ic->propertyFor(&factory_);
+    if (state != nullptr && state->shouldIgnoreClientReset(monotonicNowMs())) {
+        return;
+    }
+    resetContext(ic);
+}
+
 void SmartKeyAddon::resetContext(InputContext *ic) {
     if (ic == nullptr || engine_ == nullptr || !factory_.registered()) {
         return;
@@ -222,6 +237,7 @@ void SmartKeyAddon::resetContext(InputContext *ic) {
     auto *state = ic->propertyFor(&factory_);
     if (state != nullptr) {
         state->cancelPendingDelayedCommit();
+        state->clearSelfReplaceGuard();
         state->resetLotusTracking();
         state->resetSurroundingSync();
         if (state->session() != nullptr) {
@@ -451,6 +467,7 @@ void SmartKeyAddon::flushPendingDelayedCommit(InputContext *ic,
     }
     const std::string text = state->takePendingDelayedCommit();
     if (!text.empty()) {
+        state->markSelfReplace(monotonicNowMs());
         ScopedSelfCommit guard(state);
         state->markClientMutated();
         ic->commitString(text);
@@ -468,6 +485,7 @@ void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
     // `commitString` by 15ms so `zwp_virtual_keyboard_v1` BackSpaces arrive in Gecko/Zen
     // before `zwp_input_method_v2.commit_string`.
     if (act.delete_chars > 0) {
+        state->markSelfReplace(monotonicNowMs());
         if (state->canUseDeleteSurrounding(
                 ic->capabilityFlags().test(CapabilityFlag::SurroundingText),
                 ic->surroundingText().isValid(),
@@ -526,6 +544,7 @@ void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
             }
         }
     } else if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
+        state->markSelfReplace(monotonicNowMs());
         ScopedSelfCommit guard(state);
         state->markClientMutated();
         ic->commitString(std::string(act.insert_utf8, act.insert_byte_len));
