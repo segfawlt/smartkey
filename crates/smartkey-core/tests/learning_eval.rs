@@ -2211,4 +2211,31 @@ fn dev_terms_textbox_shielded_and_accidental_undo_block_heals_on_1x_manual_fix()
         !engine.store().is_pair_blocked("machien", "machine"),
         "Wayland surrounding echo at +120ms during EditingRestored must not block (machien -> machine)"
     );
+
+    // 4. Explicit `remove_blocklist_pair` purges both the blocklist entry and `staged_undo_keep`,
+    //    lifting any cross-session ghost undo shield.
+    let mut s4 = SmartKeySession::new();
+    let mut b4 = String::new();
+    feed_keys(&mut s4, &mut engine, &mut b4, "alot <BS> ");
+    assert_eq!(b4, "alot ");
+    assert!(engine.store().is_pair_blocked("alot", "a lot"));
+    assert!(engine
+        .store()
+        .state()
+        .staged_undo_keep
+        .contains_key("en:alot->a lot"));
+    assert!(engine
+        .store_mut()
+        .remove_blocklist_pair("alot", "a lot")
+        .unwrap());
+    assert!(!engine.store().is_pair_blocked("alot", "a lot"));
+    assert!(!engine
+        .store()
+        .state()
+        .staged_undo_keep
+        .contains_key("en:alot->a lot"));
+    assert!(!engine.store().is_undo_shielded("alot"));
+    let mut b5 = String::new();
+    feed_keys(&mut s4, &mut engine, &mut b5, "alot ");
+    assert_eq!(b5, "a lot ");
 }

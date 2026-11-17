@@ -3088,7 +3088,30 @@ impl RuleStore {
                 })
             });
         }
-        removed
+        let suffix = format!(":{typed_l}->{rejected_l}");
+        let before_keep = self.state.staged_undo_keep.len();
+        self.state
+            .staged_undo_keep
+            .retain(|k, _| !k.ends_with(&suffix));
+        let before_crej = self.state.staged_contraction_rejects.len();
+        self.state
+            .staged_contraction_rejects
+            .retain(|k, _| !k.ends_with(&suffix));
+        self.state
+            .staged_contraction_reject_applied_at
+            .retain(|k, _| !k.ends_with(&suffix));
+        let state_removed = self.state.staged_undo_keep.len() != before_keep
+            || self.state.staged_contraction_rejects.len() != before_crej;
+        let word_mid = format!(":{typed_l}->");
+        if !self
+            .state
+            .staged_undo_keep
+            .keys()
+            .any(|k| k.contains(&word_mid))
+        {
+            self.session_shielded_words.remove(typed_l);
+        }
+        removed || state_removed
     }
 
     /// Removes `(typed, rejected)` from `blocklist`.
@@ -4275,10 +4298,13 @@ impl UserRuleView for RuleStore {
             return true;
         }
         let prefix = format!("{}:{lower_word}->", self.active_lang.as_str());
-        self.state
-            .staged_undo_keep
-            .keys()
-            .any(|k| k.starts_with(&prefix))
+        self.state.staged_undo_keep.keys().any(|k| {
+            k.strip_prefix(&prefix).is_some_and(|rejected| {
+                self.compiled
+                    .blocklist
+                    .contains(&(lower_word.to_string(), rejected.to_string()))
+            })
+        })
     }
 
     fn is_pair_blocked(&self, typed_lower: &str, candidate_lower: &str) -> bool {
