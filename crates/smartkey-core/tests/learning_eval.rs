@@ -1870,3 +1870,250 @@ fn reconcile_surrounding_guards_displaced_cursor_undo() {
     let bs3 = session3.process_key(&mut engine, KeyInput::BackSpace, 3_320);
     assert_eq!(bs3.action, SessionAction::PassThrough);
 }
+
+#[test]
+fn sentence_start_typo_fix_never_promotes_ordinary_word_to_title_case_personal_dict() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+
+    for _ in 0..2 {
+        let mut s = SmartKeySession::new();
+        let mut b = String::new();
+        feed_keys(&mut s, &mut engine, &mut b, "t <CBS>It ");
+        feed_keys(&mut s, &mut engine, &mut b, "itq <CBS>It ");
+    }
+
+    assert!(
+        !engine.store().compiled().personal_dict.contains("it"),
+        "ordinary lexicon word 'it' must never promote to personal_dict from sentence-start fix"
+    );
+    assert!(
+        !engine.store().compiled().corrections.contains_key("t"),
+        "1-char trigger 't' must not graduate to [corrections]"
+    );
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .corrections
+            .get("itq")
+            .map(String::as_str),
+        Some("it"),
+        "sentence-start fix 'itq -> It' must store lowercase 'it'"
+    );
+
+    let mut check_s = SmartKeySession::new();
+    let mut check_b = String::new();
+    feed_keys(
+        &mut check_s,
+        &mut engine,
+        &mut check_b,
+        "we itq saw it and it works ",
+    );
+    assert_eq!(check_b, "we it saw it and it works ");
+
+    // Even if an ordinary non-tech lexicon word like "It" were seeded directly into personal_dict,
+    // Step 3 must not force-capitalize mid-sentence "it" unless pinned.
+    engine
+        .store_mut()
+        .add_user_personal_word(&LangId::en(), "It")
+        .unwrap();
+    let mut seeded_s = SmartKeySession::new();
+    let mut seeded_b = String::new();
+    feed_keys(&mut seeded_s, &mut engine, &mut seeded_b, "we saw it ");
+    assert_eq!(seeded_b, "we saw it ");
+}
+
+#[test]
+fn uppercase_to_lowercase_manual_edit_logs_shields_and_downgrades_personal_case() {
+    let (dir, rules, state) = contraction_tmp_paths("uncase_manual");
+    {
+        let mut engine = contraction_engine(&rules, &state);
+        let mut s = SmartKeySession::new();
+        let mut b = String::new();
+        feed_keys(
+            &mut s,
+            &mut engine,
+            &mut b,
+            "Domixi, Domixi, Domixi.<ENTER>",
+        );
+        assert_eq!(
+            engine
+                .store()
+                .compiled()
+                .personal_dict_canonical
+                .get("domixi")
+                .map(String::as_str),
+            Some("Domixi")
+        );
+
+        let mut check_s = SmartKeySession::new();
+        let mut check_b = String::new();
+        feed_keys(&mut check_s, &mut engine, &mut check_b, "hi domixi ");
+        assert_eq!(check_b, "hi Domixi ");
+
+        // 1x manual fix Domixi -> domixi: logs, stages, and shields in-session immediately.
+        let mut fix1_s = SmartKeySession::new();
+        let mut fix1_b = String::new();
+        let evs1 = feed_keys(&mut fix1_s, &mut engine, &mut fix1_b, "Domixi <CBS>domixi ");
+        assert!(evs1.iter().any(|e| matches!(
+            e,
+            LearnEvent::StagedCorrection {
+                orig,
+                fixed,
+                count: 1,
+                ..
+            } if orig == "Domixi" && fixed == "domixi"
+        )));
+        assert!(
+            engine.store().state().recent_events.iter().any(|ev| {
+                matches!(
+                    ev,
+                    DiagnosticEvent::ManualBackspaceFix { orig, fixed, outcome, .. }
+                    if orig == "Domixi" && fixed == "domixi" && outcome == "staged (1x)"
+                )
+            }),
+            "1x uppercase->lowercase manual fix must be logged"
+        );
+
+        let mut same_s = SmartKeySession::new();
+        let mut same_b = String::new();
+        feed_keys(&mut same_s, &mut engine, &mut same_b, "hi domixi ");
+        assert_eq!(same_b, "hi domixi ");
+    }
+
+    // 2x manual fix in a new session permanently blocks ("domixi", "domixi") and downgrades canonical case.
+    {
+        let mut engine = contraction_engine(&rules, &state);
+        let mut fix2_s = SmartKeySession::new();
+        let mut fix2_b = String::new();
+        let evs2 = feed_keys(&mut fix2_s, &mut engine, &mut fix2_b, "Domixi <CBS>domixi ");
+        assert!(evs2.iter().any(|e| matches!(
+            e,
+            LearnEvent::BlockedPairPermanent { typed, rejected }
+            if typed == "domixi" && rejected == "domixi"
+        )));
+        assert_eq!(
+            engine
+                .store()
+                .compiled()
+                .personal_dict_canonical
+                .get("domixi")
+                .map(String::as_str),
+            Some("domixi"),
+            "downgraded personal_dict entry must remain in lowercase"
+        );
+        assert!(engine.store().is_pair_blocked("domixi", "domixi"));
+    }
+
+    // Fresh session reloaded from disk leaves "domixi" lowercase, and Hello->hello stays ignored.
+    {
+        let mut engine = contraction_engine(&rules, &state);
+        let mut fresh_s = SmartKeySession::new();
+        let mut fresh_b = String::new();
+        feed_keys(&mut fresh_s, &mut engine, &mut fresh_b, "hi domixi ");
+        assert_eq!(fresh_b, "hi domixi ");
+
+        for _ in 0..2 {
+            let mut h_s = SmartKeySession::new();
+            let mut h_b = String::new();
+            let evs = feed_keys(&mut h_s, &mut engine, &mut h_b, "Hello <CBS>hello ");
+            assert!(
+                evs.contains(&LearnEvent::Ignored(SkipReason::SameWord)),
+                "ordinary Hello->hello must stay ignored: {evs:?}"
+            );
+        }
+        assert!(!engine.store().is_pair_blocked("hello", "hello"));
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn personal_dict_case_undo_keep_blocks_at_1x_without_decay_and_ctrl_bs_tracks_undo() {
+    let (dir, rules, state) = contraction_tmp_paths("personal_undo_1x");
+    {
+        let mut engine = contraction_engine(&rules, &state);
+        engine
+            .store_mut()
+            .add_user_personal_word(&LangId::en(), "Domixi")
+            .unwrap();
+        engine
+            .store_mut()
+            .add_user_personal_word(&LangId::en(), "Zarqv")
+            .unwrap();
+
+        let mut s = SmartKeySession::new();
+        let mut b = String::new();
+        feed_keys(&mut s, &mut engine, &mut b, "domixi <BS> ");
+        assert_eq!(b, "domixi ");
+        assert!(
+            engine.store().is_pair_blocked("domixi", "domixi"),
+            "1x undo-keep on personal_dict capitalization must block immediately without 2x staging"
+        );
+        assert!(!engine
+            .store()
+            .state()
+            .staged_contraction_rejects
+            .contains_key("en:domixi->domixi"));
+
+        // Ctrl+BackSpace right after an autocorrect triggers undo tracking and EditingRestored.
+        let mut s2 = SmartKeySession::new();
+        let mut b2 = String::new();
+        feed_keys(&mut s2, &mut engine, &mut b2, "zarqv <CBS>zarqv ");
+        assert_eq!(b2, "zarqv ");
+        assert!(engine.store().is_pair_blocked("zarqv", "zarqv"));
+        assert!(engine.store().state().recent_events.iter().any(|ev| {
+            matches!(
+                ev,
+                DiagnosticEvent::BackspaceUndo {
+                    typed,
+                    rejected,
+                    resolution: UndoResolution::KeptVerbatim,
+                    ..
+                } if typed == "zarqv" && rejected == "Zarqv"
+            )
+        }));
+
+        let mut s3 = SmartKeySession::new();
+        let mut b3 = String::new();
+        feed_keys(&mut s3, &mut engine, &mut b3, "meet zarqv ");
+        assert_eq!(b3, "meet zarqv ");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sentence_start_untouched_oov_followed_by_lowercase_graduates_lowercase_and_skips_known_typos() {
+    let mut store = RuleStore::in_memory(Preset::Balanced);
+    let lex = smartkey_core::PackLexicon::from_bundled().unwrap();
+    for _ in 0..3 {
+        let ev = smartkey_core::learner::record_untouched_unknown(
+            &mut store,
+            Some(&lex),
+            &LangId::en(),
+            "beleive",
+        );
+        assert_eq!(ev, LearnEvent::None);
+    }
+    assert!(!store.compiled().personal_dict.contains("beleive"));
+
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut s = SmartKeySession::new();
+    let mut b = String::new();
+    feed_keys(
+        &mut s,
+        &mut engine,
+        &mut b,
+        "Zyxkorp. we use zyxkorp and zyxkorp.<ENTER>",
+    );
+    assert_eq!(
+        engine
+            .store()
+            .compiled()
+            .personal_dict_canonical
+            .get("zyxkorp")
+            .map(String::as_str),
+        Some("zyxkorp"),
+        "sentence-start OOV followed by lowercase uses must graduate as lowercase"
+    );
+}

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::casing::is_expressive_stretch;
 use crate::keyboard::damerau_levenshtein_chars;
 use crate::lexicon::PackLexicon;
-use crate::scorer::{is_staged_rejection_pair_for, UserRuleView};
+use crate::scorer::{allows_personal_proper_case, is_staged_rejection_pair_for, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::LangId;
 
@@ -209,7 +209,7 @@ fn reject_pair_permanently(
 /// erase it again, deadlocking recovery by typing.
 fn clear_pair_rejection(
     store: &mut RuleStore,
-    lexicon: Option<&PackLexicon>,
+    _lexicon: Option<&PackLexicon>,
     lang: &LangId,
     typed_lower: &str,
     fixed: &str,
@@ -223,21 +223,18 @@ fn clear_pair_rejection(
     );
     let state = store.state_mut();
     state.staged_contraction_reject_applied_at.remove(&key);
-    if state.staged_contraction_rejects.remove(&key).is_some()
-        || is_staged_rejection_pair_for(lexicon, lang.as_str(), typed_lower, &fixed.to_lowercase())
-    {
-        // The 2x-blocked path leaves a persisted undo-keep key that `is_undo_shielded` reads as a
-        // cross-session shield; graduation must lift it too.
-        state.staged_undo_keep.remove(&key);
-    }
+    state.staged_contraction_rejects.remove(&key);
+    state.staged_undo_keep.remove(&key);
 }
 
 /// Row 2: `Undo + Keep Verbatim` (`"hok " -> "hot " -> BS -> Space`).
 /// - `1x`: Immediately blocks `(typed, rejected)` in `blocklist` on disk AND shields `typed_lower`
 ///   in-session so the user never has to backspace the same unwanted replacement twice — EXCEPT
-///   curated contraction pairs (`"dont" -> "don't"`), which only stage the rejection (see
-///   `reject_pair_permanently`); the session shield already covers the rest of the session.
-/// - `2x`: Permanently promotes `typed` to `personal_dict` in `rules.toml`.
+///   curated contraction pairs (`"dont" -> "don't"`) and curated proper nouns (`"english" -> "English"`),
+///   which only stage the rejection (see `reject_pair_permanently`); the session shield already covers
+///   the rest of the session.
+/// - `2x`: Permanently promotes `typed` to `personal_dict` in `rules.toml` (or downgrades uppercase
+///   `personal_dict` canonical casing on case-only rejections).
 pub fn record_undo_keep_verbatim(
     store: &mut RuleStore,
     lexicon: Option<&PackLexicon>,
@@ -245,7 +242,8 @@ pub fn record_undo_keep_verbatim(
     typed_raw: &str,
     rejected: &str,
 ) -> LearnEvent {
-    let typed_lower = typed_raw.to_lowercase();
+    let trimmed_raw = typed_raw.trim();
+    let typed_lower = trimmed_raw.to_lowercase();
     let rejected_lower = rejected.to_lowercase();
     if typed_lower.is_empty() {
         return LearnEvent::None;
@@ -257,9 +255,32 @@ pub fn record_undo_keep_verbatim(
     }
     store.add_session_word_shield(&typed_lower);
     store.add_session_pair_block(&typed_lower, &rejected_lower);
+    if typed_lower == rejected_lower && trimmed_raw.chars().any(char::is_uppercase) {
+        return LearnEvent::ShieldedWordSession { word: typed_lower };
+    }
     store.sync_state_before_write();
+    let personal_target_lang = if lang.as_str() != "en"
+        && !store
+            .compiled()
+            .lang_personal_dict
+            .get(lang.as_str())
+            .is_some_and(|s| s.contains(&typed_lower))
+        && store.compiled().personal_dict.contains(&typed_lower)
+    {
+        LangId::en()
+    } else {
+        lang.clone()
+    };
+    if typed_lower == rejected_lower
+        && !trimmed_raw.chars().any(char::is_uppercase)
+        && store
+            .lookup_personal_canonical_for(&personal_target_lang, &typed_lower)
+            .is_some_and(|c| !allows_personal_proper_case(lexicon, &typed_lower, c))
+    {
+        store.remove_personal_word(&personal_target_lang, &typed_lower);
+    }
     if !reject_pair_permanently(store, lexicon, lang, &typed_lower, &rejected_lower) {
-        // `1x` rejection of a curated contraction pair: session shield only, nothing permanent.
+        // `1x` rejection of a curated contraction/proper-noun pair: session shield only, nothing permanent.
         // Must return BEFORE touching `staged_undo_keep`: `RuleStore::is_undo_shielded` treats any
         // persisted `staged_undo_keep` key for the word as a cross-session shield, which would
         // silence the curated rule on the very next session and defeat the `2x` requirement.
@@ -274,13 +295,19 @@ pub fn record_undo_keep_verbatim(
     };
 
     if cnt >= 2 {
-        let word_to_save = if typed_raw.trim().chars().any(char::is_uppercase) {
-            typed_raw.trim()
+        let word_to_save = if trimmed_raw.chars().any(char::is_uppercase)
+            && allows_personal_proper_case(lexicon, &typed_lower, trimmed_raw)
+        {
+            trimmed_raw
         } else {
             &typed_lower
         };
         if is_prose_word_token(&typed_lower) {
-            store.add_personal_word_with_stage(lang, word_to_save, "undo_keep_2x");
+            if typed_lower == rejected_lower && !trimmed_raw.chars().any(char::is_uppercase) {
+                store.downgrade_personal_word_case(&personal_target_lang, &typed_lower);
+            } else {
+                store.add_personal_word_with_stage(lang, word_to_save, "undo_keep_2x");
+            }
         }
         let _ = store.flush_state();
         LearnEvent::GraduatedUndoKeep {
@@ -369,8 +396,7 @@ pub fn resolve_restored_edit(
     // immediate `1x` block. Editing to a 3rd word (`"dont" -> "don't" -> BS -> "donut "`) is weak
     // evidence against the contraction — it may simply have been a different intended word.
     let pair_blocked = reject_pair_permanently(store, lexicon, lang, &raw_lower, &rej_lower);
-    let rej_in_lexicon =
-        lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&rej_lower));
+    let rej_in_lexicon = lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&rej_lower));
     if !rej_in_lexicon && store.is_explicit_personal_word(lang, &rej_lower) {
         let demote_key = format!("demote:{}:{}", lang.as_str(), rej_lower);
         let cnt = {
@@ -415,6 +441,7 @@ pub fn record_manual_edit(
         LearnEvent::StagedCorrection { count, .. } => Some(format!("staged ({count}x)")),
         LearnEvent::GraduatedCorrection { .. } => Some("graduated".to_string()),
         LearnEvent::GraduatedPersonalWord { .. } => Some("graduated_case".to_string()),
+        LearnEvent::BlockedPairPermanent { .. } => Some("graduated_uncase".to_string()),
         LearnEvent::StagedContextCorrection { count, .. } => {
             Some(format!("staged_context ({count}x)"))
         }
@@ -545,6 +572,10 @@ fn record_manual_edit_inner(
                         "{}:{fixed_lower}->{fixed_lower}",
                         effective_lang.as_str()
                     ));
+                    store
+                        .state_mut()
+                        .staged_corrections
+                        .remove(&format!("uncase:{}:{fixed_lower}", effective_lang.as_str()));
                     if !is_blocked_proper {
                         store.add_personal_word_with_stage(
                             &effective_lang,
@@ -557,6 +588,118 @@ fn record_manual_edit_inner(
                     return LearnEvent::GraduatedPersonalWord {
                         lang: effective_lang.0,
                         word: fixed_trimmed.to_string(),
+                    };
+                }
+                let _ = store.flush_state();
+                return LearnEvent::StagedCorrection {
+                    lang: effective_lang.0,
+                    orig: orig_trimmed.to_string(),
+                    fixed: fixed_trimmed.to_string(),
+                    count,
+                };
+            }
+        } else if orig_trimmed != fixed_trimmed
+            && is_prose_word_token(&fixed_lower)
+            && fixed_lower.chars().count() >= 2
+            && orig_trimmed.chars().any(char::is_uppercase)
+            && !fixed_trimmed.chars().any(char::is_uppercase)
+        {
+            let target_has_non_ascii = fixed_lower
+                .chars()
+                .any(|c| !c.is_ascii() && c.is_alphabetic());
+            if lang.as_str() == "vi" && !target_has_non_ascii {
+                return LearnEvent::None;
+            }
+            let effective_lang = if target_has_non_ascii && lang.as_str() == "en" {
+                LangId("vi".to_string())
+            } else {
+                lang.clone()
+            };
+            if store.is_pinned(&fixed_lower) {
+                return LearnEvent::None;
+            }
+            let active_lex = if effective_lang == *lang {
+                lexicon
+            } else {
+                None
+            };
+            let personal_target_lang = if effective_lang.as_str() != "en"
+                && !store
+                    .compiled()
+                    .lang_personal_dict
+                    .get(effective_lang.as_str())
+                    .is_some_and(|s| s.contains(&fixed_lower))
+                && store.compiled().personal_dict.contains(&fixed_lower)
+            {
+                LangId::en()
+            } else {
+                effective_lang.clone()
+            };
+            let personal_canon_upper = store
+                .lookup_personal_canonical_for(&personal_target_lang, &fixed_lower)
+                .filter(|c| c.chars().any(char::is_uppercase))
+                .map(str::to_string);
+            let curated_proper_active = active_lex
+                .is_some_and(|l| l.lookup_proper_noun(&fixed_lower).is_some())
+                && !store.is_pair_blocked(&fixed_lower, &fixed_lower);
+            let staged_canon_active = store
+                .state()
+                .staged_personal_canonical
+                .contains_key(&format!("{}:{fixed_lower}", effective_lang.as_str()))
+                || store
+                    .state()
+                    .staged_corrections
+                    .contains_key(&format!("case:{}:{fixed_lower}", effective_lang.as_str()));
+
+            if personal_canon_upper.is_some() || curated_proper_active || staged_canon_active {
+                store.reload_if_modified();
+                store.add_session_word_shield(&fixed_lower);
+                store.add_session_pair_block(&fixed_lower, &fixed_lower);
+                let canon_key = format!("{}:{fixed_lower}", effective_lang.as_str());
+                let case_key = format!("case:{}:{fixed_lower}", effective_lang.as_str());
+                {
+                    let st = store.state_mut();
+                    st.staged_personal_canonical.remove(&fixed_lower);
+                    st.staged_personal_canonical.remove(&canon_key);
+                    st.staged_corrections.remove(&case_key);
+                }
+                if personal_canon_upper
+                    .as_deref()
+                    .is_some_and(|c| !allows_personal_proper_case(active_lex, &fixed_lower, c))
+                {
+                    store.remove_personal_word(&personal_target_lang, &fixed_lower);
+                    store.add_permanent_block(&fixed_lower, &fixed_lower);
+                    let _ = store.flush_state();
+                    return LearnEvent::BlockedPairPermanent {
+                        typed: fixed_lower.clone(),
+                        rejected: fixed_lower,
+                    };
+                }
+                let uncase_key = format!("uncase:{}:{fixed_lower}", effective_lang.as_str());
+                let count = {
+                    let e = store
+                        .state_mut()
+                        .staged_corrections
+                        .entry(uncase_key.clone())
+                        .or_insert(0);
+                    *e = e.saturating_add(1);
+                    *e
+                };
+                if count >= 2 {
+                    store.state_mut().staged_corrections.remove(&uncase_key);
+                    if active_lex.is_some_and(|l| {
+                        l.contains_any_variant_or_elided(&fixed_lower)
+                            && !l.lookup_word(&fixed_lower).is_some_and(|m| m.is_tech())
+                    }) {
+                        store.remove_personal_word(&personal_target_lang, &fixed_lower);
+                    } else {
+                        store.downgrade_personal_word_case(&personal_target_lang, &fixed_lower);
+                    }
+                    store.add_permanent_block(&fixed_lower, &fixed_lower);
+                    let _ = store.flush_state();
+                    return LearnEvent::BlockedPairPermanent {
+                        typed: fixed_lower.clone(),
+                        rejected: fixed_lower,
                     };
                 }
                 let _ = store.flush_state();
@@ -727,10 +870,12 @@ fn record_manual_edit_inner(
     // Guard 2: Valid-Word Shield (`"form" -> "from"` must NEVER learn as a global unigram rule!).
     // Core lexicon words are permanently shielded; `personal_dict`-only words can be un-dictionaried
     // if the user manually fixes them into another word `2x`.
-    let orig_in_lexicon =
-        active_lex.is_some_and(|l| l.contains_any_variant_or_elided(&orig_lower));
+    let orig_in_lexicon = active_lex.is_some_and(|l| l.contains_any_variant_or_elided(&orig_lower));
 
     if !orig_in_lexicon {
+        if orig_chars.len() < 2 {
+            return LearnEvent::None;
+        }
         // If `orig_lower` previously had a `1x` undo-keep shield (e.g. an accidental `1x` undo on `"forn"`),
         // manually fixing `orig_lower -> fixed_lower` immediately clears that undo shield.
         store.clear_undo_shield(&effective_lang, &orig_lower);
@@ -742,22 +887,19 @@ fn record_manual_edit_inner(
             .entry(fixed_lower.clone())
             .or_insert(0) += 1;
 
-        // Preserve target casing if explicitly non-ASCII (`"Đắk"`), mixed-case (`"PyTorch"`, `"FastAPI"`),
-        // or intentional TitleCase (`"Hyprland"` when `orig_raw` was lowercase or `target_is_novel_unknown`).
+        // Preserve target casing only when explicitly non-ASCII (`"Đắk"`), mixed-case
+        // (`"PyTorch"`, `"FastAPI"`), novel OOV (`"Hyprland"`), lexicon tech (`FLAG_TECH`),
+        // or an unblocked curated proper noun — never sentence-start TitleCase on ordinary prose!
         let fixed_trimmed = fixed_raw.trim();
-        let has_internal_upper = fixed_trimmed.chars().skip(1).any(char::is_uppercase);
-        let has_intentional_title = fixed_trimmed.chars().next().is_some_and(char::is_uppercase)
-            && (target_is_novel_unknown
-                || orig_raw
-                    .trim()
-                    .chars()
-                    .next()
-                    .is_some_and(char::is_lowercase)
-                || active_lex
-                    .is_some_and(|l| l.lookup_word(&fixed_lower).is_some_and(|m| m.is_tech())));
-        let target_to_save = if target_has_non_ascii || has_internal_upper || has_intentional_title
-        {
+        let can_personal_case = is_intentional_cased_token(fixed_trimmed)
+            && allows_personal_proper_case(active_lex, &fixed_lower, fixed_trimmed);
+        let curated_proper = active_lex
+            .and_then(|l| l.lookup_proper_noun(&fixed_lower))
+            .filter(|_| !store.is_pair_blocked(&fixed_lower, &fixed_lower));
+        let target_to_save = if target_has_non_ascii || can_personal_case {
             fixed_trimmed.to_string()
+        } else if let Some(proper) = curated_proper {
+            proper.to_string()
         } else {
             fixed_lower.clone()
         };
@@ -810,7 +952,7 @@ fn record_manual_edit_inner(
             if store.is_explicit_personal_word(&effective_lang, &orig_lower) {
                 store.remove_personal_word(&effective_lang, &orig_lower);
             }
-            if (target_is_novel_unknown || has_internal_upper || has_intentional_title)
+            if (target_is_novel_unknown || can_personal_case)
                 && !store.is_personal_word(&fixed_lower)
             {
                 store.add_personal_word_with_stage(
@@ -828,7 +970,13 @@ fn record_manual_edit_inner(
             } else {
                 None
             };
-            clear_pair_rejection(store, eff_lex, &effective_lang, &orig_lower, &target_to_save);
+            clear_pair_rejection(
+                store,
+                eff_lex,
+                &effective_lang,
+                &orig_lower,
+                &target_to_save,
+            );
             let _ = store.flush_state();
             return LearnEvent::GraduatedCorrection {
                 lang: effective_lang.0,
@@ -954,6 +1102,7 @@ pub fn record_untouched_unknown(
             store.compiled().personal_dict_canonical.get(&lower)
         };
         if is_intentional_cased_token(word_trimmed)
+            && allows_personal_proper_case(lexicon, &lower, word_trimmed)
             && canon.is_none_or(|c| !c.chars().any(char::is_uppercase))
         {
             let target_lang = if lang.as_str() != "en"
@@ -999,12 +1148,36 @@ pub fn record_untouched_unknown(
         return LearnEvent::None;
     }
 
+    let undo_prefix = format!("{}:{}->", lang.as_str(), lower);
+    let has_prior_undo = store
+        .state()
+        .staged_undo_keep
+        .iter()
+        .any(|(k, &v)| v >= 1 && k.starts_with(&undo_prefix));
+    if !has_prior_undo && lexicon.is_some_and(|l| l.lookup_known_typos(&lower).is_some()) {
+        return LearnEvent::None;
+    }
+
     let key = format!("{}:{}", lang.as_str(), lower);
-    if has_upper && is_intentional_cased_token(word_trimmed) {
+    if has_upper
+        && is_intentional_cased_token(word_trimmed)
+        && allows_personal_proper_case(lexicon, &lower, word_trimmed)
+    {
         store
             .state_mut()
             .staged_personal_canonical
             .insert(key.clone(), word_trimmed.to_string());
+    } else if !has_upper {
+        let lang_prefix = format!("{}:", lang.as_str());
+        let target_suffix = format!("->{lower}");
+        let case_key = format!("case:{}:{lower}", lang.as_str());
+        let has_active_manual_fix = store.state().staged_corrections.iter().any(|(k, &v)| {
+            v >= 1
+                && (k == &case_key || (k.starts_with(&lang_prefix) && k.ends_with(&target_suffix)))
+        });
+        if !has_active_manual_fix {
+            store.state_mut().staged_personal_canonical.remove(&key);
+        }
     }
     let count = {
         let e = store
@@ -1016,14 +1189,8 @@ pub fn record_untouched_unknown(
         *e
     };
 
-    let undo_prefix = format!("{}:{}->", lang.as_str(), lower);
-    let has_prior_undo = store
-        .state()
-        .staged_undo_keep
-        .iter()
-        .any(|(k, &v)| v >= 1 && k.starts_with(&undo_prefix));
     let required_count = if has_prior_undo { 1 } else { 3 };
-    let word_to_save = if has_upper {
+    let word_to_save = if has_upper && allows_personal_proper_case(lexicon, &lower, word_trimmed) {
         word_trimmed.to_string()
     } else if let Some(canon) = store.state().staged_personal_canonical.get(&key).cloned() {
         canon

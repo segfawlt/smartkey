@@ -106,29 +106,66 @@ pub fn is_unconditional_contraction_pair(typed_lower: &str, expanded_lower: &str
         .is_some_and(|lex| lex.is_contraction_pair(typed_lower, expanded_lower))
 }
 
+/// True when `candidate_cased` is eligible to hold canonical uppercase in `personal_dict`
+/// (internal uppercase like `PyTorch`, non-ASCII initial uppercase like `Đắk`, novel OOV words
+/// like `Domixi`, or lexicon `FLAG_TECH` words like `Hyprland`). Ordinary non-tech lexicon
+/// prose words (`It`, `The`, `Hello`, `Polish`) return `false` so sentence-start TitleCase
+/// never hijacks mid-sentence prose.
+pub fn allows_personal_proper_case(
+    lexicon: Option<&PackLexicon>,
+    lower_word: &str,
+    candidate_cased: &str,
+) -> bool {
+    let mut chars = candidate_cased.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !candidate_cased.chars().any(char::is_uppercase) {
+        return false;
+    }
+    if chars.any(char::is_uppercase) || (!first.is_ascii() && first.is_uppercase()) {
+        return true;
+    }
+    match lexicon {
+        None => true,
+        Some(lex) => {
+            !lex.contains_any_variant_or_elided(lower_word)
+                || lex.lookup_word(lower_word).is_some_and(|m| m.is_tech())
+        }
+    }
+}
+
 /// True when `(typed_lower, rejected_lower)` requires `2x` rejection evidence for the given pack:
-/// curated contractions from `lexicon.rules()` (`dont -> don't`) and case-only corrections (`polish -> Polish`).
+/// curated contractions from `lexicon.rules()` (`dont -> don't`), standalone `i -> I`, and
+/// curated proper nouns (`english -> English`) — NOT machine-learned `personal_dict` casing
+/// (`domixi -> Domixi` or accidental `it -> It`), which must block at `1x`.
 pub fn is_staged_rejection_pair_for(
     lexicon: Option<&PackLexicon>,
     lang: &str,
     typed_lower: &str,
     rejected_lower: &str,
 ) -> bool {
+    let resolved_lex = match lexicon {
+        Some(lex) => Some(lex),
+        None if lang == "en" => crate::lexicon::bundled_en_lexicon(),
+        None => None,
+    };
+    let Some(lex) = resolved_lex else {
+        return false;
+    };
     if typed_lower == rejected_lower {
-        return true;
+        return (lex.rules().capitalize_standalone_i && typed_lower == "i")
+            || lex.lookup_proper_noun(typed_lower).is_some();
     }
-    match lexicon {
-        Some(lex) => lex.is_contraction_pair(typed_lower, rejected_lower),
-        None => lang == "en" && is_unconditional_contraction_pair(typed_lower, rejected_lower),
-    }
+    lex.is_contraction_pair(typed_lower, rejected_lower)
 }
 
 /// Pairs whose permanent block needs `2x` rejection evidence instead of an immediate `1x` block:
-/// curated contractions (`dont -> don't`) and case-only corrections (`polish -> Polish`; after
-/// lowercasing both sides are equal). Both come from curated lists, so one accidental BackSpace
-/// must not permanently disable them (see `learner::reject_pair_permanently`).
+/// curated contractions (`dont -> don't`) and curated case-only corrections (`english -> English`).
+/// Both come from curated lists, so one accidental BackSpace must not permanently disable them
+/// (see `learner::reject_pair_permanently`).
 pub fn is_staged_rejection_pair(typed_lower: &str, rejected_lower: &str) -> bool {
-    typed_lower == rejected_lower || is_unconditional_contraction_pair(typed_lower, rejected_lower)
+    is_staged_rejection_pair_for(None, "en", typed_lower, rejected_lower)
 }
 
 /// Layer 1 PC-first scorer backed by `PackLexicon`.
@@ -405,11 +442,9 @@ impl LatinScorer {
             if let Some((stem, suffix)) = core_lower.split_once(';') {
                 if !stem.is_empty() && lang_rules.clitics.suffixes.iter().any(|s| s == suffix) {
                     let candidate_apos = format!("{stem}'{suffix}");
-                    let resolved = if let Some(rule) = lang_rules
-                        .replacements
-                        .iter()
-                        .find(|r| r.kind == ReplacementKind::Contraction && r.typed == candidate_apos)
-                    {
+                    let resolved = if let Some(rule) = lang_rules.replacements.iter().find(|r| {
+                        r.kind == ReplacementKind::Contraction && r.typed == candidate_apos
+                    }) {
                         Some(rule.fix.clone())
                     } else if self.lexicon.contains_any_variant(&candidate_apos) {
                         Some(candidate_apos)
@@ -456,7 +491,8 @@ impl LatinScorer {
                 .iter()
                 .filter(|r| r.kind == ReplacementKind::TransposedApostrophe)
             {
-                if core_lower == r.typed && !rules.is_pair_blocked(&core_lower, &r.fix.to_lowercase())
+                if core_lower == r.typed
+                    && !rules.is_pair_blocked(&core_lower, &r.fix.to_lowercase())
                 {
                     let rep = wrap(&project_case(&r.fix, cap_initial));
                     return (
@@ -504,6 +540,8 @@ impl LatinScorer {
                 if let Some(canon) = rules.lookup_personal_canonical(&core_lower) {
                     if canon.chars().any(char::is_uppercase)
                         && core != canon
+                        && (rules.is_pinned(&core_lower)
+                            || allows_personal_proper_case(Some(&self.lexicon), &core_lower, canon))
                         && !rules.is_pair_blocked(&core_lower, &canon.to_lowercase())
                     {
                         let rep = wrap(canon);
@@ -531,6 +569,7 @@ impl LatinScorer {
             let allow_personal_case_upgrade = in_personal
                 && !shift_slip_fixed
                 && (is_mixed_case_word || (user_title_case && !ctx.at_sentence_start))
+                && allows_personal_proper_case(Some(&self.lexicon), &core_lower, &core)
                 && rules
                     .lookup_personal_canonical(&core_lower)
                     .is_some_and(|c| !c.chars().any(char::is_uppercase));
@@ -1000,7 +1039,9 @@ impl LatinScorer {
                         self.lexicon
                             .lookup_word(mapped)
                             .map(|m| self.lexicon.effective_freq_meta(m, config.dialect))
-                            .unwrap_or_else(|| self.lexicon.effective_freq_meta(meta, config.dialect))
+                            .unwrap_or_else(|| {
+                                self.lexicon.effective_freq_meta(meta, config.dialect)
+                            })
                     };
                     if char_len <= 4 {
                         let cost = weighted_keyboard_cost(&core_lower, mapped);
@@ -1221,12 +1262,12 @@ impl LatinScorer {
                 .lexicon
                 .effective_freq_meta(m1, config.dialect)
                 .min(self.lexicon.effective_freq_meta(m2, config.dialect));
-            let w1_fmt = if w1 == "i" && config.auto_capitalize_i && lang_rules.capitalize_standalone_i
-            {
-                "I"
-            } else {
-                w1
-            };
+            let w1_fmt =
+                if w1 == "i" && config.auto_capitalize_i && lang_rules.capitalize_standalone_i {
+                    "I"
+                } else {
+                    w1
+                };
             let joined = format!("{w1_fmt} {w2}");
             push_candidate(
                 &joined,

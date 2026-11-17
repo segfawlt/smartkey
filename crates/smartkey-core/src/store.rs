@@ -2309,6 +2309,125 @@ impl RuleStore {
         self.state.staged_personal_canonical.remove(&key);
     }
 
+    /// Looks up canonical `personal_dict` casing for `lower_word` under `lang`, falling back to
+    /// global English `personal_dict` when `lang != "en"`.
+    pub fn lookup_personal_canonical_for(&self, lang: &LangId, lower_word: &str) -> Option<&str> {
+        if lang.as_str() != "en" {
+            if let Some(c) = self
+                .compiled
+                .lang_personal_dict_canonical
+                .get(lang.as_str())
+                .and_then(|m| m.get(lower_word))
+            {
+                return Some(c.as_str());
+            }
+        }
+        self.compiled
+            .personal_dict_canonical
+            .get(lower_word)
+            .map(String::as_str)
+    }
+
+    /// Downgrades a cased `personal_dict` entry (`"Domixi"`) to lowercase (`"domixi"`) while
+    /// keeping the word in `personal_dict`, returning `true` if `rules.toml` was updated.
+    pub fn downgrade_personal_word_case(&mut self, lang: &LangId, word_lower: &str) -> bool {
+        self.sync_external_edits_before_write();
+        let word_l = word_lower.trim().to_lowercase();
+        if word_l.is_empty() {
+            return false;
+        }
+        let staged_key = format!("{}:{word_l}", lang.as_str());
+        let mut state_changed = self
+            .state
+            .staged_personal_canonical
+            .remove(&word_l)
+            .is_some();
+        state_changed |= self
+            .state
+            .staged_personal_canonical
+            .remove(&staged_key)
+            .is_some();
+
+        let prev_canon = if lang.as_str() == "en" {
+            if self
+                .compiled
+                .personal_dict_canonical
+                .get(&word_l)
+                .is_some_and(|c| c.chars().any(char::is_uppercase))
+            {
+                let prev = self
+                    .compiled
+                    .personal_dict_canonical
+                    .insert(word_l.clone(), word_l.clone());
+                if let Some(arr) = self
+                    .doc
+                    .get_mut("personal_dict")
+                    .and_then(Item::as_array_mut)
+                {
+                    for item in arr.iter_mut() {
+                        if item.as_str().is_some_and(|s| s.to_lowercase() == word_l) {
+                            let decor = item.decor().clone();
+                            let mut val = Value::from(word_l.as_str());
+                            *val.decor_mut() = decor;
+                            *item = val;
+                        }
+                    }
+                }
+                prev
+            } else {
+                None
+            }
+        } else if self
+            .compiled
+            .lang_personal_dict_canonical
+            .get(lang.as_str())
+            .and_then(|m| m.get(&word_l))
+            .is_some_and(|c| c.chars().any(char::is_uppercase))
+        {
+            let prev = self
+                .compiled
+                .lang_personal_dict_canonical
+                .get_mut(lang.as_str())
+                .and_then(|m| m.insert(word_l.clone(), word_l.clone()));
+            if let Some(arr) = self
+                .doc
+                .get_mut("lang")
+                .and_then(Item::as_table_mut)
+                .and_then(|t| t.get_mut(lang.as_str()))
+                .and_then(Item::as_table_mut)
+                .and_then(|t| t.get_mut("personal_dict"))
+                .and_then(Item::as_array_mut)
+            {
+                for item in arr.iter_mut() {
+                    if item.as_str().is_some_and(|s| s.to_lowercase() == word_l) {
+                        let decor = item.decor().clone();
+                        let mut val = Value::from(word_l.as_str());
+                        *val.decor_mut() = decor;
+                        *item = val;
+                    }
+                }
+            }
+            prev
+        } else {
+            None
+        };
+
+        if let Some(prev) = prev_canon {
+            let _ = self.flush_rules();
+            let _ = self.flush_state();
+            self.log_rule_learned(
+                &format!("personal_dict:{word_l}"),
+                "case_downgrade_2x",
+                Some(prev),
+            );
+            return true;
+        }
+        if state_changed {
+            let _ = self.flush_state();
+        }
+        false
+    }
+
     /// Clears any `1x` undo-keep shield and untouched-unknown staging for `word_lower` when the user
     /// manually edits `word_lower` into a different word.
     pub fn clear_undo_shield(&mut self, lang: &LangId, word_lower: &str) {
@@ -4603,8 +4722,7 @@ fomr = \"from\"
         let mut store = RuleStore::in_memory(Preset::Balanced);
         store.add_correction(&LangId::en(), "r", "or");
         store.add_correction(&LangId::vi(), "dak", "Đắk");
-        store
-            .add_correction(&LangId("es".to_string()), "xqtypo", "porque");
+        store.add_correction(&LangId("es".to_string()), "xqtypo", "porque");
         store.set_snippet(";sig", "Best regards").unwrap();
 
         // Active lang "en" sees top-level [corrections], not [lang.vi.corrections] / [lang.es.corrections]

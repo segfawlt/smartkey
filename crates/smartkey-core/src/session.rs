@@ -92,10 +92,7 @@ impl LexiconRegistry {
     /// Scans `dirs` in priority order (earliest directory wins on conflict for the same `lang`),
     /// collecting `"legacy_pack_ignored"` / `"invalid_pack_ignored"` notices for rejected `.skdict` files.
     /// Falls back to `bundled-en` when `"en"` was not loaded from disk and `bundled_en_fallback` is true.
-    pub fn scan_dirs(
-        dirs: &[PathBuf],
-        bundled_fallback: bool,
-    ) -> (Self, Vec<(String, String)>) {
+    pub fn scan_dirs(dirs: &[PathBuf], bundled_fallback: bool) -> (Self, Vec<(String, String)>) {
         let mut reg = Self::new();
         let mut notices = Vec::new();
 
@@ -224,11 +221,7 @@ impl SmartKeyEngine {
         engine
     }
 
-    pub fn new_from_dirs(
-        dirs: &[PathBuf],
-        bundled_fallback: bool,
-        store: RuleStore,
-    ) -> Self {
+    pub fn new_from_dirs(dirs: &[PathBuf], bundled_fallback: bool, store: RuleStore) -> Self {
         let (registry, notices) = LexiconRegistry::scan_dirs(dirs, bundled_fallback);
         let mut engine = Self::from_registry(registry, store);
         engine.emit_notices(notices);
@@ -345,7 +338,11 @@ impl SmartKeyEngine {
         self.active_vi_pack()?.lookup_shorthand(lower)
     }
 
-    fn simulate_vi_lotus(&self, raw_keys: &str, opts: crate::vi_telex::LotusOptions) -> crate::vi_telex::LotusSimulation {
+    fn simulate_vi_lotus(
+        &self,
+        raw_keys: &str,
+        opts: crate::vi_telex::LotusOptions,
+    ) -> crate::vi_telex::LotusSimulation {
         crate::vi_telex::simulate_lotus_word_with_dict(raw_keys, opts, self.active_vi_syllables())
     }
 
@@ -359,7 +356,10 @@ impl SmartKeyEngine {
 
     fn emit_notices(&mut self, notices: Vec<(String, String)>) {
         for (notice, detail) in notices {
-            if self.emitted_notices.insert((notice.clone(), detail.clone())) {
+            if self
+                .emitted_notices
+                .insert((notice.clone(), detail.clone()))
+            {
                 self.store.log_pack_notice(&notice, &detail);
             }
         }
@@ -1314,11 +1314,7 @@ impl SmartKeySession {
                     {
                         let (vi_dict, store) = engine.vi_dict_and_store_mut();
                         self.maybe_record_vi_passthrough_repair(
-                            vi_dict,
-                            store,
-                            &orig_word,
-                            &buf,
-                            events,
+                            vi_dict, store, &orig_word, &buf, events,
                         );
                     }
                     let lex = engine.registry.lexicon(self.lang.as_str());
@@ -1608,6 +1604,37 @@ impl SmartKeySession {
     fn handle_ctrl_backspace(&mut self, engine: &mut SmartKeyEngine) -> SessionOutput {
         let mode = std::mem::replace(&mut self.mode, Mode::Idle);
         match mode {
+            Mode::JustAutocorrected {
+                raw_typed,
+                applied,
+                prev_word_before,
+                trailing_boundaries,
+                is_snippet,
+                corrected_at_ms,
+            } => {
+                let undo_window = engine.store.compiled().undo_window_ms;
+                let single_word_space = !applied.chars().any(char::is_whitespace)
+                    && trailing_boundaries.chars().all(char::is_whitespace);
+                if self.last_key_ms.saturating_sub(corrected_at_ms) <= undo_window
+                    && single_word_space
+                {
+                    engine.store.log_backspace_undo(
+                        &raw_typed,
+                        &applied,
+                        UndoResolution::Triggered,
+                    );
+                    self.prev_word = prev_word_before.clone();
+                    self.mode = Mode::EditingRestored {
+                        raw_typed,
+                        rejected: applied,
+                        prev_word_before,
+                        buf: String::new(),
+                        is_snippet,
+                    };
+                } else {
+                    self.prev_word = None;
+                }
+            }
             Mode::AfterWord {
                 word,
                 prev_word_before,
@@ -2461,9 +2488,10 @@ impl SmartKeySession {
                     }
                 } else {
                     if reason == MatchKind::ValidWord && engine.store.diagnostics().event_log {
-                        if let (Some(prev), Some(scorer)) =
-                            (prev_before.as_deref(), engine.scorer_for(self.lang.as_str()))
-                        {
+                        if let (Some(prev), Some(scorer)) = (
+                            prev_before.as_deref(),
+                            engine.scorer_for(self.lang.as_str()),
+                        ) {
                             if scorer.lexicon().header().tier == PackTier::Data {
                                 let alt = scorer.find_real_word_context_alternative(
                                     &word,
@@ -2472,9 +2500,9 @@ impl SmartKeySession {
                                     &engine.store,
                                 );
                                 if let Some((cand, cand_bg, typed_bg)) = alt {
-                                    engine
-                                        .store
-                                        .log_real_word_declined(&word, prev, &cand, cand_bg, typed_bg);
+                                    engine.store.log_real_word_declined(
+                                        &word, prev, &cand, cand_bg, typed_bg,
+                                    );
                                 }
                             }
                         }
@@ -2794,7 +2822,8 @@ mod tests {
         std::fs::write(dict_dir.join("fr.skdict"), b"NOT_A_PACK").unwrap();
 
         let store = RuleStore::in_memory(Preset::Balanced);
-        let mut engine = SmartKeyEngine::new_from_dirs(std::slice::from_ref(&dict_dir), true, store);
+        let mut engine =
+            SmartKeyEngine::new_from_dirs(std::slice::from_ref(&dict_dir), true, store);
 
         // Fallback to bundled-en succeeds; invalid fr pack is ignored.
         let en = engine.lexicon().expect("bundled en fallback");
@@ -2878,7 +2907,8 @@ mod tests {
         std::fs::write(user_dir.join("es.skdict"), user_es).unwrap();
         std::fs::write(sys_dir.join("es.skdict"), sys_es).unwrap();
 
-        let (reg, notices) = LexiconRegistry::scan_dirs(&[user_dir.clone(), sys_dir.clone()], false);
+        let (reg, notices) =
+            LexiconRegistry::scan_dirs(&[user_dir.clone(), sys_dir.clone()], false);
         assert!(notices.is_empty());
         let es = reg.lexicon("es").expect("es pack loaded");
         assert_eq!(es.header().pack_version, [0, 3, 2]);
@@ -3028,7 +3058,10 @@ mod tests {
             true,
             RuleStore::in_memory(Preset::Balanced),
         );
-        assert!(engine.scorer_for("vi").is_none(), "ImeBridge pack must not expose LatinScorer");
+        assert!(
+            engine.scorer_for("vi").is_none(),
+            "ImeBridge pack must not expose LatinScorer"
+        );
         assert_eq!(engine.lookup_vi_shorthand("zzz"), Some("dạ vâng"));
         assert!(engine.is_vi_slang_word("customvi"));
         assert_eq!(engine.lookup_vi_shorthand("ko"), None);
