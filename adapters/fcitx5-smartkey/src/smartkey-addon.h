@@ -493,11 +493,25 @@ struct SelfReplaceResetGuard {
 /// Pure state machine tracking `fcitx5-lotus` uinput replacement bursts, synthetic echo suppression,
 /// and pending filtered word-break boundaries (`CommitStringEvent` deferred evaluation).
 struct LotusBridgeTracker {
-    /// Exceeds `fcitx5-lotus`'s `kReplacementAckSlackMs = 200` + preDelay (<=20ms) + postDelay (10ms).
+    /// Broad "Lotus may still be mutating the client" window, used ONLY for surrounding-text
+    /// reconciliation guards, VK-echo bookkeeping, and boundary queuing. Exceeds `fcitx5-lotus`'s
+    /// `kReplacementAckSlackMs = 200` + preDelay (<=20ms) + postDelay (10ms).
     static constexpr uint64_t kBurstInitialWindowMs = 350;
     static constexpr uint64_t kBurstEchoGraceMs = 300;
 
+    /// Narrow window in which a `BackSpace`/`Left`/`Delete` may be a synthetic Lotus echo.
+    /// Calibrated on 180 traced uinput bursts: trigger -> first echo <= 19 ms (with
+    /// `DefaultCommitInterval=10`; the default 20 ms preDelay adds <= 10 ms), echo -> echo /
+    /// `Pause` gaps <= 9 ms. User BackSpaces arrive >= 40 ms after the previous key. The old
+    /// 350/300 ms window swallowed user BackSpaces and desynced the shadow buffer
+    /// (`kiểu s<BS>cos` -> buffer `scos` -> autocorrect `sóc` deleting 4 chars).
+    /// Raise these only if Lotus `Default*Interval`/`PostDelay` are configured far above defaults.
+    static constexpr uint64_t kEchoBsFirstWindowMs = 45;
+    static constexpr uint64_t kEchoBsChainGapMs = 30;
+
     uint64_t burstDeadlineMs = 0;
+    uint64_t echoBsDeadlineMs = 0;
+    uint64_t lastUserBackspaceMs = 0;
     uint32_t pendingBoundaryCp = 0;
     bool hasPendingBoundary = false;
     bool suppressPostKey = false;
@@ -506,15 +520,40 @@ struct LotusBridgeTracker {
     std::vector<uint32_t> pendingPostBoundaryChars;
     std::string vkBoundaryCommitUtf8;
 
+    /// A key that may make Lotus start a replacement burst (Telex trigger, boundary, ...).
     void armBurst(uint64_t nowMs) {
         burstDeadlineMs = nowMs + kBurstInitialWindowMs;
+        echoBsDeadlineMs = nowMs + kEchoBsFirstWindowMs;
     }
+    /// Evidence that a burst is in flight (echo, `Pause` anchor, VK rune, intermediate commit).
+    /// Extends the echo window only by the short inter-echo gap — never self-sustaining for
+    /// human-paced (>= 40 ms autorepeat) BackSpaces.
     void rearmBurstEcho(uint64_t nowMs) {
         burstDeadlineMs = nowMs + kBurstEchoGraceMs;
+        echoBsDeadlineMs = nowMs + kEchoBsChainGapMs;
     }
-    void clearBurst() { burstDeadlineMs = 0; }
+    void clearBurst() {
+        burstDeadlineMs = 0;
+        echoBsDeadlineMs = 0;
+    }
     bool isInBurst(uint64_t nowMs) const {
         return burstDeadlineMs != 0 && nowMs <= burstDeadlineMs;
+    }
+    bool expectsEchoBackspace(uint64_t nowMs) const {
+        return echoBsDeadlineMs != 0 && nowMs <= echoBsDeadlineMs;
+    }
+
+    /// Diagnostics: a `Pause` anchor shortly after a BackSpace we classified as the user's means
+    /// that BackSpace may have been a late Lotus echo (trace label `late_echo_suspect`).
+    static constexpr uint64_t kLateEchoLookbackMs = 120;
+    void noteUserBackspace(uint64_t nowMs) { lastUserBackspaceMs = nowMs; }
+    void clearUserBackspace() { lastUserBackspaceMs = 0; }
+    bool takeLateEchoSuspect(uint64_t nowMs) {
+        const bool suspect = lastUserBackspaceMs != 0 &&
+                             nowMs >= lastUserBackspaceMs &&
+                             nowMs - lastUserBackspaceMs <= kLateEchoLookbackMs;
+        lastUserBackspaceMs = 0;
+        return suspect;
     }
 
     void setSuppressPost(bool v) { suppressPostKey = v; }
@@ -573,6 +612,8 @@ struct LotusBridgeTracker {
 
     void reset() {
         burstDeadlineMs = 0;
+        echoBsDeadlineMs = 0;
+        lastUserBackspaceMs = 0;
         pendingBoundaryCp = 0;
         hasPendingBoundary = false;
         suppressPostKey = false;
@@ -999,6 +1040,14 @@ public:
     void rearmLotusBurstEcho(uint64_t nowMs) { lotus_.rearmBurstEcho(nowMs); }
     void clearLotusBurst() { lotus_.clearBurst(); }
     bool isInLotusBurst(uint64_t nowMs) const { return lotus_.isInBurst(nowMs); }
+    bool expectsLotusEchoBackspace(uint64_t nowMs) const {
+        return lotus_.expectsEchoBackspace(nowMs);
+    }
+    void noteLotusUserBackspace(uint64_t nowMs) { lotus_.noteUserBackspace(nowMs); }
+    void clearLotusUserBackspace() { lotus_.clearUserBackspace(); }
+    bool takeLotusLateEchoSuspect(uint64_t nowMs) {
+        return lotus_.takeLateEchoSuspect(nowMs);
+    }
 
     void setSuppressPostKey(bool v) { lotus_.setSuppressPost(v); }
     bool takeSuppressPostKey() { return lotus_.takeSuppressPost(); }

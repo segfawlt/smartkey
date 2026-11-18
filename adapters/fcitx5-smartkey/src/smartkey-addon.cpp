@@ -995,12 +995,14 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         // Re-arm the echo grace window across `Pause` (rather than clearing to 0) so chained
         // bursts launched immediately from `LotusState::replayBufferedKeys()` stay suppressed.
         if (rawKey.sym() == FcitxKey_Pause) {
+            const bool lateEchoSuspect = state->takeLotusLateEchoSuspect(nowMs);
             state->markLotusActivity();
             state->rearmLotusBurstEcho(nowMs);
             state->setSuppressPostKey(true);
             if (trace) {
-                emitPreKey("lotus_pause", s0,
-                           snapshotSessionCompact(state->session()), {});
+                emitPreKey(lateEchoSuspect ? "lotus_pause+late_echo_suspect"
+                                           : "lotus_pause",
+                           s0, snapshotSessionCompact(state->session()), {});
             }
             return;
         }
@@ -1010,7 +1012,9 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         // intermediate echo BackSpaces unfiltered so they reach the client app, which means
         // `PostInputMethod` WILL fire for them — `setSuppressPostKey(true)` blocks `onPostKeyEvent`
         // from mistaking synthetic echoes for user BackSpaces!
-        if (state->isInLotusBurst(nowMs) &&
+        // Uses the NARROW echo window (`kEchoBsFirstWindowMs` / `kEchoBsChainGapMs`), not the broad
+        // 350 ms burst window: human BackSpaces inside the broad window must reach the session.
+        if (state->expectsLotusEchoBackspace(nowMs) &&
             (rawKey.sym() == FcitxKey_BackSpace ||
              rawKey.sym() == FcitxKey_Left ||
              rawKey.sym() == FcitxKey_Delete)) {
@@ -1032,6 +1036,11 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
                 emitPreKey("decode_skip", s0, s0, {});
             }
             return;
+        }
+        if (keyKind == SMARTKEY_KEY_BACKSPACE) {
+            state->noteLotusUserBackspace(nowMs);
+        } else {
+            state->clearLotusUserBackspace();
         }
         const std::string chUtf8 =
             (trace && keyKind == SMARTKEY_KEY_CHAR && codepoint >= 0x20 &&

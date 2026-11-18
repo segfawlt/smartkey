@@ -6,6 +6,9 @@
  * `XDG_DATA_HOME/fcitx5/addon/smartkey.conf` WITHOUT `FCITX_ADDON_DIRS` or root.
  */
 
+// `install-local.sh` builds Release (`-DNDEBUG`), which would compile every `assert` below to a
+// no-op and let this smoke test pass vacuously. Force assertions on for this test binary.
+#undef NDEBUG
 #include <cassert>
 #include <cstdlib>
 #include <ctime>
@@ -109,6 +112,56 @@ void verifyProfileClassification() {
     assert(!st.isInBurst(1400));
     st.rearmBurstEcho(1250);
     assert(st.isInBurst(1500));
+
+    // Echo-BackSpace vs user-BackSpace classification, calibrated on 180 real traced Lotus
+    // bursts (trigger -> first echo <= 19 ms, echo gaps <= 9 ms, always closed by `Pause`)
+    // versus user BackSpaces (>= 40 ms, never followed by `Pause`).
+    {
+        // Genuine burst: trigger letter, echoes 1 ms apart, then `Pause`.
+        LotusBridgeTracker g{};
+        g.armBurst(10000);
+        assert(g.expectsEchoBackspace(10001));
+        g.rearmBurstEcho(10001);
+        assert(g.expectsEchoBackspace(10003));
+        g.rearmBurstEcho(10003);
+        assert(g.expectsEchoBackspace(10019));
+        // Slow-but-valid first echo (default Lotus `DefaultCommitInterval=20` preDelay).
+        LotusBridgeTracker slow{};
+        slow.armBurst(11000);
+        assert(slow.expectsEchoBackspace(11035));
+
+        // `scos` incident: lone `s` at word start, user BackSpace 191 ms later.
+        LotusBridgeTracker u{};
+        u.armBurst(20000);
+        assert(!u.expectsEchoBackspace(20191));
+        // `kl` incident: user BackSpace 308 ms after an armed letter.
+        assert(!u.expectsEchoBackspace(20308));
+        // Broad surrounding-text guard window is intentionally unchanged.
+        assert(u.isInBurst(20191));
+
+        // `Pause` closes the burst: a user BackSpace 153 ms later, then autorepeat every
+        // 40 ms, must never be treated as echo; a chained burst right after `Pause` still is.
+        LotusBridgeTracker p{};
+        p.armBurst(30000);
+        p.rearmBurstEcho(30010);  // Pause anchor
+        assert(p.expectsEchoBackspace(30020));
+        assert(!p.expectsEchoBackspace(30163));
+        assert(!p.expectsEchoBackspace(30203));
+
+        p.clearBurst();
+        assert(!p.expectsEchoBackspace(30000));
+
+        // `late_echo_suspect`: `Pause` within 120 ms of a user-classified BackSpace.
+        LotusBridgeTracker l{};
+        l.noteUserBackspace(40000);
+        assert(l.takeLateEchoSuspect(40060));
+        assert(!l.takeLateEchoSuspect(40061));  // consumed
+        l.noteUserBackspace(41000);
+        assert(!l.takeLateEchoSuspect(41500));
+        l.noteUserBackspace(42000);
+        l.clearUserBackspace();  // any non-BackSpace key in between
+        assert(!l.takeLateEchoSuspect(42010));
+    }
 
     st.setSuppressPost(true);
     assert(st.takeSuppressPost());
@@ -297,8 +350,13 @@ void verifyTraceRecorderHelpers() {
 
     // Session snapshot compact formatter across all modes + prev + lotus_composing
     {
+        // FFI snapshots always set `mode_utf8`; a zeroed struct formats as `Unknown[lc=0]`.
         SmartKeySessionSnapshot idle{};
+        idle.mode_utf8 = "Idle";
+        idle.lotus_composing = true;
         assert(formatSessionCompact(idle) == "Idle");
+        SmartKeySessionSnapshot zeroed{};
+        assert(formatSessionCompact(zeroed) == "Unknown[lc=0]");
 
         SmartKeySessionSnapshot comp{};
         comp.mode_utf8 = "Composing";
