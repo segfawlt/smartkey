@@ -6,13 +6,13 @@ tags before non-trivial work.
 ## architecture-patterns/
 
 - [Fcitx5 Flight-Recorder FFI Boundary and Persistent FD Lifecycle](./architecture-patterns/fcitx5-flight-recorder-ffi-and-fd-contract.md) — Keep header-only `smartkey-addon.h` helpers FFI-free for `addon_load_smoke`, copy borrowed `SmartKeySessionSnapshot` slices before mutation, close persistent `O_APPEND` fds in `reloadConfig()`, and enforce `BYPASS` privacy before tracing. `#fcitx5 #ffi #trace #file-descriptor #privacy`
-- [Unified App Profile Classification and `unknown_app_policy` Ordering](./architecture-patterns/unified-app-profile-classification-and-unknown-policy.md) — Keep capability flags and the GTK4 DBus no-`SurroundingText` guard ahead of `unknown_app_policy`, parse `"default"` as `None`, and delegate classification to `smartkey-core` via FFI. `#app-profiles #fcitx5 #ffi #security`
+- [Unified App Profile Classification and `unknown_app_policy` Ordering](./architecture-patterns/unified-app-profile-classification-and-unknown-policy.md) — Keep capability flags and the DBus `KeyEventOrderFix`/no-`SurroundingText` guard ahead of `unknown_app_policy`, parse `"default"` as `None`, and delegate classification to `smartkey-core` via FFI. `#app-profiles #fcitx5 #ffi #security`
 
 ## integration-issues/
 
 - [SurroundingText Unicode-Scalar Cursor Indexing vs UTF-8 Slicing](./integration-issues/surrounding-text-utf8-scalar-cursor-slicing.md) — Index `SurroundingText::text()` by stepping UTF-8 codepoint boundaries because `cursor()`/`anchor()` count Unicode scalars, not bytes, and bound huge editors (`>16384` chars). `#fcitx5 #surrounding-text #utf8 #vietnamese #wayland`
 - [Surrounding-Text Undo Guard and Async Lotus Echo Windows](./integration-issues/surrounding-text-undo-guard-async-echo-windows.md) — Guard displaced-cursor undo across `en` (`80 ms`) and `vi` (`400 ms`) while skipping surrounding-text reconciliation during self-commits, Lotus bursts, or pending boundaries. `#fcitx5 #vi-lotus #undo #surrounding-text`
-- [Fcitx5 Correction Replacement: Strategy Ladder over Linear Fallback](./integration-issues/fcitx5-replacement-strategy-ladder.md) — Model post-scorer replacement as a strategy table keyed off field-reported capabilities (`overtype xtest` → `overtype` → `del` → `surrounding` → `forwarded backspaces`), verify the deletion landed, and count unanswered deletions per `InputContext`. `#fcitx5 #replacement #delete-surrounding-text #surrounding-text #wayland #app-quirks`
+- [DBus `KeyEventOrderFix` Capability Check and Dropped-Delete Circuit Breaker](./integration-issues/dbus-key-order-fix-and-dropped-delete-guard.md) — Gate `frontend:dbus` `ForwardKey` on `CapabilityFlag::KeyEventOrderFix`, abort un-deletable replacements, and latch per-context `surroundingUntrusted` plus `JustAutocorrected` disarming when `deleteSurroundingText` is silently dropped or unanswered. `#fcitx5 #dbus #surrounding-text #gtk4 #undo #wayland`
 
 ## logic-errors/
 

@@ -2239,3 +2239,52 @@ fn dev_terms_textbox_shielded_and_accidental_undo_block_heals_on_1x_manual_fix()
     feed_keys(&mut s4, &mut engine, &mut b5, "alot ");
     assert_eq!(b5, "a lot ");
 }
+
+#[test]
+fn reconcile_surrounding_disarms_undo_on_dropped_delete_duplication() {
+    let mut engine = SmartKeyEngine::in_memory_default().expect("bundled engine");
+    let mut session = SmartKeySession::new();
+    let mut now_ms = 1_000u64;
+
+    let mut last_action = SessionAction::PassThrough;
+    for ch in "dont ".chars() {
+        now_ms += 20;
+        last_action = session.process_key(&mut engine, KeyInput::Char(ch), now_ms).action;
+    }
+    assert_eq!(
+        last_action,
+        SessionAction::Replace {
+            delete_chars: 4,
+            insert: "don't ".to_string(),
+        }
+    );
+
+    // Legitimate repeated word ("dont don't ") must keep JustAutocorrected armed.
+    now_ms += 100;
+    session.reconcile_surrounding(&mut engine, "dont don't ", 11, now_ms);
+    assert_eq!(session.debug_snapshot().mode, "JustAutocorrected");
+
+    // Dropped-delete duplication ("dontdon't ") must disarm JustAutocorrected to Idle
+    // so subsequent cleanup BackSpaces do not trigger undo/blocklist poisoning.
+    now_ms += 100;
+    session.reconcile_surrounding(&mut engine, "dontdon't ", 10, now_ms);
+    assert_eq!(session.debug_snapshot().mode, "Idle");
+
+    for _ in 0..6 {
+        now_ms += 20;
+        let out = session.process_key(&mut engine, KeyInput::BackSpace, now_ms);
+        assert_eq!(out.action, SessionAction::PassThrough);
+    }
+    assert!(
+        !engine.store().is_pair_blocked("dont", "don't"),
+        "cleanup BackSpaces after dropped-delete disarm must never blocklist (dont, don't)"
+    );
+
+    let mut recheck = String::new();
+    for ch in "dont ".chars() {
+        now_ms += 20;
+        let out = session.process_key(&mut engine, KeyInput::Char(ch), now_ms);
+        apply_key_to_buffer(&mut recheck, KeyInput::Char(ch), &out.action);
+    }
+    assert_eq!(recheck, "don't ");
+}

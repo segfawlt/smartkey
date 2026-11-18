@@ -5,6 +5,7 @@ module: crates/smartkey-core/src/store.rs
 tags: [app-profiles, fcitx5, ffi, security]
 problem_type: architecture-and-bug-fix
 date: 2026-11-16
+last_updated: 2026-11-18
 ---
 
 # Unified App Profile Classification and `unknown_app_policy` Ordering
@@ -28,7 +29,7 @@ Application profile classification had three compounding bugs across `store.rs`,
 1. Mirror the built-in classifier in `smartkey-core` (`normalize_program_id`, `classify_builtin_program`, `AppProfileConfig::classify_app`) with `"zcode"` added to both Rust and C++ IDE bypass lists (`addon_load_smoke.cpp` tests `"zcode"` parity).
 2. Precedence order (`SmartKeyAddon::classifyProfile` + `AppProfileConfig::classify_app`):
    1. Fcitx5 `CapabilityFlags` (`PasswordOrSensitive`, `Terminal`, `Url`, `Email`, numeric/disabled) -> always `BYPASS`.
-   2. Empty program + `frontend == "dbus"` + invalid/missing `SurroundingText` -> `BYPASS` (`"dbus-no-surrounding-text"`) **before** `unknown_app_policy`.
+   2. Missing/dropped `ForwardKey` (`!canForwardBackspace(frontend, flags)`, which checks `CapabilityFlag::KeyEventOrderFix` on `frontend == "dbus"`) combined with unavailable/invalid/untrusted `SurroundingText` (`!canSurround`) -> `BYPASS` (`"dbus-no-surrounding-text"`) **before** `unknown_app_policy`.
    3. `smartkey_engine_classify_app(engine, app, &reason)` returning `'static` NUL-terminated reason C strings: explicit `[app_profiles]` overrides -> built-in non-`prose` matches (`program-list`/`browser`/`chat`) -> `unknown_app_policy` (for both empty and unlisted named apps) -> `Prose`.
 3. Parse `"default" | "none" | "prose_default"` -> `None` in `extract_compiled`, add `RuleStore::{add,remove}_app_profile_override`, log all profile transitions via `shouldLogProfileTransition`, format `APP_BYPASS` vs `APP_PROFILE` in CLI `log` output (keeping JSONL `"app_bypass"` event tag backward-compatible), and expose `smartkey app [list|classify|add|remove]`.
 
@@ -43,4 +44,4 @@ Security invariants (`CapabilityFlags` and GTK4 DBus missing `SurroundingText`) 
 
 ## References
 
-0
+1

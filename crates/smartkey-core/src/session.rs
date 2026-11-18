@@ -1180,12 +1180,15 @@ impl SmartKeySession {
 
         let should_reset = match &self.mode {
             Mode::JustAutocorrected {
+                raw_typed,
                 applied,
                 trailing_boundaries,
                 ..
             } => {
                 let expected = format!("{applied}{trailing_boundaries}");
+                let dropped_dup = format!("{raw_typed}{applied}{trailing_boundaries}");
                 !ends_with_or_window_suffix(before, &expected)
+                    || (!raw_typed.is_empty() && before.ends_with(&dropped_dup))
             }
             Mode::AfterWord {
                 word,

@@ -395,12 +395,197 @@ void verifyTraceRecorderHelpers() {
         assert(!fs::exists(rotPath));
         writeRec("third-after-rotate");
         assert(fs::exists(rotPath));
-        assert(fs::exists(activePath));
+    assert(fs::exists(activePath));
         assert(fs::file_size(activePath) > 0 && fs::file_size(activePath) < 180);
 
         logger.closeIfOpen();
         assert(!logger.isOpen());
         fs::remove_all(logDir);
+    }
+}
+
+void verifyBackspaceCapabilityAndDroppedDeleteGuard() {
+    using namespace fcitx::smartkey;
+
+    // 1. DBus KeyEventOrderFix capability check: GTK3 & Qt6 forward keys, GTK4 & SDL drop them.
+    {
+        const fcitx::CapabilityFlags gtk3Flags{0x6000000020ULL};
+        const fcitx::CapabilityFlags qt6Flags{0x6000800032ULL};
+        const fcitx::CapabilityFlags gtk4Flags{0x4000000020ULL};
+        const fcitx::CapabilityFlags sdlFlags{fcitx::CapabilityFlag::Preedit};
+
+        assert(canForwardBackspace("dbus", gtk3Flags));
+        assert(canForwardBackspace("dbus", qt6Flags));
+        assert(!canForwardBackspace("dbus", gtk4Flags));
+        assert(!canForwardBackspace("dbus", sdlFlags));
+        assert(canForwardBackspace("wayland", gtk4Flags));
+        assert(canForwardBackspace("wayland_v2", gtk4Flags));
+        assert(canForwardBackspace("xcb", sdlFlags));
+        assert(canForwardBackspace("x11", sdlFlags));
+        assert(canForwardBackspace("ibus", gtk4Flags));
+    }
+
+    // 2. Atomic Confirmed at buffer start ("dont" -> "don't ") and mid-sentence ("i dont" -> "i don't ").
+    {
+        SurroundingSyncTracker sync{};
+        sync.markSurroundingUpdated();
+        sync.armDeleteCheck("dont", 4, 4, "don't ");
+        assert(!sync.surroundingSynced);
+        assert(sync.verifyPendingDelete("don't ", 6, 6) ==
+               DeleteCheckVerdict::Confirmed);
+        assert(sync.surroundingSynced);
+        assert(!sync.surroundingUntrusted);
+
+        sync.armDeleteCheck("i dont", 6, 4, "don't ");
+        assert(sync.verifyPendingDelete("i don't ", 8, 8) ==
+               DeleteCheckVerdict::Confirmed);
+        assert(sync.surroundingSynced);
+    }
+
+    // 3. DroppedDeletion at buffer start and mid-sentence flips surroundingUntrusted.
+    {
+        SurroundingSyncTracker sync{};
+        sync.markSurroundingUpdated();
+        sync.armDeleteCheck("dont", 4, 4, "don't ");
+        assert(sync.verifyPendingDelete("dontdon't ", 10, 10) ==
+               DeleteCheckVerdict::DroppedDeletion);
+        assert(sync.surroundingUntrusted);
+        assert(!sync.canUseDeleteSurrounding(true, true, 10, 4, "wayland_v2"));
+        assert(!sync.canUseDeleteSurrounding(true, true, 10, 4, "dbus"));
+
+        SurroundingSyncTracker mid{};
+        mid.markSurroundingUpdated();
+        mid.armDeleteCheck("hello dont", 10, 4, "don't ");
+        assert(mid.verifyPendingDelete("hello dontdon't ", 16, 16) ==
+               DeleteCheckVerdict::DroppedDeletion);
+        assert(mid.surroundingUntrusted);
+    }
+
+    // 4. Multi-byte Vietnamese UTF-8 scalar cursor handling.
+    {
+        SurroundingSyncTracker sync{};
+        sync.markSurroundingUpdated();
+        // "cần tieegns" -> 11 Unicode scalars, delete 7 ("tieegns"), insert "tiếng " (6 scalars)
+        sync.armDeleteCheck("cần tieegns", 11, 7, "tiếng ");
+        assert(sync.verifyPendingDelete("cần tiếng ", 10, 10) ==
+               DeleteCheckVerdict::Confirmed);
+
+        sync.armDeleteCheck("cần tieegns", 11, 7, "tiếng ");
+        assert(sync.verifyPendingDelete("cần tieegnstiếng ", 17, 17) ==
+               DeleteCheckVerdict::DroppedDeletion);
+        assert(sync.surroundingUntrusted);
+    }
+
+    // 5. Zero false positives on repeated words ("dont dont") and glued words ("dontdont").
+    {
+        SurroundingSyncTracker rep{};
+        rep.markSurroundingUpdated();
+        rep.armDeleteCheck("dont dont", 9, 4, "don't ");
+        assert(rep.verifyPendingDelete("dont don't ", 11, 11) ==
+               DeleteCheckVerdict::Confirmed);
+        assert(!rep.surroundingUntrusted);
+
+        rep.armDeleteCheck("dont dont", 9, 4, "don't ");
+        assert(rep.verifyPendingDelete("dont dontdon't ", 15, 15) ==
+               DeleteCheckVerdict::DroppedDeletion);
+        assert(rep.surroundingUntrusted);
+
+        SurroundingSyncTracker glued{};
+        glued.markSurroundingUpdated();
+        glued.armDeleteCheck("dontdont", 8, 4, "don't ");
+        assert(glued.verifyPendingDelete("dontdon't ", 10, 10) ==
+               DeleteCheckVerdict::Confirmed);
+        assert(!glued.surroundingUntrusted);
+
+        glued.armDeleteCheck("dontdont", 8, 4, "don't ");
+        assert(glued.verifyPendingDelete("dontdontdon't ", 14, 14) ==
+               DeleteCheckVerdict::DroppedDeletion);
+        assert(glued.surroundingUntrusted);
+    }
+
+    // 6. Stale pre-delete echo keeps check armed until the real commit snapshot arrives.
+    {
+        SurroundingSyncTracker sync{};
+        sync.markSurroundingUpdated();
+        sync.armDeleteCheck("dont", 4, 4, "don't ");
+        assert(sync.verifyPendingDelete("dont", 4, 4) ==
+               DeleteCheckVerdict::StalePreCommit);
+        assert(!sync.surroundingSynced);
+        assert(!sync.surroundingUntrusted);
+        assert(sync.verifyPendingDelete("don't ", 6, 6) ==
+               DeleteCheckVerdict::Confirmed);
+        assert(sync.surroundingSynced);
+    }
+
+    // 7. Two-step DBus delete-then-commit resets unansweredDeletes and yields StalePreCommit -> NoCheck.
+    {
+        SurroundingSyncTracker sync{};
+        sync.markSurroundingUpdated();
+        sync.armDeleteCheck("dont", 4, 4, "don't ");
+        assert(sync.verifyPendingDelete("", 0, 0) ==
+               DeleteCheckVerdict::StalePreCommit);
+        assert(sync.unansweredDeletes == 0);
+        assert(!sync.surroundingSynced);
+        assert(sync.verifyPendingDelete("don't ", 6, 6) ==
+               DeleteCheckVerdict::NoCheck);
+        sync.markSurroundingUpdated();
+        assert(sync.surroundingSynced);
+    }
+
+    // 8. Intervening markClientMutated() cancels pendingCheck_.
+    {
+        SurroundingSyncTracker sync{};
+        sync.markSurroundingUpdated();
+        sync.armDeleteCheck("dont", 4, 4, "don't ");
+        sync.markClientMutated();
+        assert(sync.verifyPendingDelete("dontdon't ", 10, 10) ==
+               DeleteCheckVerdict::NoCheck);
+        assert(!sync.surroundingUntrusted);
+    }
+
+    // 9. unansweredDeletes circuit breaker (kMaxUnansweredDeletes = 3) with fallback vs onlyWay.
+    {
+        SurroundingSyncTracker withFallback{};
+        withFallback.markSurroundingUpdated();
+        for (int i = 0; i < 3; ++i) {
+            withFallback.checkUnansweredBeforeDelete(true);
+            assert(!withFallback.surroundingUntrusted);
+            withFallback.armDeleteCheck("dont", 4, 4, "don't ");
+        }
+        // 4th delete observes 3rd unanswered delete -> latches surroundingUntrusted.
+        withFallback.checkUnansweredBeforeDelete(true);
+        assert(withFallback.unansweredDeletes == 3);
+        assert(withFallback.surroundingUntrusted);
+        assert(!withFallback.canUseDeleteSurrounding(true, true, 4, 4, "dbus"));
+
+        SurroundingSyncTracker onlyWay{};
+        onlyWay.markSurroundingUpdated();
+        for (int i = 0; i < 5; ++i) {
+            onlyWay.checkUnansweredBeforeDelete(false);
+            assert(!onlyWay.surroundingUntrusted);
+            onlyWay.armDeleteCheck("dont", 4, 4, "don't ");
+        }
+        assert(onlyWay.unansweredDeletes >= 3);
+        assert(!onlyWay.surroundingUntrusted);
+    }
+
+    // 10. reset() preserves surroundingUntrusted; resetTrust() clears it and unansweredDeletes.
+    {
+        SurroundingSyncTracker sync{};
+        sync.markSurroundingUpdated();
+        sync.armDeleteCheck("dont", 4, 4, "don't ");
+        assert(sync.verifyPendingDelete("dontdon't ", 10, 10) ==
+               DeleteCheckVerdict::DroppedDeletion);
+        assert(sync.surroundingUntrusted);
+
+        sync.reset();
+        assert(sync.surroundingUntrusted);
+        assert(!sync.canUseDeleteSurrounding(true, true, 10, 4, "dbus"));
+
+        sync.resetTrust();
+        assert(!sync.surroundingUntrusted);
+        assert(sync.unansweredDeletes == 0);
+        assert(sync.canUseDeleteSurrounding(true, true, 10, 4, "dbus"));
     }
 }
 
@@ -411,6 +596,7 @@ int main(int argc, char *argv[]) {
     verifyKeyboardLangNormalization();
     verifyWaylandSurroundingSyncAndDelayedTimer();
     verifyTraceRecorderHelpers();
+    verifyBackspaceCapabilityAndDroppedDeleteGuard();
     if (argc < 2) {
         std::cerr << "usage: addon_load_smoke <libsmartkey.so>\n";
         return 2;

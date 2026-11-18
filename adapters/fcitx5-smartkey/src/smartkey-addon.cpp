@@ -298,14 +298,18 @@ SmartKeyAddon::SmartKeyAddon(Instance *instance)
             focusOutContext(icEvent.inputContext());
         }));
 
-    auto resetWatcher = [this](Event &event) {
-        auto &icEvent = static_cast<InputContextEvent &>(event);
-        resetContext(icEvent.inputContext());
-    };
-
     eventWatchers_.emplace_back(instance_->watchEvent(
         EventType::InputContextDestroyed, EventWatcherPhase::PreInputMethod,
-        resetWatcher));
+        [this](Event &event) {
+            auto &icEvent = static_cast<InputContextEvent &>(event);
+            if (auto *ic = icEvent.inputContext();
+                ic != nullptr && factory_.registered()) {
+                if (auto *state = ic->propertyFor(&factory_)) {
+                    state->resetSurroundingTrust();
+                }
+            }
+            resetContext(icEvent.inputContext());
+        }));
     eventWatchers_.emplace_back(instance_->watchEvent(
         EventType::InputContextReset, EventWatcherPhase::PreInputMethod,
         [this](Event &event) {
@@ -340,6 +344,11 @@ void SmartKeyAddon::reloadConfig() {
     smartkey_engine_reload_dicts(engine_);
     bool reloadedViaContext = false;
     instance_->inputContextManager().foreach([this, &reloadedViaContext](InputContext *ic) {
+        if (ic != nullptr && factory_.registered()) {
+            if (auto *state = ic->propertyFor(&factory_)) {
+                state->resetSurroundingTrust();
+            }
+        }
         resetContext(ic);
         reloadedViaContext = true;
         return true;
@@ -393,7 +402,7 @@ void SmartKeyAddon::focusOutContext(InputContext *ic) {
         flushPendingDelayedCommit(ic, state);
         state->clearSelfReplaceGuard();
         state->resetLotusTracking();
-        state->resetSurroundingSync();
+        state->resetSurroundingTrust();
         if (state->session() != nullptr) {
             SmartKeyAction unused{};
             smartkey_session_process_key(state->session(), engine_,
@@ -484,6 +493,9 @@ void SmartKeyAddon::onSwitchInputMethod(InputContext *ic) {
     const std::string imName =
         shouldTrace && instance_ != nullptr ? instance_->inputMethod(ic) : "";
 
+    if (state != nullptr) {
+        state->resetSurroundingTrust();
+    }
     resetContext(ic);
     if (shouldTrace) {
         TraceEventFields f{};
@@ -568,20 +580,24 @@ uint8_t SmartKeyAddon::classifyProfile(InputContext *ic,
         return SMARTKEY_PROFILE_BYPASS;
     }
 
-    // GTK4's `libim-fcitx5.so` (`frontend:dbus` when `GTK_IM_MODULE=fcitx` is exported)
-    // reports an empty program name and implements DBus `ForwardKey` as a hard no-op (`ret`).
-    // If `SurroundingText` is also invalid (e.g. a GTK4 terminal or raw surface), replacement
-    // cannot delete the original word and would duplicate text (`orig + replacement`).
+    // GTK4's `libim-fcitx5.so` (`frontend:dbus`, omitting `CapabilityFlag::KeyEventOrderFix`)
+    // and SDL DBus frontends implement `ForwardKey` as a no-op. If `SurroundingText` is also
+    // unavailable, invalid, or flagged untrusted for this context, replacement cannot delete
+    // the original word and would duplicate text (`orig + replacement`).
     // Run this guard before `unknown_app_policy` so `unknown_app_policy = "prose"` cannot
-    // expose unsafe DBus surfaces without valid surrounding text.
-    const std::string_view rawProg = ic->program();
-    if (rawProg.empty() &&
-        ic->frontendName() == std::string_view("dbus") &&
-        (!flags.test(CapabilityFlag::SurroundingText) ||
-         !ic->surroundingText().isValid())) {
+    // expose unsafe DBus surfaces without a working delete path.
+    const SmartKeyState *state =
+        factory_.registered() ? ic->propertyFor(&factory_) : nullptr;
+    const bool canSurround =
+        flags.test(CapabilityFlag::SurroundingText) &&
+        ic->surroundingText().isValid() &&
+        (state == nullptr || !state->isSurroundingUntrusted());
+    if (!canForwardBackspace(ic->frontendName(), flags) && !canSurround) {
         setReason("dbus-no-surrounding-text");
         return SMARTKEY_PROFILE_BYPASS;
     }
+
+    const std::string_view rawProg = ic->program();
 
     if (engine_ != nullptr) {
         const std::string appStr(appName);
@@ -616,16 +632,6 @@ uint8_t SmartKeyAddon::classifyProfile(InputContext *ic,
 }
 
 namespace {
-
-uint32_t countUtf8Chars(std::string_view s) {
-    uint32_t count = 0;
-    for (unsigned char b : s) {
-        if ((b & 0xC0) != 0x80) {
-            ++count;
-        }
-    }
-    return count;
-}
 
 void replayPostBoundaryChars(SmartKeyState *state, SmartKeyEngineHandle *engine,
                              const std::vector<uint32_t> &queuedChars,
@@ -735,6 +741,24 @@ void SmartKeyAddon::flushPendingDelayedCommit(InputContext *ic,
     }
 }
 
+void SmartKeyAddon::disarmSessionJustAutocorrected(SmartKeyState *state,
+                                                   uint64_t nowMs) {
+    if (state == nullptr || state->session() == nullptr || engine_ == nullptr) {
+        return;
+    }
+    SmartKeySessionSnapshot snap{};
+    if (!smartkey_session_debug_snapshot(state->session(), &snap)) {
+        return;
+    }
+    if (snap.mode_utf8 != nullptr &&
+        std::string_view(snap.mode_utf8) == "JustAutocorrected") {
+        SmartKeyAction unused{};
+        smartkey_session_process_key(state->session(), engine_,
+                                     SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
+                                     &unused);
+    }
+}
+
 void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
                                          const SmartKeyAction &act) {
     flushPendingDelayedCommit(ic, state);
@@ -744,6 +768,29 @@ void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
             ? std::string(act.insert_utf8, act.insert_byte_len)
             : std::string{};
     std::string_view replaceOut;
+    auto emitReplace = [&](std::string_view out) {
+        if (!isTraceActive()) {
+            return;
+        }
+        const std::string appName = normalizeProgramId(ic->program());
+        if (classifyProfile(ic, appName, nullptr) == SMARTKEY_PROFILE_BYPASS) {
+            return;
+        }
+        TraceEventFields f{};
+        f.ev = "replace";
+        f.out = out;
+        f.hasDel = true;
+        f.del = act.delete_chars;
+        if (!insertStr.empty()) {
+            f.hasTxt = true;
+            f.txt = insertStr;
+        }
+        f.s0 = snapshotSessionCompact(state->session());
+        const std::string imName =
+            instance_ != nullptr ? instance_->inputMethod(ic) : "";
+        emitTraceRecord(trace_, ic, state, appName, imName, monotonicNowMs(),
+                        f);
+    };
 
     // Note: `fcitx::SurroundingText::cursor()` and `InputContext::deleteSurroundingText`
     // both operate in Unicode character counts (`surroundingtext.h:40`), matching `act.delete_chars`.
@@ -752,6 +799,9 @@ void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
     // `commitString` by 15ms so `zwp_virtual_keyboard_v1` BackSpaces arrive in Gecko/Zen
     // before `zwp_input_method_v2.commit_string`.
     if (act.delete_chars > 0) {
+        const bool fallbackAvailable =
+            canForwardBackspace(ic->frontendName(), ic->capabilityFlags());
+        state->checkUnansweredBeforeDelete(fallbackAvailable);
         state->markSelfReplace(monotonicNowMs());
         if (state->canUseDeleteSurrounding(
                 ic->capabilityFlags().test(CapabilityFlag::SurroundingText),
@@ -759,14 +809,18 @@ void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
                 ic->surroundingText().cursor(), act.delete_chars,
                 ic->frontendName())) {
             replaceOut = "delete_surround";
+            const std::string preTextCopy = ic->surroundingText().text();
+            const uint32_t preCursor = ic->surroundingText().cursor();
             ic->deleteSurroundingText(-static_cast<int>(act.delete_chars),
                                       act.delete_chars);
             state->markClientMutated();
+            state->armSurroundingDeleteCheck(preTextCopy, preCursor,
+                                             act.delete_chars, insertStr);
             if (!insertStr.empty()) {
                 ScopedSelfCommit guard(state);
                 ic->commitString(insertStr);
             }
-        } else {
+        } else if (fallbackAvailable) {
             const Key bsKey(FcitxKey_BackSpace);
             for (uint32_t i = 0; i < act.delete_chars; ++i) {
                 ic->forwardKey(bsKey, false);
@@ -813,6 +867,10 @@ void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
             } else {
                 replaceOut = "forward_bs_sync";
             }
+        } else {
+            state->markClientMutated();
+            disarmSessionJustAutocorrected(state, monotonicNowMs());
+            replaceOut = "aborted_no_delete";
         }
     } else if (!insertStr.empty()) {
         replaceOut = "insert_only";
@@ -824,30 +882,44 @@ void SmartKeyAddon::applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
         return;
     }
 
-    if (isTraceActive()) {
-        const std::string appName = normalizeProgramId(ic->program());
-        if (classifyProfile(ic, appName, nullptr) != SMARTKEY_PROFILE_BYPASS) {
-            TraceEventFields f{};
-            f.ev = "replace";
-            f.out = replaceOut;
-            f.hasDel = true;
-            f.del = act.delete_chars;
-            if (!insertStr.empty()) {
-                f.hasTxt = true;
-                f.txt = insertStr;
-            }
-            f.s0 = snapshotSessionCompact(state->session());
-            const std::string imName =
-                instance_ != nullptr ? instance_->inputMethod(ic) : "";
-            emitTraceRecord(trace_, ic, state, appName, imName, monotonicNowMs(),
-                            f);
-        }
-    }
+    emitReplace(replaceOut);
 }
 
 void SmartKeyAddon::applyReplaceAction(InputContext *ic, SmartKeyState *state,
                                        KeyEvent &keyEvent,
                                        const SmartKeyAction &act) {
+    if (act.delete_chars > 0) {
+        const bool fallbackAvailable =
+            canForwardBackspace(ic->frontendName(), ic->capabilityFlags());
+        state->checkUnansweredBeforeDelete(fallbackAvailable);
+        const bool surroundUsable = state->canUseDeleteSurrounding(
+            ic->capabilityFlags().test(CapabilityFlag::SurroundingText),
+            ic->surroundingText().isValid(), ic->surroundingText().cursor(),
+            act.delete_chars, ic->frontendName());
+        if (!surroundUsable && !fallbackAvailable) {
+            flushPendingDelayedCommit(ic, state);
+            state->markClientMutated();
+            disarmSessionJustAutocorrected(state, monotonicNowMs());
+            if (canTraceContext(ic, normalizeProgramId(ic->program()))) {
+                TraceEventFields f{};
+                f.ev = "replace";
+                f.out = "aborted_no_delete";
+                f.hasDel = true;
+                f.del = act.delete_chars;
+                if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
+                    f.hasTxt = true;
+                    f.txt.assign(act.insert_utf8, act.insert_byte_len);
+                }
+                f.s0 = snapshotSessionCompact(state->session());
+                const std::string appName = normalizeProgramId(ic->program());
+                const std::string imName =
+                    instance_ != nullptr ? instance_->inputMethod(ic) : "";
+                emitTraceRecord(trace_, ic, state, appName, imName,
+                                monotonicNowMs(), f);
+            }
+            return;
+        }
+    }
     keyEvent.filterAndAccept();
     applyDeleteAndCommit(ic, state, act);
 }
@@ -1513,61 +1585,109 @@ void SmartKeyAddon::onSurroundingTextUpdated(Event &event) {
     }
     const uint64_t nowMs = monotonicNowMs();
     const auto &st = ic->surroundingText();
+    const bool trace = isTraceActive();
+    const std::string appName =
+        trace ? normalizeProgramId(ic->program()) : std::string{};
+    const bool traceAllowed =
+        trace &&
+        classifyProfile(ic, appName, nullptr) != SMARTKEY_PROFILE_BYPASS;
+    const std::string imName =
+        (traceAllowed && instance_ != nullptr) ? instance_->inputMethod(ic) : "";
+
+    const DeleteCheckVerdict delVerdict =
+        state->verifyPendingSurroundingDelete(st.text(), st.cursor(),
+                                              st.anchor());
+    if (delVerdict == DeleteCheckVerdict::DroppedDeletion) {
+        const std::string s0 =
+            traceAllowed ? snapshotSessionCompact(state->session())
+                         : std::string{};
+        disarmSessionJustAutocorrected(state, nowMs);
+        const std::string appLabel =
+            appName.empty() ? normalizeProgramId(ic->program()) : appName;
+        FCITX_WARN() << "SmartKey detected dropped SurroundingText delete in "
+                        "app="
+                     << appLabel << " fe=" << ic->frontendName()
+                     << "; disabling SurroundingText delete for context";
+        const char *reason = "prose";
+        const uint8_t newProfile = classifyProfile(ic, appLabel, &reason);
+        smartkey_session_set_profile(state->session(), newProfile);
+        if (state->shouldLogProfileTransition(newProfile, reason)) {
+            smartkey_engine_log_app_event(engine_, appLabel.c_str(), newProfile,
+                                          reason);
+        }
+        if (traceAllowed) {
+            TraceEventFields f{};
+            f.ev = "surround";
+            f.out = "dropped_delete_untrusted";
+            f.s0 = s0;
+            f.s1 = snapshotSessionCompact(state->session());
+            f.hasScr = true;
+            f.scr = extractSurroundingSlice(st.text(), st.cursor(), st.anchor());
+            emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+        }
+        return;
+    }
+    if (delVerdict == DeleteCheckVerdict::StalePreCommit) {
+        if (traceAllowed) {
+            std::string slice =
+                extractSurroundingSlice(st.text(), st.cursor(), st.anchor());
+            if (state->shouldEmitSurroundTrace(
+                    st.cursor(), st.anchor(), state->isSurroundingSynced(),
+                    slice)) {
+                TraceEventFields f{};
+                f.ev = "surround";
+                f.out = "stale_pre_commit";
+                f.s0 = snapshotSessionCompact(state->session());
+                f.hasScr = true;
+                f.scr = std::move(slice);
+                emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
+            }
+        }
+        return;
+    }
+
     if (state->isSelfCommitting() ||
         (lotusActive &&
          (state->isInLotusBurst(nowMs) || state->hasPendingBoundary()))) {
-        if (isTraceActive()) {
-            const std::string appName = normalizeProgramId(ic->program());
-            if (classifyProfile(ic, appName, nullptr) !=
-                SMARTKEY_PROFILE_BYPASS) {
-                std::string slice = extractSurroundingSlice(
-                    st.text(), st.cursor(), st.anchor());
-                if (state->shouldEmitSurroundTrace(
-                        st.cursor(), st.anchor(), state->isSurroundingSynced(),
-                        slice)) {
-                    TraceEventFields f{};
-                    f.ev = "surround";
-                    f.out = "skipped_guard";
-                    f.s0 = snapshotSessionCompact(state->session());
-                    f.hasScr = true;
-                    f.scr = std::move(slice);
-                    const std::string imName =
-                        instance_ != nullptr ? instance_->inputMethod(ic) : "";
-                    emitTraceRecord(trace_, ic, state, appName, imName, nowMs,
-                                    f);
-                }
+        if (traceAllowed) {
+            std::string slice =
+                extractSurroundingSlice(st.text(), st.cursor(), st.anchor());
+            if (state->shouldEmitSurroundTrace(
+                    st.cursor(), st.anchor(), state->isSurroundingSynced(),
+                    slice)) {
+                TraceEventFields f{};
+                f.ev = "surround";
+                f.out = "skipped_guard";
+                f.s0 = snapshotSessionCompact(state->session());
+                f.hasScr = true;
+                f.scr = std::move(slice);
+                emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
             }
         }
         return;
     }
     state->markSurroundingUpdated();
-    const bool trace = isTraceActive();
     const std::string s0 =
-        trace ? snapshotSessionCompact(state->session()) : std::string{};
+        traceAllowed ? snapshotSessionCompact(state->session()) : std::string{};
     smartkey_session_reconcile_surrounding(state->session(), engine_,
                                            st.text().c_str(), st.cursor(),
                                            nowMs);
-    if (trace) {
-        const std::string appName = normalizeProgramId(ic->program());
-        if (classifyProfile(ic, appName, nullptr) != SMARTKEY_PROFILE_BYPASS) {
-            const std::string s1 = snapshotSessionCompact(state->session());
-            std::string slice =
-                extractSurroundingSlice(st.text(), st.cursor(), st.anchor());
-            const bool changedSession = (s0 != s1);
-            const bool dedupDiff = state->shouldEmitSurroundTrace(
-                st.cursor(), st.anchor(), state->isSurroundingSynced(), slice);
-            if (changedSession || dedupDiff) {
-                TraceEventFields f{};
-                f.ev = "surround";
-                f.out = changedSession ? "reconcile_reset" : "synced";
-                f.s0 = s0;
-                f.s1 = s1;
-                f.hasScr = true;
-                f.scr = std::move(slice);
-                const std::string imName =
-                    instance_ != nullptr ? instance_->inputMethod(ic) : "";
-                emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
-            }
+    if (traceAllowed) {
+        const std::string s1 = snapshotSessionCompact(state->session());
+        std::string slice =
+            extractSurroundingSlice(st.text(), st.cursor(), st.anchor());
+        const bool changedSession = (s0 != s1);
+        const bool dedupDiff = state->shouldEmitSurroundTrace(
+            st.cursor(), st.anchor(), state->isSurroundingSynced(), slice);
+        if (changedSession || dedupDiff) {
+            TraceEventFields f{};
+            f.ev = "surround";
+            f.out = changedSession ? "reconcile_reset" : "synced";
+            f.s0 = s0;
+            f.s1 = s1;
+            f.hasScr = true;
+            f.scr = std::move(slice);
+            emitTraceRecord(trace_, ic, state, appName, imName, nowMs, f);
         }
     }
 }

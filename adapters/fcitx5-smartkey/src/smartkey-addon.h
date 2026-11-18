@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/eventloopinterface.h>
 #include <fcitx-utils/handlertable.h>
@@ -207,29 +208,268 @@ inline bool isSyntheticVkKey(uint32_t keycode, uint32_t cp) {
     return false;
 }
 
+inline uint32_t countUtf8Chars(std::string_view s) {
+    uint32_t count = 0;
+    for (unsigned char b : s) {
+        if ((b & 0xC0) != 0x80) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+inline std::size_t stepUtf8Codepoint(std::string_view text, std::size_t idx) {
+    if (idx >= text.size()) {
+        return text.size();
+    }
+    const unsigned char b = static_cast<unsigned char>(text[idx]);
+    std::size_t len = 1;
+    if (b < 0x80) {
+        len = 1;
+    } else if ((b & 0xE0) == 0xC0) {
+        len = 2;
+    } else if ((b & 0xF0) == 0xE0) {
+        len = 3;
+    } else if ((b & 0xF8) == 0xF0) {
+        len = 4;
+    }
+    if (idx + len > text.size()) {
+        return text.size();
+    }
+    for (std::size_t k = 1; k < len; ++k) {
+        if ((static_cast<unsigned char>(text[idx + k]) & 0xC0) != 0x80) {
+            return idx + 1;
+        }
+    }
+    return idx + len;
+}
+
 inline bool isWaylandFrontend(std::string_view frontend) {
     return frontend == "wayland" || frontend == "wayland_v2";
 }
 
-/// Tracks whether `InputContext::surroundingText()` has received a fresh
-/// client update since the last client-mutating key/commit event.
-/// On Wayland (`wayland` / `wayland_v2`), `SurroundingText` lags behind keys
-/// forwarded via `zwp_virtual_keyboard_v1`, so `deleteSurroundingText` is only
-/// safe when `surroundingSynced` is true.
-struct SurroundingSyncTracker {
-    bool surroundingSynced = false;
+/// On `frontend:dbus`, only IM modules that advertise `CapabilityFlag::KeyEventOrderFix`
+/// (GTK3, Qt5/Qt6) actually deliver `ForwardKey` events; GTK4 (`libim-fcitx5.so`) and
+/// SDL drop `ForwardKey` as a no-op stub.
+inline bool canForwardBackspace(std::string_view frontend,
+                                CapabilityFlags flags) {
+    if (frontend == "dbus") {
+        return flags.test(CapabilityFlag::KeyEventOrderFix);
+    }
+    return true;
+}
 
-    void markClientMutated() { surroundingSynced = false; }
-    void markSurroundingUpdated() { surroundingSynced = true; }
-    void reset() { surroundingSynced = false; }
+enum class DeleteCheckVerdict : uint8_t {
+    NoCheck,
+    StalePreCommit,
+    Confirmed,
+    DroppedDeletion,
+    Inconclusive,
+};
+
+/// Tracks whether `InputContext::surroundingText()` has received a fresh
+/// client update since the last client-mutating key/commit event, verifies
+/// that `deleteSurroundingText` deletions actually landed, and latches a
+/// per-`InputContext` circuit breaker (`surroundingUntrusted`) when an app
+/// drops a deletion or ignores consecutive deletions.
+struct SurroundingSyncTracker {
+    static constexpr uint32_t kPrefixTailCap = 16;
+    static constexpr uint32_t kMaxUnansweredDeletes = 3;
+
+    struct PendingDeleteCheck {
+        bool active = false;
+        bool atBufferStart = false;
+        uint32_t preCursorChars = 0;
+        uint32_t deleteChars = 0;
+        uint32_t prefixTailChars = 0;
+        uint32_t expectedSuccessCursor = 0;
+        uint32_t expectedDroppedCursor = 0;
+        std::string prefixTailUtf8;
+        std::string preTailUtf8;
+        std::string expectedSuccessSuffix;
+        std::string expectedDroppedSuffix;
+
+        void clear() {
+            active = false;
+            atBufferStart = false;
+            preCursorChars = 0;
+            deleteChars = 0;
+            prefixTailChars = 0;
+            expectedSuccessCursor = 0;
+            expectedDroppedCursor = 0;
+            prefixTailUtf8.clear();
+            preTailUtf8.clear();
+            expectedSuccessSuffix.clear();
+            expectedDroppedSuffix.clear();
+        }
+    };
+
+    bool surroundingSynced = false;
+    bool surroundingUntrusted = false;
+    bool awaitingUpdateSinceDelete = false;
+    uint32_t unansweredDeletes = 0;
+    PendingDeleteCheck pendingCheck_{};
+
+    void markClientMutated() {
+        surroundingSynced = false;
+        pendingCheck_.clear();
+    }
+    void markSurroundingUpdated() {
+        surroundingSynced = true;
+        awaitingUpdateSinceDelete = false;
+        unansweredDeletes = 0;
+    }
+    void reset() {
+        surroundingSynced = false;
+        awaitingUpdateSinceDelete = false;
+        pendingCheck_.clear();
+    }
+    void resetTrust() {
+        reset();
+        surroundingUntrusted = false;
+        unansweredDeletes = 0;
+    }
 
     bool canUseDeleteSurrounding(bool hasSurroundingCap,
                                  bool isSurroundingValid, uint32_t cursor,
                                  uint32_t deleteChars,
                                  std::string_view frontend) const {
-        return hasSurroundingCap && isSurroundingValid &&
-               cursor >= deleteChars &&
+        return !surroundingUntrusted && hasSurroundingCap &&
+               isSurroundingValid && cursor >= deleteChars &&
                (!isWaylandFrontend(frontend) || surroundingSynced);
+    }
+
+    void checkUnansweredBeforeDelete(bool fallbackAvailable) {
+        if (awaitingUpdateSinceDelete) {
+            ++unansweredDeletes;
+            awaitingUpdateSinceDelete = false;
+            if (fallbackAvailable &&
+                unansweredDeletes >= kMaxUnansweredDeletes) {
+                surroundingUntrusted = true;
+            }
+        }
+    }
+
+    void armDeleteCheck(std::string_view preText, uint32_t preCursorChars,
+                        uint32_t deleteChars, std::string_view insertedUtf8) {
+        surroundingSynced = false;
+        awaitingUpdateSinceDelete = true;
+        pendingCheck_.clear();
+        if (deleteChars == 0 || insertedUtf8.empty() ||
+            preCursorChars < deleteChars || preCursorChars > 16384) {
+            return;
+        }
+        const uint32_t delStartCp = preCursorChars - deleteChars;
+        const uint32_t prefixTailStartCp =
+            (delStartCp > kPrefixTailCap) ? (delStartCp - kPrefixTailCap) : 0;
+
+        std::size_t byteIdx = 0;
+        std::size_t prefixTailStartByte = 0;
+        std::size_t delStartByte = 0;
+        for (uint32_t cp = 0; cp < preCursorChars; ++cp) {
+            if (cp == prefixTailStartCp) {
+                prefixTailStartByte = byteIdx;
+            }
+            if (cp == delStartCp) {
+                delStartByte = byteIdx;
+            }
+            if (byteIdx >= preText.size()) {
+                return;
+            }
+            byteIdx = stepUtf8Codepoint(preText, byteIdx);
+        }
+        const std::size_t preCursorByte = byteIdx;
+
+        pendingCheck_.active = true;
+        pendingCheck_.atBufferStart = (delStartCp == 0);
+        pendingCheck_.preCursorChars = preCursorChars;
+        pendingCheck_.deleteChars = deleteChars;
+        pendingCheck_.prefixTailChars = delStartCp - prefixTailStartCp;
+        pendingCheck_.prefixTailUtf8 = std::string(preText.substr(
+            prefixTailStartByte, delStartByte - prefixTailStartByte));
+        const std::string_view deletedUtf8 =
+            preText.substr(delStartByte, preCursorByte - delStartByte);
+        pendingCheck_.preTailUtf8 = pendingCheck_.prefixTailUtf8;
+        pendingCheck_.preTailUtf8.append(deletedUtf8);
+        pendingCheck_.expectedSuccessSuffix = pendingCheck_.prefixTailUtf8;
+        pendingCheck_.expectedSuccessSuffix.append(insertedUtf8);
+        pendingCheck_.expectedDroppedSuffix = pendingCheck_.preTailUtf8;
+        pendingCheck_.expectedDroppedSuffix.append(insertedUtf8);
+
+        const uint32_t insertedChars = countUtf8Chars(insertedUtf8);
+        pendingCheck_.expectedSuccessCursor = delStartCp + insertedChars;
+        pendingCheck_.expectedDroppedCursor = preCursorChars + insertedChars;
+    }
+
+    DeleteCheckVerdict verifyPendingDelete(std::string_view text,
+                                           uint32_t cursorChars,
+                                           uint32_t anchorChars) {
+        if (!pendingCheck_.active) {
+            return DeleteCheckVerdict::NoCheck;
+        }
+        if (cursorChars > 16384) {
+            pendingCheck_.clear();
+            return DeleteCheckVerdict::Inconclusive;
+        }
+        std::size_t cursorByte = 0;
+        for (uint32_t cp = 0; cp < cursorChars; ++cp) {
+            if (cursorByte >= text.size()) {
+                pendingCheck_.clear();
+                return DeleteCheckVerdict::Inconclusive;
+            }
+            cursorByte = stepUtf8Codepoint(text, cursorByte);
+        }
+        const std::string_view before = text.substr(0, cursorByte);
+
+        if (anchorChars == cursorChars) {
+            const bool droppedMatch =
+                pendingCheck_.atBufferStart
+                    ? (cursorChars == pendingCheck_.expectedDroppedCursor &&
+                       before == pendingCheck_.expectedDroppedSuffix)
+                    : (before.ends_with(pendingCheck_.expectedDroppedSuffix) &&
+                       (cursorChars == pendingCheck_.expectedDroppedCursor ||
+                        pendingCheck_.prefixTailChars >= 4));
+            if (droppedMatch) {
+                pendingCheck_.clear();
+                surroundingUntrusted = true;
+                surroundingSynced = false;
+                awaitingUpdateSinceDelete = false;
+                unansweredDeletes = 0;
+                return DeleteCheckVerdict::DroppedDeletion;
+            }
+        }
+
+        const bool confirmedMatch =
+            cursorChars == pendingCheck_.expectedSuccessCursor &&
+            before.ends_with(pendingCheck_.expectedSuccessSuffix);
+
+        if (!confirmedMatch &&
+            cursorChars == pendingCheck_.preCursorChars &&
+            before.ends_with(pendingCheck_.preTailUtf8)) {
+            return DeleteCheckVerdict::StalePreCommit;
+        }
+
+        const uint32_t deletedCursor =
+            pendingCheck_.preCursorChars - pendingCheck_.deleteChars;
+        if (cursorChars == deletedCursor &&
+            pendingCheck_.expectedSuccessCursor != cursorChars &&
+            before.ends_with(pendingCheck_.prefixTailUtf8)) {
+            pendingCheck_.clear();
+            awaitingUpdateSinceDelete = false;
+            unansweredDeletes = 0;
+            return DeleteCheckVerdict::StalePreCommit;
+        }
+
+        if (confirmedMatch) {
+            pendingCheck_.clear();
+            awaitingUpdateSinceDelete = false;
+            unansweredDeletes = 0;
+            surroundingSynced = true;
+            return DeleteCheckVerdict::Confirmed;
+        }
+
+        pendingCheck_.clear();
+        return DeleteCheckVerdict::Inconclusive;
     }
 };
 
@@ -438,32 +678,6 @@ inline std::string extractSurroundingSlice(std::string_view text,
                " bytes=" + std::to_string(text.size()) + ">";
     }
 
-    auto nextCpOffset = [text](std::size_t idx) -> std::size_t {
-        if (idx >= text.size()) {
-            return text.size();
-        }
-        const unsigned char b = static_cast<unsigned char>(text[idx]);
-        std::size_t len = 1;
-        if (b < 0x80) {
-            len = 1;
-        } else if ((b & 0xE0) == 0xC0) {
-            len = 2;
-        } else if ((b & 0xF0) == 0xE0) {
-            len = 3;
-        } else if ((b & 0xF8) == 0xF0) {
-            len = 4;
-        }
-        if (idx + len > text.size()) {
-            return text.size();
-        }
-        for (std::size_t k = 1; k < len; ++k) {
-            if ((static_cast<unsigned char>(text[idx + k]) & 0xC0) != 0x80) {
-                return idx + 1;
-            }
-        }
-        return idx + len;
-    };
-
     const std::size_t ringCap = static_cast<std::size_t>(maxBefore) + 1;
     std::size_t stackRing[65]{};
     std::vector<std::size_t> heapRing;
@@ -478,7 +692,7 @@ inline std::string extractSurroundingSlice(std::string_view text,
         if (cursorByte >= text.size()) {
             return "<invalid-cursor>";
         }
-        cursorByte = nextCpOffset(cursorByte);
+        cursorByte = stepUtf8Codepoint(text, cursorByte);
         ring[(cp + 1) % ringCap] = cursorByte;
     }
 
@@ -488,7 +702,7 @@ inline std::string extractSurroundingSlice(std::string_view text,
 
     std::size_t afterEndByte = cursorByte;
     for (uint32_t a = 0; a < maxAfter && afterEndByte < text.size(); ++a) {
-        afterEndByte = nextCpOffset(afterEndByte);
+        afterEndByte = stepUtf8Codepoint(text, afterEndByte);
     }
     const bool truncatedAfter = afterEndByte < text.size();
 
@@ -831,8 +1045,31 @@ public:
         surroundingSync_.reset();
         surroundDedup_.reset();
     }
+    void resetSurroundingTrust() {
+        surroundingSync_.resetTrust();
+        surroundDedup_.reset();
+    }
     bool isSurroundingSynced() const {
         return surroundingSync_.surroundingSynced;
+    }
+    bool isSurroundingUntrusted() const {
+        return surroundingSync_.surroundingUntrusted;
+    }
+    void checkUnansweredBeforeDelete(bool fallbackAvailable) {
+        surroundingSync_.checkUnansweredBeforeDelete(fallbackAvailable);
+    }
+    void armSurroundingDeleteCheck(std::string_view preText,
+                                   uint32_t preCursorChars,
+                                   uint32_t deleteChars,
+                                   std::string_view insertedUtf8) {
+        surroundingSync_.armDeleteCheck(preText, preCursorChars, deleteChars,
+                                        insertedUtf8);
+    }
+    DeleteCheckVerdict verifyPendingSurroundingDelete(std::string_view text,
+                                                      uint32_t cursorChars,
+                                                      uint32_t anchorChars) {
+        return surroundingSync_.verifyPendingDelete(text, cursorChars,
+                                                    anchorChars);
     }
     bool shouldEmitSurroundTrace(uint32_t c, uint32_t a, bool sy,
                                  std::string_view sl) {
@@ -932,6 +1169,7 @@ private:
     bool isTraceActive();
     bool canTraceContext(InputContext *ic, std::string_view appName);
     void flushPendingDelayedCommit(InputContext *ic, SmartKeyState *state);
+    void disarmSessionJustAutocorrected(SmartKeyState *state, uint64_t nowMs);
     void applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
                               const SmartKeyAction &act);
     void applyReplaceAction(InputContext *ic, SmartKeyState *state,
