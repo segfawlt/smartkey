@@ -12,6 +12,7 @@ tags before non-trivial work.
 
 - [SurroundingText Unicode-Scalar Cursor Indexing vs UTF-8 Slicing](./integration-issues/surrounding-text-utf8-scalar-cursor-slicing.md) — Index `SurroundingText::text()` by stepping UTF-8 codepoint boundaries because `cursor()`/`anchor()` count Unicode scalars, not bytes, and bound huge editors (`>16384` chars). `#fcitx5 #surrounding-text #utf8 #vietnamese #wayland`
 - [Surrounding-Text Undo Guard and Async Lotus Echo Windows](./integration-issues/surrounding-text-undo-guard-async-echo-windows.md) — Guard displaced-cursor undo across `en` (`80 ms`) and `vi` (`400 ms`) while skipping surrounding-text reconciliation during self-commits, Lotus bursts, or pending boundaries. `#fcitx5 #vi-lotus #undo #surrounding-text`
+- [Fcitx5 Correction Replacement: Strategy Ladder over Linear Fallback](./integration-issues/fcitx5-replacement-strategy-ladder.md) — Model post-scorer replacement as a strategy table keyed off field-reported capabilities (`overtype xtest` → `overtype` → `del` → `surrounding` → `forwarded backspaces`), verify the deletion landed, and count unanswered deletions per `InputContext`. `#fcitx5 #replacement #delete-surrounding-text #surrounding-text #wayland #app-quirks`
 
 ## logic-errors/
 
