@@ -14,6 +14,8 @@ tags before non-trivial work.
 - [Surrounding-Text Undo Guard and Async Lotus Echo Windows](./integration-issues/surrounding-text-undo-guard-async-echo-windows.md) — Guard displaced-cursor undo across `en` (`80 ms`) and `vi` (`400 ms`) while skipping surrounding-text reconciliation during self-commits, Lotus bursts, or pending boundaries. `#fcitx5 #vi-lotus #undo #surrounding-text`
 - [DBus `KeyEventOrderFix` Capability Check and Dropped-Delete Circuit Breaker](./integration-issues/dbus-key-order-fix-and-dropped-delete-guard.md) — Gate `frontend:dbus` `ForwardKey` on `CapabilityFlag::KeyEventOrderFix`, abort un-deletable replacements, and latch per-context `surroundingUntrusted` plus `JustAutocorrected` disarming when `deleteSurroundingText` is silently dropped or unanswered. `#fcitx5 #dbus #surrounding-text #gtk4 #undo #wayland`
 - [Stepwise BackSpace Undo Across `fcitx5-lotus` `PreInputMethod` and `PostAutocorrectOrigin`](./integration-issues/stepwise-undo-lotus-preinput-and-pending-punct.md) — Intercept `JustAutocorrected` (`trailing_count == 0`) 2nd BackSpace in `PreInputMethod` before Lotus eats the word, and carry `PostAutocorrectOrigin` through `PendingTrailingDot`/`PendingSemicolon` instead of re-scoring already-corrected tokens. `#fcitx5 #vi-lotus #undo #pending-dot #state-machine`
+- [Lotus Echo-BackSpace Classification Needs a Narrow Window](./integration-issues/lotus-echo-backspace-narrow-window.md) — Classify `BackSpace` as a Lotus echo only within 45 ms of a trigger / 30 ms of an echo or `Pause` (traced bursts ≤ 19 ms), never via the broad 350/300 ms burst guard that swallowed user BackSpaces and desynced the shadow buffer (`scos -> sóc`). `#fcitx5 #vi-lotus #backspace #shadow-buffer #trace`
+- [Release `-DNDEBUG` Silently Disabled `addon_load_smoke` Assertions](./integration-issues/release-ndebug-vacuous-smoke-asserts.md) — `#undef NDEBUG` before `<cassert>` in C++ test targets built Release; confirm red tests actually fail before fixing. `#fcitx5 #cmake #testing #ndebug`
 
 ## logic-errors/
 
@@ -30,7 +32,7 @@ tags before non-trivial work.
 - `Clause-Erase Cancel` — Holding `BackSpace` past index 0 of a restored word aborts undo learning rather than recording a partial prefix rejection.
 - `Delta-Span Check` — Learner heuristic rejecting manual edits whose length delta or edit distance indicates a change of mind rather than a typo fix.
 - `Self-Confirm Cancel` — Cancelling an undo-keep signal when the user immediately retypes the exact autocorrection they just undid.
-- `Lotus burst echo window` — Time window (`fcitx5-smartkey`) after `fcitx5-lotus` `Pause`/Telex keys during which injected synthetic `BackSpace`/`Left`/`Delete` and lagging `SurroundingTextUpdated` events are suppressed.
+- `Lotus burst echo window` — Broad time window (`fcitx5-smartkey`, 350/300 ms) after `fcitx5-lotus` `Pause`/Telex keys during which lagging `SurroundingTextUpdated` events are skipped. Synthetic `BackSpace`/`Left`/`Delete` echoes use the separate narrow echo window (45/30 ms).
 
 ## Promote Candidates
 
