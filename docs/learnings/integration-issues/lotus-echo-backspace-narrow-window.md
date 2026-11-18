@@ -39,8 +39,12 @@ user BackSpaces were labelled echoes.
    misclassified user BackSpaces were 40–282 ms and never followed by `Pause`.
 2. `LotusBridgeTracker` gained a separate `echoBsDeadlineMs`: `armBurst` sets `now + 45 ms`
    (`kEchoBsFirstWindowMs`), `rearmBurstEcho` (echo, `Pause`, VK rune, intermediate commit) sets
-   `now + 30 ms` (`kEchoBsChainGapMs`). The echo filter uses `expectsLotusEchoBackspace()`; the
-   broad `isInLotusBurst()` window is kept only for surrounding-text/boundary guards.
+   `now + 30 ms` (`kEchoBsChainGapMs`). `armBurst` fires on a Telex trigger letter, on any letter
+   once `hasLotusActivityInWord()`, on every boundary char (`Space`, punctuation), and on queued
+   post-boundary letters — so the 45 ms window also follows `Space`. The echo filter
+   (`BackSpace`/`Left`/`Delete`) uses `expectsLotusEchoBackspace()`; the broad `isInLotusBurst()`
+   window is no longer a key classifier — it remains for surrounding-text/self-commit guards,
+   post-boundary queuing, the VK-rune re-arm guard, and trace fields.
 3. Diagnostic: `lotus_pause+late_echo_suspect` is traced when `Pause` arrives ≤ 120 ms after a
    BackSpace classified as the user's (would reveal a too-narrow window under load).
 
@@ -49,9 +53,25 @@ user BackSpaces were labelled echoes.
 `fcitx5-lotus` itself never guesses: it treats BackSpace as its own only while `g_isDeleting` is
 set by an actual `performReplacement`. SmartKey cannot read that flag, but the injection latency
 is tiny and bounded (preDelay ≤ `DefaultCommitInterval`, per-echo `DefaultBackspaceInterval`),
-while human reaction is ≥ 40 ms. Chained bursts from `replayBufferedKeys()` land within the 30 ms
+while human BackSpaces are slow. The classifier does not measure human timing; the separation is
+empirical (2026-11-17/18 traces, 281 BackSpaces following a non-BackSpace key): 239 at 0–20 ms
+(all echoes), none at 21–100 ms, the fastest human one at 144 ms; BackSpace autorepeat is 40 ms,
+above the 30 ms chain gap. Chained bursts from `replayBufferedKeys()` land within the 30 ms
 post-`Pause` allowance (observed +10 ms). Replaying all traced BackSpaces: old 0 echo leaks / many
 user swallowed; new 0 echo leaks / 0 user swallowed.
+
+### Residual risks (accepted)
+
+- A user BackSpace ≤ 45 ms after an arming key (or ≤ 30 ms after an echo/`Pause`) is still
+  swallowed. Not observed in traces (see gap above).
+- An ordinary non-arming letter does **not** clear `echoBsDeadlineMs`. Do not "fix" this: 43 of
+  1412 traced user-key gaps were < 20 ms (key rollover), and the first echo can arrive up to ~19 ms
+  after the trigger, so clearing on the next letter would leak echoes into the session.
+- A swallowed BackSpace also extends the broad window by 300 ms (`rearmBurstEcho`).
+- All traced echoes were `BackSpace` (421/421); `Left`/`Delete` stay in the filter for parity with
+  Lotus's replacement paths but have no trace evidence either way.
+- Echoes later than the window leak; `late_echo_suspect` only catches them when a `Pause` follows
+  within 120 ms.
 
 ## Prevention
 

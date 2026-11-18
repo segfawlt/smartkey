@@ -502,7 +502,9 @@ struct LotusBridgeTracker {
     /// Narrow window in which a `BackSpace`/`Left`/`Delete` may be a synthetic Lotus echo.
     /// Calibrated on 180 traced uinput bursts: trigger -> first echo <= 19 ms (with
     /// `DefaultCommitInterval=10`; the default 20 ms preDelay adds <= 10 ms), echo -> echo /
-    /// `Pause` gaps <= 9 ms. User BackSpaces arrive >= 40 ms after the previous key. The old
+    /// `Pause` gaps <= 9 ms. Traced user BackSpaces arrive >= 144 ms after a letter and autorepeat
+    /// at 40 ms; nothing here measures that, the separation is empirical. Ordinary letters must
+    /// NOT clear the echo deadline (key rollover < 20 ms would leak the echoes). The old
     /// 350/300 ms window swallowed user BackSpaces and desynced the shadow buffer
     /// (`kiểu s<BS>cos` -> buffer `scos` -> autocorrect `sóc` deleting 4 chars).
     /// Raise these only if Lotus `Default*Interval`/`PostDelay` are configured far above defaults.
