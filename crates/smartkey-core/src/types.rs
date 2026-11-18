@@ -25,6 +25,20 @@ pub enum Aggressiveness {
     Aggressive,
 }
 
+/// Post-autocorrect `BackSpace` behavior (`rules.toml`: `settings.undo_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UndoMode {
+    /// `1st BackSpace` deletes trailing space/punctuation (`"resource "` -> `"resource"`),
+    /// allowing forgotten `.` / `,` / `s` edits; `2nd BackSpace` into the word snaps back to `raw_typed`.
+    #[default]
+    Step,
+    /// Legacy `1x BackSpace` immediately deletes `applied + trailing_boundaries` and restores `raw_typed`.
+    Immediate,
+    /// Never snap back to `raw_typed` on `BackSpace`; backspace deletes characters normally.
+    Off,
+}
+
 /// Active application context resolved by the host adapter (`fcitx5`, CLI, or HeliBoard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

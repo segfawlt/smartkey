@@ -943,6 +943,22 @@ mod tests {
         );
 
         assert!(unsafe {
+            smartkey_session_process_key(sess, eng, SMARTKEY_KEY_BACKSPACE, 0, 180, &mut act)
+        });
+        assert_eq!(act.kind, SMARTKEY_ACTION_PASS_THROUGH);
+        assert_eq!(
+            read_snap(),
+            (
+                "JustAutocorrected".to_string(),
+                "the".to_string(),
+                "teh".to_string(),
+                "the".to_string(),
+                0,
+                true
+            )
+        );
+
+        assert!(unsafe {
             smartkey_session_process_key(sess, eng, SMARTKEY_KEY_BACKSPACE, 0, 200, &mut act)
         });
         assert_eq!(act.kind, SMARTKEY_ACTION_REPLACE);

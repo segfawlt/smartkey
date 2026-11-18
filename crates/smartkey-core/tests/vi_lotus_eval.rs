@@ -226,9 +226,28 @@ fn test_vi_lotus_shields_valid_vietnamese_and_english_words() {
 fn test_vi_lotus_backspace_undo_and_modular_plugin_toggle() {
     let (mut engine, mut session) = make_vi_engine_and_session();
 
-    // Type `ttieengs ` -> `"tiếng "`, then `1x BackSpace` -> reverts to `"ttieengs"`!
+    // 1. Stepwise BackSpace after `"ttieengs "` lets the user add forgotten `. ` -> `"tiếng. "` without reverting or shielding:
+    let (mut dot_buf, _) = type_sequence(&mut session, &mut engine, "ttieengs ");
+    assert_eq!(dot_buf, "tiếng ");
+    let bs_peel = session.process_key(&mut engine, KeyInput::BackSpace, 1_500);
+    assert_eq!(bs_peel.action, SessionAction::PassThrough);
+    apply_key_to_buffer(&mut dot_buf, KeyInput::BackSpace, &bs_peel.action);
+    for (idx, ch) in ['.', ' '].into_iter().enumerate() {
+        let out = session.process_key(&mut engine, KeyInput::Char(ch), 1_520 + (idx as u64) * 20);
+        assert_eq!(out.action, SessionAction::PassThrough);
+        apply_key_to_buffer(&mut dot_buf, KeyInput::Char(ch), &out.action);
+    }
+    assert_eq!(dot_buf, "tiếng. ");
+    let _ = session.reset(&mut engine);
+
+    // 2. Type `ttieengs ` -> `"tiếng "`, then `2x BackSpace` -> 1st peels `' '`, 2nd reverts to `"ttieengs"`!
     let (mut buf, _) = type_sequence(&mut session, &mut engine, "ttieengs ");
     assert_eq!(buf, "tiếng ");
+
+    let bs1 = session.process_key(&mut engine, KeyInput::BackSpace, 1_950);
+    assert_eq!(bs1.action, SessionAction::PassThrough);
+    apply_key_to_buffer(&mut buf, KeyInput::BackSpace, &bs1.action);
+    assert_eq!(buf, "tiếng");
 
     let bs_out = session.process_key(&mut engine, KeyInput::BackSpace, 2_000);
     apply_key_to_buffer(&mut buf, KeyInput::BackSpace, &bs_out.action);
@@ -276,10 +295,14 @@ fn test_vi_lotus_shorthand_expansion_and_slang_shielding() {
     let (buf, _) = type_sequence(&mut session, &mut engine, "ko dc ntn mn ");
     assert_eq!(buf, "không được như thế nào mọi người ");
 
-    // 2. `1x BackSpace` immediately after multi-word Vietnamese shorthand expansion (`ntn -> như thế nào`)
-    //    deletes the entire expanded phrase `"như thế nào "` and restores `"ntn"`, and Space blocks the pair!
+    // 2. Stepwise BackSpace immediately after multi-word Vietnamese shorthand expansion (`ntn -> như thế nào`):
+    //    1st BackSpace peels trailing `' '`; 2nd deletes the expanded phrase `"như thế nào"` and restores `"ntn"`, and Space blocks the pair!
     let (mut buf2, _) = type_sequence(&mut session, &mut engine, "ntn ");
     assert_eq!(buf2, "như thế nào ");
+    let bs2_step = session.process_key(&mut engine, KeyInput::BackSpace, 4_950);
+    assert_eq!(bs2_step.action, SessionAction::PassThrough);
+    apply_key_to_buffer(&mut buf2, KeyInput::BackSpace, &bs2_step.action);
+    assert_eq!(buf2, "như thế nào");
     let bs_out = session.process_key(&mut engine, KeyInput::BackSpace, 5_000);
     apply_key_to_buffer(&mut buf2, KeyInput::BackSpace, &bs_out.action);
     assert_eq!(buf2, "ntn");
@@ -338,9 +361,13 @@ fn test_vi_lotus_host_contract_filtered_boundaries_macros_off_mode_and_options()
     assert_eq!(off_buf, "of issue the ");
     session.set_lotus_composing(true);
 
-    // 4. English-Sentence Momentum Shield + `1x BackSpace` revert back to Vietnamese rune:
+    // 4. English-Sentence Momentum Shield + stepwise BackSpace revert back to Vietnamese rune:
     let (mut mom_buf, _) = type_sequence(&mut session, &mut engine, "it is ");
     assert_eq!(mom_buf, "it is ");
+    let bs_m1 = session.process_key(&mut engine, KeyInput::BackSpace, 4_025);
+    assert_eq!(bs_m1.action, SessionAction::PassThrough);
+    apply_key_to_buffer(&mut mom_buf, KeyInput::BackSpace, &bs_m1.action);
+    assert_eq!(mom_buf, "it is");
     let bs = session.process_key(&mut engine, KeyInput::BackSpace, 4_050);
     apply_key_to_buffer(&mut mom_buf, KeyInput::BackSpace, &bs.action);
     assert_eq!(mom_buf, "it í");
@@ -430,7 +457,7 @@ fn test_vi_lotus_uinput_restore_class_rescue_and_unknown_learning() {
 fn test_vi_lotus_sentence_start_english_passthrough_and_surrounding_undo_guard() {
     let (mut engine, mut session) = make_vi_engine_and_session();
 
-    // 1. Safe sentence-start TitleCase passthrough (`If`, `Of`, `Or`), including 1x BackSpace
+    // 1. Safe sentence-start TitleCase passthrough (`If`, `Of`, `Or`), including stepwise BackSpace
     //    revert back to Lotus's Vietnamese rune (`Ò`):
     let (if_buf, _) = type_sequence(&mut session, &mut engine, "If ");
     assert_eq!(if_buf, "If ");
@@ -438,6 +465,10 @@ fn test_vi_lotus_sentence_start_english_passthrough_and_surrounding_undo_guard()
     let _ = session.reset(&mut engine);
     let (mut of_buf, _) = type_sequence(&mut session, &mut engine, "Of ");
     assert_eq!(of_buf, "Of ");
+    let bs_step = session.process_key(&mut engine, KeyInput::BackSpace, 2_450);
+    assert_eq!(bs_step.action, SessionAction::PassThrough);
+    apply_key_to_buffer(&mut of_buf, KeyInput::BackSpace, &bs_step.action);
+    assert_eq!(of_buf, "Of");
     let bs = session.process_key(&mut engine, KeyInput::BackSpace, 2_500);
     apply_key_to_buffer(&mut of_buf, KeyInput::BackSpace, &bs.action);
     assert_eq!(of_buf, "Ò");

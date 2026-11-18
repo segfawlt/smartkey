@@ -1142,6 +1142,42 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
             return;
         }
 
+        // Before Lotus sees a 2nd BackSpace while sitting at the end of a freshly autocorrected
+        // word (`JustAutocorrected` with `trailing_count == 0`, after 1st BackSpace peeled off
+        // trailing space/punctuation), handle it in `PreInputMethod` so Lotus cannot consume the
+        // corrected word first.
+        if (keyKind == SMARTKEY_KEY_BACKSPACE && !boundaryAbortedNav &&
+            !state->hasPendingBoundary() && !state->hasLotusActivityInWord()) {
+            SmartKeySessionSnapshot snap{};
+            if (smartkey_session_debug_snapshot(state->session(), &snap) &&
+                snap.mode_utf8 != nullptr &&
+                std::string_view(snap.mode_utf8) == "JustAutocorrected" &&
+                snap.trailing_count == 0) {
+                state->setSuppressPostKey(true);
+                smartkey_session_set_lotus_composing(state->session(), false);
+                SmartKeyAction act{};
+                const bool ok = smartkey_session_process_key(
+                    state->session(), engine_, SMARTKEY_KEY_BACKSPACE, 0,
+                    nowMs, &act);
+                if (ok && act.kind == SMARTKEY_ACTION_REPLACE) {
+                    if (trace) {
+                        emitPreKey("lotus_step_undo_replace", s0,
+                                   snapshotSessionCompact(state->session()),
+                                   chUtf8);
+                    }
+                    applyReplaceAction(ic, state, keyEvent, act);
+                } else {
+                    state->markClientMutated();
+                    if (trace) {
+                        emitPreKey("lotus_step_undo_pass", s0,
+                                   snapshotSessionCompact(state->session()),
+                                   chUtf8);
+                    }
+                }
+                return;
+            }
+        }
+
         // For word-break/lookahead chars (`Space`, `,`, `.`, `!`, `?`, etc.), `BackSpace`,
         // `Enter`, `Tab`, and cursor nav: defer to `onPostKeyEvent` (if Lotus forwards) or
         // `onCommitString` (if Lotus filters the boundary to restore/commit).

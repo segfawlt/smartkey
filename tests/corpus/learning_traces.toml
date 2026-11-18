@@ -8,28 +8,28 @@
 [[trace]]
 name = "row1_undo_and_edit_blocks_wrong_suggestion_immediately"
 steps = [
-  { keys = "fomr <BS><BS><BS>rm ", expect_buf = "form " },
+  { keys = "fomr <BS><BS><BS><BS>rm ", expect_buf = "form " },
   { keys = "fomr ", expect_buf = "form form " },
 ]
 
 [[trace]]
 name = "row2_undo_and_keep_verbatim_session_shield_1x"
 steps = [
-  { keys = "alot <BS> ", expect_buf = "alot " },
+  { keys = "alot <BS><BS> ", expect_buf = "alot " },
   { keys = "alot ", expect_buf = "alot alot " },
 ]
 
 [[trace]]
 name = "row3_self_confirm_cancel_on_accidental_backspace"
 steps = [
-  { keys = "chagnes <BS><BS><BS><BS><BS>nges ", expect_buf = "changes " },
+  { keys = "chagnes <BS><BS><BS><BS><BS><BS>nges ", expect_buf = "changes " },
   { keys = "chagnes ", expect_buf = "changes changes " },
 ]
 
 [[trace]]
 name = "clause_erase_cancel_past_word_start"
 steps = [
-  { keys = "hello chagnes <BS><BS><BS><BS><BS><BS><BS><BS><BS>", expect_buf = "hello" },
+  { keys = "hello chagnes <BS><BS><BS><BS><BS><BS><BS><BS><BS><BS>", expect_buf = "hello" },
   { keys = " chagnes ", expect_buf = "hello changes " },
 ]
 
@@ -102,9 +102,15 @@ steps = [
 ]
 
 [[trace]]
-name = "multi_boundary_comma_space_single_backspace_undo"
+name = "multi_boundary_comma_space_step_backspace_undo"
 steps = [
-  { keys = "chagnes, <BS>, ", expect_buf = "chagnes, " },
+  { keys = "chagnes, <BS><BS><BS>, ", expect_buf = "chagnes, " },
+]
+
+[[trace]]
+name = "step_undo_punctuation_and_suffix_edits"
+steps = [
+  { keys = "reosurce <BS>. ssytem <BS>, reosurce <BS>s reosurce <BS>.json ", expect_buf = "resource. system, resources resource.json " },
 ]
 
 [[trace]]
@@ -120,7 +126,7 @@ steps = [
 name = "vi_lotus_shorthand_undo_pair_block"
 lang = "vi"
 steps = [
-  { keys = "ntn <BS> ", expect_buf = "ntn " },
+  { keys = "ntn <BS><BS> ", expect_buf = "ntn " },
   { keys = "ntn ", expect_buf = "ntn ntn " },
 ]
 

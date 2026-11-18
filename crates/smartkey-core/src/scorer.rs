@@ -867,9 +867,15 @@ impl LatinScorer {
         }
 
         let length_damping = 1.0 / (1.0 + 0.10 * (char_len.saturating_sub(3).min(7) as f32));
-        let mut pool: HashMap<String, Candidate> = HashMap::new();
+        struct PooledEntry {
+            cand: Candidate,
+            raw_edit_cost: f32,
+            bg_term: f32,
+            rescue_bonus: f32,
+        }
+        let mut pool: HashMap<String, PooledEntry> = HashMap::new();
 
-        let push_candidate = |pool: &mut HashMap<String, Candidate>,
+        let push_candidate = |pool: &mut HashMap<String, PooledEntry>,
                               cand_lower: &str,
                               freq: u8,
                               bonus: f32,
@@ -878,8 +884,17 @@ impl LatinScorer {
             if cand_lower == core_lower || rules.is_pair_blocked(&core_lower, cand_lower) {
                 return;
             }
-            let edit_cost =
-                custom_cost.unwrap_or_else(|| weighted_keyboard_cost(&core_lower, cand_lower));
+            // Keep true raw motor distance for SmashRescue even when `edit_cost` is scramble-clamped.
+            let (edit_cost, raw_edit_cost) = match (kind, custom_cost) {
+                (MatchKind::SmashRescue, Some(damped)) => {
+                    (damped, weighted_keyboard_cost(&core_lower, cand_lower))
+                }
+                (_, Some(c)) => (c, c),
+                (_, None) => {
+                    let c = weighted_keyboard_cost(&core_lower, cand_lower);
+                    (c, c)
+                }
+            };
             let bg = match prev_lower.as_deref() {
                 Some(p) => {
                     let first_word = cand_lower.split(' ').next().unwrap_or(cand_lower);
@@ -899,6 +914,11 @@ impl LatinScorer {
             };
             let freq_term = 1.25 * (freq as f32 / 255.0);
             let bg_term = 0.95 * bg;
+            let rescue_bonus = if kind == MatchKind::SmashRescue {
+                bonus
+            } else {
+                0.0
+            };
             let score = freq_term + bg_term + bonus + anagram_bonus + trouble
                 - (length_damping * edit_cost);
 
@@ -911,31 +931,27 @@ impl LatinScorer {
             } else {
                 wrap(&project_case(cand_lower, cap_initial))
             };
+            let make_entry = || PooledEntry {
+                cand: Candidate {
+                    replacement: formatted,
+                    score,
+                    edit_cost,
+                    freq,
+                    bigram_boost: bg,
+                    kind,
+                },
+                raw_edit_cost,
+                bg_term,
+                rescue_bonus,
+            };
             match pool.get_mut(cand_lower) {
                 Some(existing) => {
-                    if score > existing.score {
-                        *existing = Candidate {
-                            replacement: formatted,
-                            score,
-                            edit_cost,
-                            freq,
-                            bigram_boost: bg,
-                            kind,
-                        };
+                    if score > existing.cand.score {
+                        *existing = make_entry();
                     }
                 }
                 None => {
-                    pool.insert(
-                        cand_lower.to_string(),
-                        Candidate {
-                            replacement: formatted,
-                            score,
-                            edit_cost,
-                            freq,
-                            bigram_boost: bg,
-                            kind,
-                        },
-                    );
+                    pool.insert(cand_lower.to_string(), make_entry());
                 }
             }
         };
@@ -978,9 +994,13 @@ impl LatinScorer {
         }
 
         // Fast-path: an unambiguous curated typo entry (`chagnes -> changes`, `soemtimes -> sometimes`)
-        // does not need expensive distance-2 DFA scanning over 160k lexicon words!
-        let skip_heavy_dfa =
-            single_curated_hit && !collect_all && pool.values().any(|c| c.score >= 0.35);
+        // does not need expensive distance-2 DFA scanning over 160k lexicon words, provided the
+        // hit itself is motor-close so a clean uninflected stem cannot be skipped.
+        let skip_heavy_dfa = single_curated_hit
+            && !collect_all
+            && pool
+                .values()
+                .any(|e| e.cand.score >= 0.35 && e.raw_edit_cost <= 0.95);
 
         // For 2-char unknown words (`uh`, `ko`, `iu`), never run statistical fuzzy guessing!
         if char_len == 2 && pool.is_empty() {
@@ -1027,7 +1047,7 @@ impl LatinScorer {
         // Stage 1: fast `d <= 1` (`< 15 µs`, catches 95% of unseen transpositions & adjacent slips like `woryr -> worry`).
         // Stage 2: `d <= 2` ONLY if Stage 1 produced no confident match!
         if char_len >= 3 && !skip_heavy_dfa {
-            let run_stage = |dist: u8, pool: &mut HashMap<String, Candidate>| {
+            let run_stage = |dist: u8, pool: &mut HashMap<String, PooledEntry>| {
                 let mut fuzzy_hits = Vec::new();
                 self.lexicon
                     .search_fuzzy(&core_lower, dist, &mut fuzzy_hits);
@@ -1064,7 +1084,7 @@ impl LatinScorer {
 
             let best_d1 = pool
                 .values()
-                .map(|c| c.score)
+                .map(|e| e.cand.score)
                 .fold(f32::NEG_INFINITY, f32::max);
             let allow_d2 = char_len >= 5 || prev_lower.is_some();
             if allow_d2 && (best_d1 < 0.25 || collect_all) {
@@ -1075,7 +1095,7 @@ impl LatinScorer {
         // 5e. `POPCNT` Character-Multiset Smash Rescue for heavy scrambles (`hstiautoin -> situation`)
         let best_so_far = pool
             .values()
-            .map(|c| c.score)
+            .map(|e| e.cand.score)
             .fold(f32::NEG_INFINITY, f32::max);
         if char_len >= 7 && core_lower.is_ascii() && (best_so_far < 0.45 || collect_all) {
             let q_mask = ascii_letter_mask(&core_lower);
@@ -1105,7 +1125,9 @@ impl LatinScorer {
                     3
                 };
                 let dl = damerau_levenshtein_chars(&core_lower, &entry.word);
-                if dl > max_dl {
+                // Restrict short (7–9 char) dl <= 2 candidates from SmashRescue so high-frequency
+                // words (freq >= 105, e.g. inflected forms) do not gain a +0.26 cliff over stems.
+                if dl > max_dl || (dl < 3 && char_len < 10) {
                     continue;
                 }
                 let mapped = self.lexicon.map_dialect(&entry.word, config.dialect);
@@ -1180,7 +1202,60 @@ impl LatinScorer {
             }
         }
 
-        let mut ranked: Vec<Candidate> = pool.into_values().collect();
+        let (t_auto, min_margin) = Self::thresholds(config.aggressiveness);
+
+        // Damp bigram overrides when a candidate has large excess motor cost vs the tightest viable match.
+        let min_raw_edit = pool
+            .values()
+            .filter(|e| e.cand.score >= t_auto)
+            .map(|e| e.raw_edit_cost)
+            .fold(f32::INFINITY, f32::min);
+        if min_raw_edit.is_finite() {
+            for entry in pool.values_mut() {
+                if entry.bg_term > 0.0 {
+                    let excess = entry.raw_edit_cost - min_raw_edit;
+                    if excess > 0.45 {
+                        let keep = (1.0 - (excess - 0.45) * 1.5).clamp(0.0, 1.0);
+                        let new_bg = entry.bg_term * keep;
+                        entry.cand.score -= entry.bg_term - new_bg;
+                        entry.bg_term = new_bg;
+                    }
+                }
+            }
+        }
+
+        // English Relational Stem-Dominance Guard: do not let a high-edit inflection (-ed/-d/-s/-es/-ies/-ied/-ing)
+        // outrank or tie-block its own motor-clean viable base stem via bigram/SmashRescue boosts.
+        if self.lexicon.header().lang == "en" {
+            let viable_stems: Vec<(String, f32, f32)> = pool
+                .iter()
+                .filter(|(k, e)| k.len() >= 3 && e.cand.score >= t_auto)
+                .map(|(k, e)| (k.clone(), e.raw_edit_cost, e.cand.score))
+                .collect();
+            if !viable_stems.is_empty() {
+                for (cand_key, entry) in pool.iter_mut() {
+                    let mut cap: Option<f32> = None;
+                    for (stem_key, stem_raw_edit, stem_score) in &viable_stems {
+                        if is_english_inflection_of(stem_key, cand_key)
+                            && entry.raw_edit_cost >= *stem_raw_edit + 0.45
+                        {
+                            let c = *stem_score - min_margin - 0.01;
+                            cap = Some(cap.map_or(c, |prev| prev.min(c)));
+                        }
+                    }
+                    if let Some(max_score) = cap {
+                        entry.cand.score -= entry.bg_term + entry.rescue_bonus;
+                        entry.bg_term = 0.0;
+                        entry.rescue_bonus = 0.0;
+                        if entry.cand.score > max_score {
+                            entry.cand.score = max_score;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut ranked: Vec<Candidate> = pool.into_values().map(|e| e.cand).collect();
         ranked.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1188,7 +1263,6 @@ impl LatinScorer {
                 .then_with(|| b.freq.cmp(&a.freq))
         });
 
-        let (t_auto, min_margin) = Self::thresholds(config.aggressiveness);
         let mut ambiguous_high_score_tie = false;
         if let Some(top) = ranked.first() {
             let second_score = ranked.get(1).map(|c| c.score).unwrap_or(0.0);
@@ -1401,6 +1475,42 @@ fn generate_chatter_collapses(lower: &str) -> Vec<String> {
     }
 
     out
+}
+
+/// Returns `true` when `cand` is a regular English inflection (`-s`, `-es`, `-ies`, `-d`, `-ed`,
+/// `-ied`, `-ing`, or doubled final consonant + `-ed`/`-ing`) of ASCII base `stem` (`len >= 3`).
+fn is_english_inflection_of(stem: &str, cand: &str) -> bool {
+    if stem.len() < 3 || cand.len() <= stem.len() || !stem.is_ascii() || !cand.is_ascii() {
+        return false;
+    }
+    if let Some(suf) = cand.strip_prefix(stem) {
+        if matches!(suf, "s" | "es" | "ed" | "ing") || (suf == "d" && stem.ends_with('e')) {
+            return true;
+        }
+        let last = stem.as_bytes()[stem.len() - 1];
+        if last.is_ascii_alphabetic()
+            && !matches!(last, b'a' | b'e' | b'i' | b'o' | b'u' | b'w' | b'x' | b'y')
+        {
+            let sb = suf.as_bytes();
+            if sb.first() == Some(&last) && (&sb[1..] == b"ed" || &sb[1..] == b"ing") {
+                return true;
+            }
+        }
+    }
+    if let Some(root) = stem.strip_suffix('y') {
+        if let Some(suf) = cand.strip_prefix(root) {
+            if matches!(suf, "ies" | "ied") {
+                return true;
+            }
+        }
+    }
+    if stem.ends_with('e') && !stem.ends_with("ee") {
+        let root = &stem[..stem.len() - 1];
+        if cand.strip_prefix(root) == Some("ing") {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1671,5 +1781,47 @@ mod tests {
             scorer.evaluate("i", &ctx, &cfg, &EmptyUserRules),
             EvalOutcome::Unchanged { .. }
         ));
+    }
+
+    #[test]
+    fn english_inflection_helper_recognizes_regular_forms_and_rejects_unrelated_words() {
+        for (stem, cand) in [
+            ("disable", "disabled"),
+            ("disable", "disables"),
+            ("disable", "disabling"),
+            ("observe", "observed"),
+            ("compile", "compiled"),
+            ("compile", "compiling"),
+            ("require", "required"),
+            ("require", "requires"),
+            ("plan", "planned"),
+            ("plan", "planning"),
+            ("stop", "stopped"),
+            ("apply", "applied"),
+            ("apply", "applies"),
+            ("process", "processes"),
+            ("process", "processed"),
+            ("process", "processing"),
+            ("implementation", "implementations"),
+        ] {
+            assert!(
+                is_english_inflection_of(stem, cand),
+                "expected {cand:?} to be recognized as inflection of {stem:?}"
+            );
+        }
+
+        for (stem, cand) in [
+            ("go", "goes"),
+            ("plan", "planner"),
+            ("plane", "planned"),
+            ("tree", "trings"),
+            ("speed", "spede"),
+            ("disable", "disable"),
+        ] {
+            assert!(
+                !is_english_inflection_of(stem, cand),
+                "did not expect {cand:?} to be recognized as inflection of {stem:?}"
+            );
+        }
     }
 }

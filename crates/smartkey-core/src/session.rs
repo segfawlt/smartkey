@@ -12,7 +12,7 @@ use crate::lexicon::{LexiconError, PackLexicon, PackTier};
 use crate::scorer::{EvalContext, LanguageScorer, LatinScorer, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::{
-    AppProfile, Candidate, EvalOutcome, Explanation, InputOrigin, LangId, MatchKind,
+    AppProfile, Candidate, EvalOutcome, Explanation, InputOrigin, LangId, MatchKind, UndoMode,
 };
 
 enum LoadedPack {
@@ -892,6 +892,12 @@ impl SessionOutput {
 }
 
 #[derive(Debug, Clone)]
+struct PostAutocorrectOrigin {
+    raw_typed: String,
+    prev_word_before: Option<String>,
+    is_snippet: bool,
+}
+
 enum Mode {
     Idle,
     Composing {
@@ -906,6 +912,7 @@ enum Mode {
         peak_before_bs: Option<String>,
         dot_char: char,
         on_screen_word_chars: Option<usize>,
+        post_autocorrect: Option<PostAutocorrectOrigin>,
     },
     /// Saw `;` right after `word`; waiting 1 key to distinguish pinky contraction slip (`"don;t"`)
     /// from prose semicolon (`"chagnes; "`).
@@ -913,6 +920,7 @@ enum Mode {
         word: String,
         peak_before_bs: Option<String>,
         on_screen_word_chars: Option<usize>,
+        post_autocorrect: Option<PostAutocorrectOrigin>,
     },
     /// Word was just committed untouched followed by `trailing_spaces` spaces (`' '`),
     /// allowing post-Space `BackSpace` or `Ctrl+BackSpace` manual typo learning.
@@ -922,7 +930,8 @@ enum Mode {
         trailing_spaces: usize,
     },
     /// Word was just autocorrected (`raw_typed -> applied + trailing_boundaries`);
-    /// `1x BackSpace` within `undo_window_ms` snaps back to `raw_typed`.
+    /// post-correction `BackSpace` follows `settings.undo_mode` (`"step"`, `"immediate"`, `"off"`)
+    /// within `undo_window_ms`.
     JustAutocorrected {
         raw_typed: String,
         applied: String,
@@ -1473,12 +1482,33 @@ impl SmartKeySession {
             }
             Mode::PendingTrailingDot {
                 word: buf,
+                dot_char,
+                post_autocorrect: Some(_),
+                ..
+            } => {
+                if !buf.is_empty() {
+                    self.update_context_after_commit(engine, &buf, Some(dot_char), false);
+                }
+            }
+            Mode::PendingSemicolon {
+                word: buf,
+                post_autocorrect: Some(_),
+                ..
+            } => {
+                if !buf.is_empty() {
+                    self.update_context_after_commit(engine, &buf, Some(';'), false);
+                }
+            }
+            Mode::PendingTrailingDot {
+                word: buf,
                 peak_before_bs,
+                post_autocorrect: None,
                 ..
             }
             | Mode::PendingSemicolon {
                 word: buf,
                 peak_before_bs,
+                post_autocorrect: None,
                 ..
             }
             | Mode::Composing {
@@ -1563,39 +1593,125 @@ impl SmartKeySession {
                 raw_typed,
                 applied,
                 prev_word_before,
-                trailing_boundaries,
+                mut trailing_boundaries,
                 is_snippet,
                 corrected_at_ms,
             } => {
-                let undo_window = engine.store.compiled().undo_window_ms;
-                if now_ms.saturating_sub(corrected_at_ms) <= undo_window {
-                    engine.store.log_backspace_undo(
-                        &raw_typed,
-                        &applied,
-                        UndoResolution::Triggered,
-                    );
-                    let delete_chars =
-                        applied.chars().count() + trailing_boundaries.chars().count();
-                    let restored = raw_typed.clone();
-                    self.prev_word = prev_word_before.clone();
-                    self.mode = Mode::EditingRestored {
-                        raw_typed,
-                        rejected: applied,
-                        prev_word_before,
-                        buf: restored.clone(),
-                        is_snippet,
-                    };
-                    SessionOutput {
-                        action: SessionAction::Replace {
-                            delete_chars,
-                            insert: restored,
-                        },
-                        matched_kind: None,
-                        learn_events: Vec::new(),
+                let (undo_window, undo_mode) = {
+                    let c = engine.store.compiled();
+                    (c.undo_window_ms, c.undo_mode)
+                };
+                let in_window = now_ms.saturating_sub(corrected_at_ms) <= undo_window;
+                match undo_mode {
+                    UndoMode::Immediate => {
+                        if in_window {
+                            engine.store.log_backspace_undo(
+                                &raw_typed,
+                                &applied,
+                                UndoResolution::Triggered,
+                            );
+                            let delete_chars =
+                                applied.chars().count() + trailing_boundaries.chars().count();
+                            let restored = raw_typed.clone();
+                            self.prev_word = prev_word_before.clone();
+                            self.mode = Mode::EditingRestored {
+                                raw_typed,
+                                rejected: applied,
+                                prev_word_before,
+                                buf: restored.clone(),
+                                is_snippet,
+                            };
+                            SessionOutput {
+                                action: SessionAction::Replace {
+                                    delete_chars,
+                                    insert: restored,
+                                },
+                                matched_kind: None,
+                                learn_events: Vec::new(),
+                            }
+                        } else {
+                            self.prev_word = None;
+                            SessionOutput::passthrough()
+                        }
                     }
-                } else {
-                    self.prev_word = None;
-                    SessionOutput::passthrough()
+                    UndoMode::Step => {
+                        if !in_window {
+                            self.prev_word = None;
+                            SessionOutput::passthrough()
+                        } else if !trailing_boundaries.is_empty() {
+                            trailing_boundaries.pop();
+                            if trailing_boundaries.is_empty() {
+                                self.at_sentence_start = false;
+                                self.suppress_sentence_cap = false;
+                            }
+                            self.mode = Mode::JustAutocorrected {
+                                raw_typed,
+                                applied,
+                                prev_word_before,
+                                trailing_boundaries,
+                                is_snippet,
+                                corrected_at_ms: now_ms,
+                            };
+                            SessionOutput::passthrough()
+                        } else {
+                            engine.store.log_backspace_undo(
+                                &raw_typed,
+                                &applied,
+                                UndoResolution::Triggered,
+                            );
+                            let delete_chars = applied.chars().count();
+                            let restored = raw_typed.clone();
+                            self.prev_word = prev_word_before.clone();
+                            self.mode = Mode::EditingRestored {
+                                raw_typed,
+                                rejected: applied,
+                                prev_word_before,
+                                buf: restored.clone(),
+                                is_snippet,
+                            };
+                            SessionOutput {
+                                action: SessionAction::Replace {
+                                    delete_chars,
+                                    insert: restored,
+                                },
+                                matched_kind: None,
+                                learn_events: Vec::new(),
+                            }
+                        }
+                    }
+                    UndoMode::Off => {
+                        if in_window && !trailing_boundaries.is_empty() {
+                            trailing_boundaries.pop();
+                            if trailing_boundaries.is_empty() {
+                                self.at_sentence_start = false;
+                                self.suppress_sentence_cap = false;
+                            }
+                            self.mode = Mode::JustAutocorrected {
+                                raw_typed,
+                                applied,
+                                prev_word_before,
+                                trailing_boundaries,
+                                is_snippet,
+                                corrected_at_ms: now_ms,
+                            };
+                        } else if trailing_boundaries.is_empty() {
+                            let mut buf = applied;
+                            buf.pop();
+                            if buf.is_empty() {
+                                self.prev_word = None;
+                            } else {
+                                self.prev_word = prev_word_before;
+                                self.mode = Mode::Composing {
+                                    buf,
+                                    peak_before_bs: None,
+                                    origin: InputOrigin::PlainAscii,
+                                };
+                            }
+                        } else {
+                            self.prev_word = None;
+                        }
+                        SessionOutput::passthrough()
+                    }
                 }
             }
             Mode::EditingRestored {
@@ -1671,19 +1787,34 @@ impl SmartKeySession {
             Mode::PendingTrailingDot {
                 word,
                 peak_before_bs,
+                post_autocorrect,
                 ..
             }
             | Mode::PendingSemicolon {
                 word,
                 peak_before_bs,
+                post_autocorrect,
                 ..
             } => {
                 // Backspace deletes the provisional `.`, `:`, or `;`
-                self.mode = Mode::Composing {
-                    buf: word,
-                    peak_before_bs,
-                    origin: InputOrigin::PlainAscii,
-                };
+                if let Some(origin) = post_autocorrect {
+                    self.at_sentence_start = false;
+                    self.suppress_sentence_cap = false;
+                    self.mode = Mode::JustAutocorrected {
+                        raw_typed: origin.raw_typed,
+                        applied: word,
+                        prev_word_before: origin.prev_word_before,
+                        trailing_boundaries: String::new(),
+                        is_snippet: origin.is_snippet,
+                        corrected_at_ms: now_ms,
+                    };
+                } else {
+                    self.mode = Mode::Composing {
+                        buf: word,
+                        peak_before_bs,
+                        origin: InputOrigin::PlainAscii,
+                    };
+                }
                 SessionOutput::passthrough()
             }
             Mode::Composing {
@@ -1727,10 +1858,19 @@ impl SmartKeySession {
                 is_snippet,
                 corrected_at_ms,
             } => {
-                let undo_window = engine.store.compiled().undo_window_ms;
+                let (undo_window, undo_mode) = {
+                    let c = engine.store.compiled();
+                    (c.undo_window_ms, c.undo_mode)
+                };
                 let single_word_space = !applied.chars().any(char::is_whitespace)
                     && trailing_boundaries.chars().all(char::is_whitespace);
-                if self.last_key_ms.saturating_sub(corrected_at_ms) <= undo_window
+                if undo_mode == UndoMode::Off {
+                    self.prev_word = if single_word_space {
+                        prev_word_before
+                    } else {
+                        None
+                    };
+                } else if self.last_key_ms.saturating_sub(corrected_at_ms) <= undo_window
                     && single_word_space
                 {
                     engine.store.log_backspace_undo(
@@ -1827,6 +1967,42 @@ impl SmartKeySession {
         SessionOutput::passthrough()
     }
 
+    fn finish_post_autocorrect_pending_punct(
+        &mut self,
+        engine: &SmartKeyEngine,
+        word: String,
+        punct_char: char,
+        origin: PostAutocorrectOrigin,
+        next_ch: char,
+        now_ms: u64,
+    ) -> SessionOutput {
+        if Self::is_immediate_boundary(next_ch) {
+            self.update_context_after_commit(engine, &word, Some(punct_char), false);
+            let mut trailing_boundaries = String::with_capacity(4);
+            trailing_boundaries.push(punct_char);
+            trailing_boundaries.push(next_ch);
+            self.mode = Mode::JustAutocorrected {
+                raw_typed: origin.raw_typed,
+                applied: word,
+                prev_word_before: origin.prev_word_before,
+                trailing_boundaries,
+                is_snippet: origin.is_snippet,
+                corrected_at_ms: now_ms,
+            };
+        } else {
+            self.prev_word = origin.prev_word_before;
+            let mut merged = word;
+            merged.push(punct_char);
+            merged.push(next_ch);
+            self.mode = Mode::Composing {
+                buf: merged,
+                peak_before_bs: None,
+                origin: InputOrigin::PlainAscii,
+            };
+        }
+        SessionOutput::passthrough()
+    }
+
     fn handle_char(&mut self, engine: &mut SmartKeyEngine, ch: char, now_ms: u64) -> SessionOutput {
         // Backtick toggles inline Markdown code immunity (`` `code` ``)
         if ch == '`' {
@@ -1848,7 +2024,13 @@ impl SmartKeySession {
                 peak_before_bs,
                 dot_char,
                 on_screen_word_chars,
+                post_autocorrect,
             } => {
+                if let Some(origin) = post_autocorrect {
+                    return self.finish_post_autocorrect_pending_punct(
+                        engine, word, dot_char, origin, ch, now_ms,
+                    );
+                }
                 if Self::is_immediate_boundary(ch) {
                     return self.finish_token_at_boundary_inner(
                         engine,
@@ -1880,7 +2062,13 @@ impl SmartKeySession {
                 word,
                 peak_before_bs,
                 on_screen_word_chars,
+                post_autocorrect,
             } => {
+                if let Some(origin) = post_autocorrect {
+                    return self.finish_post_autocorrect_pending_punct(
+                        engine, word, ';', origin, ch, now_ms,
+                    );
+                }
                 if Self::is_immediate_boundary(ch) {
                     return self.finish_token_at_boundary_inner(
                         engine,
@@ -2058,6 +2246,7 @@ impl SmartKeySession {
                         peak_before_bs,
                         dot_char: ch,
                         on_screen_word_chars: None,
+                        post_autocorrect: None,
                     };
                     return SessionOutput::passthrough();
                 }
@@ -2066,6 +2255,7 @@ impl SmartKeySession {
                         word: buf,
                         peak_before_bs,
                         on_screen_word_chars: None,
+                        post_autocorrect: None,
                     };
                     return SessionOutput::passthrough();
                 }
@@ -2092,8 +2282,8 @@ impl SmartKeySession {
                 return SessionOutput::passthrough();
             }
 
-            // 6. Immediately after an autocorrect: allow trailing `' '` after `,`/`.`/`:` (`"fomr, "`)
-            // to stay inside the `1x BackSpace` undo window!
+            // 6. Immediately after an autocorrect: allow trailing boundaries (e.g. `"fomr, "`) or
+            //    peeled post-backspace punctuation/suffix edits (`"reosurce <BS>. "`, `"reosurce <BS>s "`)!
             Mode::JustAutocorrected {
                 raw_typed,
                 applied,
@@ -2106,7 +2296,11 @@ impl SmartKeySession {
                     && !trailing_boundaries.ends_with(' ')
                     && !trailing_boundaries.ends_with('\t')
                 {
+                    let was_empty = trailing_boundaries.is_empty();
                     trailing_boundaries.push(ch);
+                    if was_empty {
+                        self.update_context_after_commit(engine, &applied, None, true);
+                    }
                     self.mode = Mode::JustAutocorrected {
                         raw_typed,
                         applied,
@@ -2116,6 +2310,61 @@ impl SmartKeySession {
                         corrected_at_ms,
                     };
                     return SessionOutput::passthrough();
+                }
+                if trailing_boundaries.is_empty() {
+                    if ch == '.' || ch == ':' {
+                        let word_chars = applied.chars().count();
+                        self.mode = Mode::PendingTrailingDot {
+                            word: applied,
+                            peak_before_bs: None,
+                            dot_char: ch,
+                            on_screen_word_chars: Some(word_chars),
+                            post_autocorrect: Some(PostAutocorrectOrigin {
+                                raw_typed,
+                                prev_word_before,
+                                is_snippet,
+                            }),
+                        };
+                        return SessionOutput::passthrough();
+                    }
+                    if ch == ';' {
+                        let word_chars = applied.chars().count();
+                        self.mode = Mode::PendingSemicolon {
+                            word: applied,
+                            peak_before_bs: None,
+                            on_screen_word_chars: Some(word_chars),
+                            post_autocorrect: Some(PostAutocorrectOrigin {
+                                raw_typed,
+                                prev_word_before,
+                                is_snippet,
+                            }),
+                        };
+                        return SessionOutput::passthrough();
+                    }
+                    if Self::is_immediate_boundary(ch) {
+                        trailing_boundaries.push(ch);
+                        self.update_context_after_commit(engine, &applied, Some(ch), false);
+                        self.mode = Mode::JustAutocorrected {
+                            raw_typed,
+                            applied,
+                            prev_word_before,
+                            trailing_boundaries,
+                            is_snippet,
+                            corrected_at_ms,
+                        };
+                        return SessionOutput::passthrough();
+                    }
+                    if !Self::is_opening_delimiter_when_idle(ch) {
+                        self.prev_word = prev_word_before;
+                        let mut buf = applied;
+                        buf.push(ch);
+                        self.mode = Mode::Composing {
+                            buf,
+                            peak_before_bs: None,
+                            origin: InputOrigin::PlainAscii,
+                        };
+                        return SessionOutput::passthrough();
+                    }
                 }
                 // User moved on to new characters -> start normal handling from Idle
             }
@@ -2242,8 +2491,28 @@ impl SmartKeySession {
             } => (buf, peak_before_bs, None, 0usize),
             Mode::PendingTrailingDot {
                 word,
+                dot_char,
+                post_autocorrect: Some(origin),
+                ..
+            } if Self::is_immediate_boundary(boundary_ch) => {
+                return self.finish_post_autocorrect_pending_punct(
+                    engine, word, dot_char, origin, boundary_ch, now_ms,
+                );
+            }
+            Mode::PendingSemicolon {
+                word,
+                post_autocorrect: Some(origin),
+                ..
+            } if Self::is_immediate_boundary(boundary_ch) => {
+                return self.finish_post_autocorrect_pending_punct(
+                    engine, word, ';', origin, boundary_ch, now_ms,
+                );
+            }
+            Mode::PendingTrailingDot {
+                word,
                 peak_before_bs,
                 dot_char,
+                post_autocorrect: None,
                 ..
             } if Self::is_immediate_boundary(boundary_ch) => {
                 (word, peak_before_bs, Some(dot_char), 1usize)
@@ -2251,6 +2520,7 @@ impl SmartKeySession {
             Mode::PendingSemicolon {
                 word,
                 peak_before_bs,
+                post_autocorrect: None,
                 ..
             } if Self::is_immediate_boundary(boundary_ch) => {
                 (word, peak_before_bs, Some(';'), 1usize)
@@ -2292,6 +2562,7 @@ impl SmartKeySession {
                 peak_before_bs,
                 dot_char: boundary_ch,
                 on_screen_word_chars: Some(committed_word_chars),
+                post_autocorrect: None,
             };
             return SessionOutput::passthrough();
         }
@@ -2300,6 +2571,7 @@ impl SmartKeySession {
                 word,
                 peak_before_bs,
                 on_screen_word_chars: Some(committed_word_chars),
+                post_autocorrect: None,
             };
             return SessionOutput::passthrough();
         }

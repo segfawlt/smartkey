@@ -10,7 +10,9 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::event_log::{current_epoch_ms, date_string, DiagnosticsConfig, EventLog, EventLogLevel};
 use crate::scorer::UserRuleView;
-use crate::types::{Aggressiveness, AppProfile, Dialect, LangId, MatchKind, ScorerConfig};
+use crate::types::{
+    Aggressiveness, AppProfile, Dialect, LangId, MatchKind, ScorerConfig, UndoMode,
+};
 use crate::vi_telex::LotusOptions;
 
 /// Built-in onboarding presets (`smartkey init --preset ...`).
@@ -57,6 +59,7 @@ enabled = true
 dialect = "mixed"               # "mixed" | "en_US" | "en_GB"
 aggressiveness = "{aggr}"       # "conservative" | "balanced" | "aggressive"
 undo_window_ms = 5000
+undo_mode = "step"              # "step" | "immediate" | "off"
 auto_capitalize_i = true
 auto_capitalize_sentence = {auto_cap_sent}
 fix_shift_slips = true          # THat's -> That's, situatioN: -> situation:, tHIS -> This
@@ -689,6 +692,7 @@ pub struct CompiledRules {
     pub enabled: bool,
     pub vi_lotus_enabled: bool,
     pub undo_window_ms: u64,
+    pub undo_mode: UndoMode,
     pub scorer_config: ScorerConfig,
     pub diagnostics: DiagnosticsConfig,
     pub app_profiles: AppProfileConfig,
@@ -3629,6 +3633,7 @@ impl RuleStore {
             "dialect" | "settings.dialect" => Some("settings.dialect"),
             "aggressiveness" | "settings.aggressiveness" => Some("settings.aggressiveness"),
             "undo_window_ms" | "settings.undo_window_ms" => Some("settings.undo_window_ms"),
+            "undo_mode" | "settings.undo_mode" => Some("settings.undo_mode"),
             "auto_capitalize_i" | "settings.auto_capitalize_i" => {
                 Some("settings.auto_capitalize_i")
             }
@@ -3670,6 +3675,7 @@ impl RuleStore {
             "settings.dialect",
             "settings.aggressiveness",
             "settings.undo_window_ms",
+            "settings.undo_mode",
             "settings.auto_capitalize_i",
             "settings.auto_capitalize_sentence",
             "settings.fix_shift_slips",
@@ -3709,6 +3715,11 @@ impl RuleStore {
                 Aggressiveness::Aggressive => "aggressive".to_string(),
             },
             "settings.undo_window_ms" => c.undo_window_ms.to_string(),
+            "settings.undo_mode" => match c.undo_mode {
+                UndoMode::Step => "step".to_string(),
+                UndoMode::Immediate => "immediate".to_string(),
+                UndoMode::Off => "off".to_string(),
+            },
             "settings.auto_capitalize_i" => sc.auto_capitalize_i.to_string(),
             "settings.auto_capitalize_sentence" => sc.auto_capitalize_sentence.to_string(),
             "settings.fix_shift_slips" => sc.fix_shift_slips.to_string(),
@@ -3820,6 +3831,22 @@ impl RuleStore {
                     ));
                 }
                 TomlPatch::Int("settings", "undo_window_ms", ms)
+            }
+            "settings.undo_mode" => {
+                let s = match raw_value.trim().to_ascii_lowercase().as_str() {
+                    "step" | "stepwise" => "step",
+                    "immediate" | "instant" => "immediate",
+                    "off" | "none" | "disable" | "disabled" | "false" => "off",
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "invalid undo_mode {raw_value:?} (expected step, immediate, or off)"
+                            ),
+                        ));
+                    }
+                };
+                TomlPatch::Str("settings", "undo_mode", s)
             }
             "settings.auto_capitalize_i" => {
                 TomlPatch::Bool("settings", "auto_capitalize_i", parse_bool(raw_value)?)
@@ -3997,6 +4024,7 @@ impl RuleStore {
             enabled: true,
             vi_lotus_enabled: true,
             undo_window_ms: 5000,
+            undo_mode: UndoMode::Step,
             scorer_config: ScorerConfig::default(),
             ..CompiledRules::default()
         };
@@ -4019,6 +4047,15 @@ impl RuleStore {
                 if ms > 0 {
                     out.undo_window_ms = ms as u64;
                 }
+            }
+            if let Some(um) = settings.get("undo_mode").and_then(Item::as_str) {
+                out.undo_mode = match um.trim().to_ascii_lowercase().as_str() {
+                    "immediate" | "instant" => UndoMode::Immediate,
+                    "off" | "none" | "disable" | "disabled" | "false" => UndoMode::Off,
+                    _ => UndoMode::Step,
+                };
+            } else if let Some(false) = settings.get("undo_mode").and_then(Item::as_bool) {
+                out.undo_mode = UndoMode::Off;
             }
             if let Some(d) = settings.get("dialect").and_then(Item::as_str) {
                 out.scorer_config.dialect = match d {
@@ -4786,5 +4823,47 @@ fomr = \"from\"
         assert_eq!(store.lookup_correction("dak"), None);
         assert_eq!(store.lookup_correction("xqtypo"), Some("porque"));
         assert_eq!(store.lookup_snippet(";sig"), Some("Best regards"));
+    }
+
+    #[test]
+    fn undo_mode_setting_round_trips_and_validates() {
+        let dir = temp_store_dir("undo_mode_setting");
+        let rules_path = dir.join("rules.toml");
+        let state_path = dir.join("learner_state.json");
+
+        {
+            let mut store =
+                RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
+                    .unwrap();
+            assert_eq!(store.compiled().undo_mode, UndoMode::Step);
+            assert_eq!(
+                store.get_setting("undo_mode").as_deref(),
+                Some("step")
+            );
+            assert!(store
+                .list_settings()
+                .iter()
+                .any(|(k, v)| *k == "settings.undo_mode" && v == "step"));
+
+            let (canon, val) = store.set_setting("undo_mode", "immediate").unwrap();
+            assert_eq!(canon, "settings.undo_mode");
+            assert_eq!(val, "immediate");
+            assert_eq!(store.compiled().undo_mode, UndoMode::Immediate);
+
+            let (_, val2) = store.set_setting("settings.undo_mode", "off").unwrap();
+            assert_eq!(val2, "off");
+            assert_eq!(store.compiled().undo_mode, UndoMode::Off);
+
+            let err = store.set_setting("undo_mode", "bogus").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        // Verify persisted value reloads cleanly and bool fallback works too.
+        let reloaded =
+            RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
+                .unwrap();
+        assert_eq!(reloaded.compiled().undo_mode, UndoMode::Off);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

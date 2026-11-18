@@ -216,8 +216,8 @@ fn six_row_matrix_and_guards_behave_exact_to_spec() {
         let mut session = SmartKeySession::new();
         let mut buf = String::new();
 
-        // 1. Snippet undo (`1x BackSpace`) reverts WITHOUT blocklisting `addr`
-        feed_keys(&mut session, &mut engine, &mut buf, "addr <BS> ");
+        // 1. Snippet undo reverts WITHOUT blocklisting `addr`
+        feed_keys(&mut session, &mut engine, &mut buf, "addr <BS><BS> ");
         assert_eq!(buf, "addr ");
         assert!(engine.store().compiled().blocklist.is_empty());
 
@@ -232,7 +232,7 @@ fn six_row_matrix_and_guards_behave_exact_to_spec() {
             &mut session,
             &mut engine,
             &mut buf,
-            "chagnes <BS><BS><BS><BS><BS>nges ",
+            "chagnes <BS><BS><BS><BS><BS><BS>nges ",
         );
         assert_eq!(buf, "changes ");
         assert!(evs.contains(&LearnEvent::SelfConfirmCancelled));
@@ -244,7 +244,7 @@ fn six_row_matrix_and_guards_behave_exact_to_spec() {
             &mut session,
             &mut engine,
             &mut buf,
-            "chagnes <BS><BS><BS><BS><BS><BS><BS><BS>hello ",
+            "chagnes <BS><BS><BS><BS><BS><BS><BS><BS><BS>hello ",
         );
         assert_eq!(buf, "hello ");
         assert!(
@@ -255,7 +255,7 @@ fn six_row_matrix_and_guards_behave_exact_to_spec() {
         // 4. Row 2: Undo + Keep Verbatim (`1x` immediately blocks the pair on disk so the user
         //    never has to backspace a 2nd time, while `personal_dict` waits for a 2nd confirmation)
         buf.clear();
-        let evs = feed_keys(&mut session, &mut engine, &mut buf, "alot <BS> ");
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "alot <BS><BS> ");
         assert_eq!(buf, "alot ");
         assert!(evs.contains(&LearnEvent::ShieldedWordSession {
             word: "alot".to_string()
@@ -477,12 +477,12 @@ enabled = true
             total_count: 2,
         }));
 
-    // 3. Snippet undo 1x, 2x, 3x (`;addr -> 123 Le Loi` -> `<BS>` -> kept verbatim)
+    // 3. Snippet undo 1x, 2x, 3x (`;addr -> 123 Le Loi` -> `<BS><BS>` -> kept verbatim)
     feed_keys(
         &mut session,
         &mut engine,
         &mut buf,
-        ";addr <BS> ;addr <BS> ;addr <BS> ",
+        ";addr <BS><BS> ;addr <BS><BS> ;addr <BS><BS> ",
     );
     assert_eq!(
         engine.store().state().undo_counts.get(";addr->123 le loi"),
@@ -504,7 +504,7 @@ enabled = true
         &mut session,
         &mut engine,
         &mut buf,
-        "chagnes <BS><BS><BS><BS><BS>nges ",
+        "chagnes <BS><BS><BS><BS><BS><BS>nges ",
     );
     assert!(engine
         .store()
@@ -521,7 +521,7 @@ enabled = true
         &mut session,
         &mut engine,
         &mut buf,
-        "teh <BS><BS><BS><BS><BS>",
+        "teh <BS><BS><BS><BS><BS><BS>",
     );
     assert!(engine
         .store()
@@ -650,8 +650,8 @@ fn test_proper_noun_capitalization_and_undo() {
     feed_keys(&mut session, &mut engine, &mut buf, "english ");
     assert_eq!(buf, "English ");
 
-    // 1x BackSpace undo -> snaps back to "english"
-    feed_keys(&mut session, &mut engine, &mut buf, "<BS>");
+    // 2x BackSpace undo under default step mode -> 1st deletes space, 2nd snaps back to "english"
+    feed_keys(&mut session, &mut engine, &mut buf, "<BS><BS>");
     assert_eq!(buf, "english");
 
     // Keep it verbatim
@@ -674,10 +674,10 @@ fn test_slang_shielding_and_shorthand_expansion() {
     feed_keys(&mut session, &mut engine, &mut buf, "onl obv notif bruh ");
     assert_eq!(buf, "onl obv notif bruh ");
 
-    // Shorthand triggers (`ofc`, `rn`) auto-expand, and `1x BackSpace` reverts the entire phrase
+    // Shorthand triggers (`ofc`, `rn`) auto-expand, and step undo reverts the entire phrase
     // and blocks that pair permanently so the next `rn ` stays `rn `:
     buf.clear();
-    feed_keys(&mut session, &mut engine, &mut buf, "ofc rn <BS> rn ");
+    feed_keys(&mut session, &mut engine, &mut buf, "ofc rn <BS><BS> rn ");
     assert_eq!(buf, "of course rn rn ");
 }
 
@@ -1098,9 +1098,9 @@ fn test_undo_recovery_purges_bad_learned_correction_and_guard_vi_ascii_telex() {
         Some("forn")
     );
 
-    // Next time `fomr ` autocorrects to `forn `, user presses `<BS>` and edits to `form `:
+    // Next time `fomr ` autocorrects to `forn `, user steps back and edits to `form `:
     // `add_permanent_block("fomr", "forn")` immediately deletes the bad `"fomr" = "forn"` rule!
-    feed_keys(&mut session, &mut engine, &mut buf, "fomr <BS><BS><BS>rm ");
+    feed_keys(&mut session, &mut engine, &mut buf, "fomr <BS><BS><BS><BS>rm ");
     assert_eq!(buf, "form ");
     assert!(
         !engine.store().compiled().corrections.contains_key("fomr"),
@@ -1348,7 +1348,7 @@ fn contraction_undo_keep_needs_2x_across_sessions_to_block() {
         let mut engine = contraction_engine(&rules, &state);
         let mut session = SmartKeySession::new();
         let mut buf = String::new();
-        let evs = feed_keys(&mut session, &mut engine, &mut buf, "dont <BS> ");
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "dont <BS><BS> ");
         assert_eq!(buf, "dont ");
         assert!(evs.contains(&LearnEvent::ShieldedWordSession {
             word: "dont".to_string()
@@ -1378,7 +1378,7 @@ fn contraction_undo_keep_needs_2x_across_sessions_to_block() {
 
         buf.clear();
         let mut session = SmartKeySession::new();
-        let evs = feed_keys(&mut session, &mut engine, &mut buf, "dont <BS> ");
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "dont <BS><BS> ");
         assert_eq!(buf, "dont ");
         assert_eq!(reject_count(&engine), 2);
         assert!(engine
@@ -1412,7 +1412,7 @@ fn contraction_edit_to_third_word_blocks_only_at_2x() {
         let mut engine = contraction_engine(&rules, &state);
         let mut session = SmartKeySession::new();
         let mut buf = String::new();
-        let evs = feed_keys(&mut session, &mut engine, &mut buf, "dont <BS><BS><BS>nut ");
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "dont <BS><BS><BS><BS>nut ");
         let blocked_ev = evs.iter().any(
             |e| matches!(e, LearnEvent::BlockedPairPermanent { typed, .. } if typed == "dont"),
         );
@@ -1468,7 +1468,7 @@ fn non_contraction_undo_keep_still_blocks_at_1x() {
     let mut engine = contraction_engine(&rules, &state);
     let mut session = SmartKeySession::new();
     let mut buf = String::new();
-    feed_keys(&mut session, &mut engine, &mut buf, "alot <BS> ");
+    feed_keys(&mut session, &mut engine, &mut buf, "alot <BS><BS> ");
     assert!(engine.store().is_pair_blocked("alot", "a lot"));
     assert!(engine.store().state().staged_contraction_rejects.is_empty());
     let _ = fs::remove_dir_all(&dir);
@@ -1496,16 +1496,16 @@ fn contraction_rejection_goes_stale_after_many_accepted_corrections() {
     let (dir, rules, state) = contraction_tmp_paths("decay");
 
     // Rejection 1, then 12 corrections accepted, then rejection 2: the old rejection is stale.
-    let (engine, _) = contraction_session(&rules, &state, "dont <BS> ");
+    let (engine, _) = contraction_session(&rules, &state, "dont <BS><BS> ");
     assert_eq!(reject_count(&engine), 1);
     let (_, buf) = contraction_session(&rules, &state, &"dont ".repeat(12));
     assert_eq!(buf, "don't ".repeat(12));
-    let (engine, _) = contraction_session(&rules, &state, "dont <BS> ");
+    let (engine, _) = contraction_session(&rules, &state, "dont <BS><BS> ");
     assert_eq!(reject_count(&engine), 1, "stale evidence must restart at 1");
     assert!(!contraction_blocked(&engine));
 
     // A rejection soon after the previous one still accumulates to a block.
-    let (engine, _) = contraction_session(&rules, &state, "dont <BS> ");
+    let (engine, _) = contraction_session(&rules, &state, "dont <BS><BS> ");
     assert_eq!(reject_count(&engine), 2);
     assert!(contraction_blocked(&engine));
     let _ = fs::remove_dir_all(&dir);
@@ -1514,10 +1514,10 @@ fn contraction_rejection_goes_stale_after_many_accepted_corrections() {
 #[test]
 fn contraction_rejections_close_together_still_block() {
     let (dir, rules, state) = contraction_tmp_paths("close");
-    contraction_session(&rules, &state, "dont <BS> ");
+    contraction_session(&rules, &state, "dont <BS><BS> ");
     // 3 accepted corrections is below the staleness threshold.
     contraction_session(&rules, &state, &"dont ".repeat(3));
-    let (engine, _) = contraction_session(&rules, &state, "dont <BS> ");
+    let (engine, _) = contraction_session(&rules, &state, "dont <BS><BS> ");
     assert_eq!(reject_count(&engine), 2);
     assert!(contraction_blocked(&engine));
     let _ = fs::remove_dir_all(&dir);
@@ -1542,7 +1542,7 @@ fn case_only_undo_keep_needs_2x_across_sessions_to_block() {
         let mut engine = contraction_engine(&rules, &state);
         let mut session = SmartKeySession::new();
         let mut buf = String::new();
-        let evs = feed_keys(&mut session, &mut engine, &mut buf, "english <BS> ");
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "english <BS><BS> ");
         assert_eq!(buf, "english ");
         assert!(
             !evs.contains(&LearnEvent::SelfConfirmCancelled),
@@ -1564,7 +1564,7 @@ fn case_only_undo_keep_needs_2x_across_sessions_to_block() {
 
         buf.clear();
         let mut session = SmartKeySession::new();
-        feed_keys(&mut session, &mut engine, &mut buf, "english <BS> ");
+        feed_keys(&mut session, &mut engine, &mut buf, "english <BS><BS> ");
         assert_eq!(buf, "english ");
         assert!(case_pair_blocked(&engine));
     }
@@ -1594,7 +1594,7 @@ fn pinned_word_ignores_rejections_and_existing_blocks() {
     for _ in 0..3 {
         let mut session = SmartKeySession::new();
         let mut buf = String::new();
-        feed_keys(&mut session, &mut engine, &mut buf, "english <BS> ");
+        feed_keys(&mut session, &mut engine, &mut buf, "english <BS><BS> ");
         assert_eq!(buf, "english ");
         let mut session = SmartKeySession::new();
         buf.clear();
@@ -1829,7 +1829,7 @@ fn f3_personal_word_usage_boosts_typo_rescue_tiebreak_after_reset() {
 fn reconcile_surrounding_guards_displaced_cursor_undo() {
     let mut engine = SmartKeyEngine::in_memory_default().expect("bundled engine");
 
-    // 1. Staying at the corrected word boundary keeps 1x BackSpace undo alive:
+    // 1. Staying at the corrected word boundary keeps stepwise BackSpace undo alive:
     let mut session = SmartKeySession::new();
     let mut buf = String::new();
     for (i, ch) in "teh ".chars().enumerate() {
@@ -1838,10 +1838,13 @@ fn reconcile_surrounding_guards_displaced_cursor_undo() {
     }
     assert_eq!(buf, "the ");
     session.reconcile_surrounding(&mut engine, "hello the ", 10, 1_300);
-    let bs = session.process_key(&mut engine, KeyInput::BackSpace, 1_320);
+    let bs_step = session.process_key(&mut engine, KeyInput::BackSpace, 1_320);
+    assert_eq!(bs_step.action, SessionAction::PassThrough);
+    session.reconcile_surrounding(&mut engine, "hello the", 9, 1_500);
+    let bs = session.process_key(&mut engine, KeyInput::BackSpace, 1_520);
     assert!(
         matches!(bs.action, SessionAction::Replace { ref insert, .. } if insert == "teh"),
-        "expected undo Replace when cursor stayed after 'the ', got {:?}",
+        "expected undo Replace when cursor stayed after 'the', got {:?}",
         bs.action
     );
 
@@ -2044,7 +2047,7 @@ fn personal_dict_case_undo_keep_blocks_at_1x_without_decay_and_ctrl_bs_tracks_un
 
         let mut s = SmartKeySession::new();
         let mut b = String::new();
-        feed_keys(&mut s, &mut engine, &mut b, "domixi <BS> ");
+        feed_keys(&mut s, &mut engine, &mut b, "domixi <BS><BS> ");
         assert_eq!(b, "domixi ");
         assert!(
             engine.store().is_pair_blocked("domixi", "domixi"),
@@ -2182,7 +2185,7 @@ fn dev_terms_textbox_shielded_and_accidental_undo_block_heals_on_1x_manual_fix()
     //    heals immediately upon `1x` manual repair (`"somewher" -> "somewhere"`).
     let mut s2 = SmartKeySession::new();
     let mut b2 = String::new();
-    feed_keys(&mut s2, &mut engine, &mut b2, "somewher <BS> ");
+    feed_keys(&mut s2, &mut engine, &mut b2, "somewher <BS><BS> ");
     assert_eq!(b2, "somewher ");
     assert!(engine.store().is_pair_blocked("somewher", "somewhere"));
 
@@ -2201,7 +2204,9 @@ fn dev_terms_textbox_shielded_and_accidental_undo_block_heals_on_1x_manual_fix()
     for ch in "machien ".chars() {
         s3.process_key(&mut engine, KeyInput::Char(ch), 1_000);
     }
-    let bs_out = s3.process_key(&mut engine, KeyInput::BackSpace, 1_100);
+    let bs_step1 = s3.process_key(&mut engine, KeyInput::BackSpace, 1_100);
+    assert_eq!(bs_step1.action, SessionAction::PassThrough);
+    let bs_out = s3.process_key(&mut engine, KeyInput::BackSpace, 1_120);
     assert!(matches!(
         bs_out.action,
         SessionAction::Replace { ref insert, .. } if insert == "machien"
@@ -2216,7 +2221,7 @@ fn dev_terms_textbox_shielded_and_accidental_undo_block_heals_on_1x_manual_fix()
     //    lifting any cross-session ghost undo shield.
     let mut s4 = SmartKeySession::new();
     let mut b4 = String::new();
-    feed_keys(&mut s4, &mut engine, &mut b4, "alot <BS> ");
+    feed_keys(&mut s4, &mut engine, &mut b4, "alot <BS><BS> ");
     assert_eq!(b4, "alot ");
     assert!(engine.store().is_pair_blocked("alot", "a lot"));
     assert!(engine
@@ -2287,4 +2292,100 @@ fn reconcile_surrounding_disarms_undo_on_dropped_delete_duplication() {
         apply_key_to_buffer(&mut recheck, KeyInput::Char(ch), &out.action);
     }
     assert_eq!(recheck, "don't ");
+}
+
+#[test]
+fn undo_mode_step_supports_post_autocorrect_punctuation_and_suffix_edits() {
+    let mut store = RuleStore::in_memory(Preset::Balanced);
+    store
+        .set_setting("auto_capitalize_sentence", "true")
+        .unwrap();
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    // 1. Backspace once to delete trailing space, add forgotten `. `, and verify next word
+    //    capitalizes (sentence start) with ZERO BackspaceUndo events or blocklist entries:
+    feed_keys(&mut session, &mut engine, &mut buf, "the reosurce <BS>. next ");
+    assert_eq!(buf, "The resource. Next ");
+    assert!(engine.store().state().undo_counts.is_empty());
+    assert!(!engine.store().is_pair_blocked("reosurce", "resource"));
+
+    // 2. Comma, exclamation (triggers sentence cap), and semicolon:
+    buf.clear();
+    let _ = session.reset(&mut engine);
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "the reosurce <BS>, reosurce <BS>! next reosurce <BS>; ",
+    );
+    assert_eq!(buf, "The resource, resource! Next resource; ");
+    assert!(engine.store().state().undo_counts.is_empty());
+
+    // 3. Suffix extension (`reosurce <BS>s `) and dot-filename merge (`reosurce <BS>.json `):
+    buf.clear();
+    let _ = session.reset(&mut engine);
+    feed_keys(
+        &mut session,
+        &mut engine,
+        &mut buf,
+        "the reosurce <BS>s reosurce <BS>.json ",
+    );
+    assert_eq!(buf, "The resources resource.json ");
+    assert!(engine.store().state().undo_counts.is_empty());
+
+    // 4. Deleting the newly added dot + extra backspace snaps back cleanly to raw input:
+    buf.clear();
+    let _ = session.reset(&mut engine);
+    feed_keys(&mut session, &mut engine, &mut buf, "ssytem <BS>.<BS><BS>");
+    assert_eq!(buf, "ssytem");
+
+    // 5. Same after `. `: 3 backspaces peel `' '`, then `'.'`, then snap back to `"reosurce"`:
+    buf.clear();
+    let _ = session.reset(&mut engine);
+    feed_keys(&mut session, &mut engine, &mut buf, "reosurce <BS>. <BS><BS><BS> ");
+    assert_eq!(buf, "reosurce ");
+    assert!(engine.store().is_pair_blocked("reosurce", "resource"));
+}
+
+#[test]
+fn undo_mode_immediate_and_off_behave_per_setting() {
+    // 1. Immediate mode: legacy 1x BackSpace snaps `"resource "` -> `"reosurce"` and `"changes, "` -> `"chagnes"`.
+    {
+        let mut store = RuleStore::in_memory(Preset::Balanced);
+        store.set_setting("settings.undo_mode", "immediate").unwrap();
+        let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+
+        feed_keys(&mut session, &mut engine, &mut buf, "reosurce <BS>");
+        assert_eq!(buf, "reosurce");
+
+        buf.clear();
+        let _ = session.reset(&mut engine);
+        feed_keys(&mut session, &mut engine, &mut buf, "chagnes, <BS>");
+        assert_eq!(buf, "chagnes");
+    }
+
+    // 2. Off mode: BackSpace never snaps back to `"reosurce"`, and Ctrl+BackSpace does not log undo.
+    {
+        let mut store = RuleStore::in_memory(Preset::Balanced);
+        store.set_setting("settings.undo_mode", "off").unwrap();
+        let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+
+        feed_keys(&mut session, &mut engine, &mut buf, "reosurce <BS><BS>");
+        assert_eq!(buf, "resourc");
+        feed_keys(&mut session, &mut engine, &mut buf, " ");
+        assert!(!engine.store().is_pair_blocked("reosurce", "resource"));
+        assert!(engine.store().state().undo_counts.is_empty());
+
+        buf.clear();
+        let _ = session.reset(&mut engine);
+        feed_keys(&mut session, &mut engine, &mut buf, "chagnes <CBS>");
+        assert_eq!(buf, "");
+        assert!(engine.store().state().undo_counts.is_empty());
+    }
 }

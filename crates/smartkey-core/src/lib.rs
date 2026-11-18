@@ -38,7 +38,7 @@ pub use store::{
 };
 pub use types::{
     Aggressiveness, AppProfile, Candidate, Dialect, EvalOutcome, Explanation, InputOrigin, LangId,
-    MatchKind, ScorerConfig,
+    MatchKind, ScorerConfig, UndoMode,
 };
 pub use vi_telex::{
     has_any_vietnamese_rune, is_vietnamese_dict_word, is_vietnamese_slang_word,

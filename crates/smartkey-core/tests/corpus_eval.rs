@@ -492,3 +492,61 @@ fn compiled_es_and_fr_packs_pass_corpus_smash_ascii_lowercase_i_and_elisions() {
         }
     }
 }
+
+#[test]
+fn anti_inflection_guard_prefers_motor_clean_stems_while_preserving_true_inflections() {
+    let scorer = LatinScorer::new_bundled().expect("bundled English lexicon must load");
+    let cfg = ScorerConfig::default();
+
+    // Unattested tense/inflection hijack prevention (Option A: repair to motor-clean base stem):
+    for (prev, typed, expected) in [
+        (None, "dsaible", "disable"),
+        (Some("is"), "dsaible", "disable"),
+        (Some("be"), "dsaible", "disable"),
+        (Some("are"), "dsaible", "disable"),
+        (Some("is"), "obvserve", "observe"),
+        (Some("the"), "planenr", "planner"),
+        (Some("is"), "compiel", "compile"),
+        (Some("is"), "reuqire", "require"),
+    ] {
+        let ctx = EvalContext {
+            prev_word: prev,
+            ..EvalContext::default()
+        };
+        match scorer.evaluate(typed, &ctx, &cfg, &EmptyUserRules) {
+            EvalOutcome::Autocorrect { replacement, .. } => assert_eq!(
+                replacement, expected,
+                "for prev={prev:?} typed={typed:?}, expected {expected:?}, got {replacement:?}"
+            ),
+            other => panic!(
+                "for prev={prev:?} typed={typed:?}, expected Autocorrect({expected:?}), got {other:?}"
+            ),
+        }
+    }
+
+    // Legitimate inflected typos and tight-motor contextual disambiguation remain intact:
+    for (prev, typed, expected) in [
+        (Some("is"), "dsiabled", "disabled"),
+        (Some("is"), "dsaibled", "disabled"),
+        (Some("is"), "disablef", "disabled"),
+        (None, "disabed", "disabled"),
+        (None, "usin", "using"),
+        (Some("over"), "ther", "there"),
+        (Some("in"), "ther", "their"),
+        (Some("too"), "mcu", "much"),
+    ] {
+        let ctx = EvalContext {
+            prev_word: prev,
+            ..EvalContext::default()
+        };
+        match scorer.evaluate(typed, &ctx, &cfg, &EmptyUserRules) {
+            EvalOutcome::Autocorrect { replacement, .. } => assert_eq!(
+                replacement, expected,
+                "positive case prev={prev:?} typed={typed:?}, expected {expected:?}, got {replacement:?}"
+            ),
+            other => panic!(
+                "positive case prev={prev:?} typed={typed:?}, expected Autocorrect({expected:?}), got {other:?}"
+            ),
+        }
+    }
+}

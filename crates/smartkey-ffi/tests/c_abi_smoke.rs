@@ -91,7 +91,16 @@ fn ffi_null_and_keystroke_roundtrip_safe() {
         let inserted = CStr::from_ptr(act.insert_utf8).to_str().unwrap();
         assert_eq!(inserted, "changes ");
 
-        // `1x BackSpace` -> Replace(8, "chagnes")
+        // 1st BackSpace peels trailing space (`PassThrough`); 2nd BackSpace -> Replace(7, "chagnes")
+        assert!(smartkey_session_process_key(
+            sess,
+            eng,
+            SMARTKEY_KEY_BACKSPACE,
+            0,
+            25,
+            &mut act
+        ));
+        assert_eq!(act.kind, SMARTKEY_ACTION_PASS_THROUGH);
         assert!(smartkey_session_process_key(
             sess,
             eng,
@@ -101,7 +110,7 @@ fn ffi_null_and_keystroke_roundtrip_safe() {
             &mut act
         ));
         assert_eq!(act.kind, SMARTKEY_ACTION_REPLACE);
-        assert_eq!(act.delete_chars, 8);
+        assert_eq!(act.delete_chars, 7);
         let restored = CStr::from_ptr(act.insert_utf8).to_str().unwrap();
         assert_eq!(restored, "chagnes");
 
@@ -194,9 +203,16 @@ int main() {
     }
     assert(buf == U"the ");
 
-    // 1x BackSpace snaps back to "teh"
-    bool ok = smartkey_session_process_key(sess, eng, SMARTKEY_KEY_BACKSPACE, 0, 120, &act);
-    assert(ok);
+    // 1st BackSpace peels space ("the"); 2nd BackSpace snaps back to "teh"
+    bool ok1 = smartkey_session_process_key(sess, eng, SMARTKEY_KEY_BACKSPACE, 0, 110, &act);
+    assert(ok1);
+    assert(act.kind == SMARTKEY_ACTION_PASS_THROUGH);
+    apply(buf, SMARTKEY_KEY_BACKSPACE, 0, act);
+    assert(buf == U"the");
+
+    bool ok2 = smartkey_session_process_key(sess, eng, SMARTKEY_KEY_BACKSPACE, 0, 120, &act);
+    assert(ok2);
+    assert(act.kind == SMARTKEY_ACTION_REPLACE);
     apply(buf, SMARTKEY_KEY_BACKSPACE, 0, act);
     assert(buf == U"teh");
 
