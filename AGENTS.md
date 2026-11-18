@@ -26,6 +26,9 @@ cargo run --release -p smartkey-cli --bin smartkey-dev -- build-pack <lang|all> 
 
 # 4. Verify version parity across Cargo.toml, CMakeLists.txt, and PKGBUILD
 ./scripts/check-versions.sh
+
+# 5. Cut and publish a new GitHub release on demand
+./scripts/release.sh [patch|minor|major|<X.Y.Z>] [--title "<subtitle>"] [--dry-run]
 ```
 
 ## Automatic Local Deploy After Green Iterations

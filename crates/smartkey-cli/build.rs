@@ -57,7 +57,7 @@ fn main() {
     println!("cargo:rustc-env=SMARTKEY_GIT_VERSION={desc}");
 
     if let Some(git_dir) = root.as_deref().and_then(resolve_git_dir) {
-        for rel in ["HEAD", "index", "logs/HEAD", "packed-refs"] {
+        for rel in ["HEAD", "index", "logs/HEAD", "packed-refs", "refs/tags"] {
             let p = git_dir.join(rel);
             if p.exists() {
                 println!("cargo:rerun-if-changed={}", p.display());
@@ -66,7 +66,7 @@ fn main() {
         let commondir_file = git_dir.join("commondir");
         if let Ok(raw) = fs::read_to_string(&commondir_file) {
             let common = git_dir.join(raw.trim());
-            for rel in ["packed-refs", "logs/HEAD"] {
+            for rel in ["packed-refs", "logs/HEAD", "refs/tags"] {
                 let p = common.join(rel);
                 if p.exists() {
                     println!("cargo:rerun-if-changed={}", p.display());
