@@ -7,6 +7,7 @@ tags before non-trivial work.
 
 - [Fcitx5 Flight-Recorder FFI Boundary and Persistent FD Lifecycle](./architecture-patterns/fcitx5-flight-recorder-ffi-and-fd-contract.md) — Keep header-only `smartkey-addon.h` helpers FFI-free for `addon_load_smoke`, copy borrowed `SmartKeySessionSnapshot` slices before mutation, close persistent `O_APPEND` fds in `reloadConfig()`, and enforce `BYPASS` privacy before tracing. `#fcitx5 #ffi #trace #file-descriptor #privacy`
 - [Unified App Profile Classification and `unknown_app_policy` Ordering](./architecture-patterns/unified-app-profile-classification-and-unknown-policy.md) — Keep capability flags and the DBus `KeyEventOrderFix`/no-`SurroundingText` guard ahead of `unknown_app_policy`, parse `"default"` as `None`, and delegate classification to `smartkey-core` via FFI. `#app-profiles #fcitx5 #ffi #security`
+- [RuleStore Sidecar Lockfile and Atomic Rename Invariants](./architecture-patterns/rule-store-sidecar-lockfile-and-atomic-renames.md) — Serialize concurrent writes on sibling `.smartkey.lock` (`truncate(false)`) instead of target files replaced via `atomic_write_bytes` inode renames, use re-entrant `with_file_lock`, and keep read-only constructors lock-free. `#store #concurrency #locking #atomic-write #fcitx5`
 
 ## integration-issues/
 
