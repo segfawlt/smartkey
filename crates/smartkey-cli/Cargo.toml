@@ -24,3 +24,5 @@ smartkey-core = { path = "../smartkey-core", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 libc = "0.2"
+ratatui = "0.30"
+crossterm = "0.29"

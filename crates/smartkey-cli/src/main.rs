@@ -16,22 +16,24 @@ use smartkey_core::{
     SmartKeySession, UndoResolution,
 };
 
+mod tui;
+
 /// Git state stamped at build time by `build.rs`: HEAD hash or tag (e.g.
 /// `cf4ba21`), with a `-dirty` suffix on uncommitted trees, or `release` for
 /// tarball builds outside a git checkout.
 const GIT_VERSION: &str = env!("SMARTKEY_GIT_VERSION");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CliError {
+pub(crate) enum CliError {
     /// Invalid flags or arguments -> exit code `2`.
     Usage(String),
     /// Operational failure (I/O, network, parse-locked TOML, unreachable daemon) -> exit code `1`.
     Runtime(String),
 }
 
-type CliResult = Result<(), CliError>;
+pub(crate) type CliResult = Result<(), CliError>;
 
-fn default_config_dir() -> PathBuf {
+pub(crate) fn default_config_dir() -> PathBuf {
     if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
         if !xdg.trim().is_empty() {
             return PathBuf::from(xdg).join("smartkey");
@@ -43,21 +45,24 @@ fn default_config_dir() -> PathBuf {
     env::temp_dir().join("smartkey/config")
 }
 
-fn load_rule_store_mut(dir: &Path, preset: Preset) -> Result<RuleStore, CliError> {
+pub(crate) fn load_rule_store_mut(dir: &Path, preset: Preset) -> Result<RuleStore, CliError> {
     let rules_path = dir.join("rules.toml");
     let state_path = dir.join("learner_state.json");
     RuleStore::load_or_init(rules_path, state_path, preset)
         .map_err(|e| CliError::Runtime(e.to_string()))
 }
 
-fn load_rule_store_readonly(dir: &Path, preset: Preset) -> Result<(RuleStore, bool), CliError> {
+pub(crate) fn load_rule_store_readonly(
+    dir: &Path,
+    preset: Preset,
+) -> Result<(RuleStore, bool), CliError> {
     let rules_path = dir.join("rules.toml");
     let state_path = dir.join("learner_state.json");
     RuleStore::load_readonly_or_default(rules_path, state_path, preset)
         .map_err(|e| CliError::Runtime(e.to_string()))
 }
 
-fn notify_fcitx5_reload() -> bool {
+pub(crate) fn notify_fcitx5_reload() -> bool {
     if let Ok(status) = Command::new("fcitx5-remote")
         .arg("-r")
         .stdout(std::process::Stdio::null())
@@ -88,7 +93,7 @@ fn notify_fcitx5_reload() -> bool {
     false
 }
 
-fn detect_fcitx5_running() -> bool {
+pub(crate) fn detect_fcitx5_running() -> bool {
     Command::new("fcitx5-remote")
         .arg("--check")
         .stdout(std::process::Stdio::null())
@@ -99,7 +104,7 @@ fn detect_fcitx5_running() -> bool {
 
 /// Searches user-local (`~/.local/lib/fcitx5`), standard (`/usr/lib`, `/usr/lib64`, `/usr/local/lib`),
 /// and Debian/Ubuntu multiarch (`/usr/lib/<triplet>/fcitx5`) addon directories for `so_name`.
-fn detect_fcitx5_module_so(so_name: &str) -> Option<PathBuf> {
+pub(crate) fn detect_fcitx5_module_so(so_name: &str) -> Option<PathBuf> {
     if let Some(home) = smartkey_core::resolve_home_dir() {
         let user_so = home.join(".local/lib/fcitx5").join(so_name);
         if user_so.exists() {
@@ -512,36 +517,36 @@ fn parse_lang_arg(raw: &str) -> Result<LangId, CliError> {
 }
 
 #[derive(Serialize)]
-struct ConfidenceCountsJson {
-    manual: usize,
-    confirmed: usize,
-    provisional: usize,
-    suspect: usize,
+pub(crate) struct ConfidenceCountsJson {
+    pub(crate) manual: usize,
+    pub(crate) confirmed: usize,
+    pub(crate) provisional: usize,
+    pub(crate) suspect: usize,
 }
 
 #[derive(Serialize)]
-struct ConfidenceRuleJson {
-    kind: &'static str,
-    key: String,
-    display: String,
-    tier: &'static str,
-    origin: &'static str,
-    hits: u32,
-    strikes: u32,
-    created_epoch_ms: u64,
+pub(crate) struct ConfidenceRuleJson {
+    pub(crate) kind: &'static str,
+    pub(crate) key: String,
+    pub(crate) display: String,
+    pub(crate) tier: &'static str,
+    pub(crate) origin: &'static str,
+    pub(crate) hits: u32,
+    pub(crate) strikes: u32,
+    pub(crate) created_epoch_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_hit_epoch_ms: Option<u64>,
+    pub(crate) last_hit_epoch_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
-struct StagedEntryJson {
-    queue: &'static str,
-    key: String,
-    display: String,
-    count: u32,
-    threshold: u32,
+pub(crate) struct StagedEntryJson {
+    pub(crate) queue: &'static str,
+    pub(crate) key: String,
+    pub(crate) display: String,
+    pub(crate) count: u32,
+    pub(crate) threshold: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    canonical: Option<String>,
+    pub(crate) canonical: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -610,7 +615,7 @@ fn parse_prune_kinds(raw: &str) -> Result<PruneKinds, CliError> {
     Ok(kinds)
 }
 
-fn format_age_ago(now_ms: u64, ts_ms: u64) -> String {
+pub(crate) fn format_age_ago(now_ms: u64, ts_ms: u64) -> String {
     if ts_ms == 0 {
         return "untracked".to_string();
     }
@@ -635,7 +640,9 @@ fn tier_sort_rank(tier: &str) -> u8 {
     }
 }
 
-fn collect_rule_confidence(store: &RuleStore) -> (ConfidenceCountsJson, Vec<ConfidenceRuleJson>) {
+pub(crate) fn collect_rule_confidence(
+    store: &RuleStore,
+) -> (ConfidenceCountsJson, Vec<ConfidenceRuleJson>) {
     let c = store.compiled();
     let mut raw: Vec<(&'static str, String, String, bool)> = Vec::new();
 
@@ -749,7 +756,7 @@ fn collect_rule_confidence(store: &RuleStore) -> (ConfidenceCountsJson, Vec<Conf
     (counts, items)
 }
 
-fn collect_staged_entries(st: &smartkey_core::LearnerState) -> Vec<StagedEntryJson> {
+pub(crate) fn collect_staged_entries(st: &smartkey_core::LearnerState) -> Vec<StagedEntryJson> {
     let mut staged = Vec::new();
     for (k, &count) in &st.staged_corrections {
         if let Some(rest) = k.strip_prefix("case:") {
@@ -1778,7 +1785,7 @@ fn cmd_config(args: &[String]) -> CliResult {
     }
 }
 
-fn match_kind_slug(kind: MatchKind) -> &'static str {
+pub(crate) fn match_kind_slug(kind: MatchKind) -> &'static str {
     match kind {
         MatchKind::Bypass => "bypass",
         MatchKind::ValidWord => "valid_word",
@@ -1846,7 +1853,7 @@ fn print_top_single(title: &str, map: &std::collections::BTreeMap<String, u32>, 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogFilter {
+pub(crate) enum LogFilter {
     All,
     FixedOnly,
     ManualOnly,
@@ -1854,7 +1861,7 @@ enum LogFilter {
 }
 
 impl LogFilter {
-    fn matches(self, ev: &DiagnosticEvent) -> bool {
+    pub(crate) fn matches(self, ev: &DiagnosticEvent) -> bool {
         match self {
             Self::All => true,
             Self::FixedOnly => matches!(ev, DiagnosticEvent::AutocorrectApplied { .. }),
@@ -1971,7 +1978,7 @@ fn format_local_timestamp(ts_ms: u64) -> String {
     }
 }
 
-fn format_diagnostic_event_line(ev: &DiagnosticEvent) -> String {
+pub(crate) fn format_diagnostic_event_line(ev: &DiagnosticEvent) -> String {
     match ev {
         DiagnosticEvent::AutocorrectApplied {
             typed,
@@ -3174,14 +3181,44 @@ fn format_hex_bytes(bytes: &[u8]) -> String {
     s
 }
 
-fn render_dict_list_lines(
-    scoped_dirs: &[(&str, PathBuf)],
-    verbose: bool,
-) -> (Vec<String>, bool) {
-    let mut lines = Vec::new();
-    let mut found = false;
+#[derive(Serialize)]
+struct DictSourceJson {
+    name: String,
+    sha256: String,
+    license: String,
+}
 
-    for (scope, dir) in scoped_dirs {
+#[derive(Serialize)]
+struct DictPackJson {
+    scope: &'static str,
+    lang: String,
+    path: String,
+    size_bytes: u64,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tier: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    variants: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sources: Vec<DictSourceJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DictListJson {
+    user_dir: String,
+    system_dir: String,
+    packs: Vec<DictPackJson>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    bundled_fallbacks: Vec<&'static str>,
+}
+
+fn collect_dict_packs(scoped_dirs: &[(&'static str, PathBuf)], include_sources: bool) -> Vec<DictPackJson> {
+    let mut packs = Vec::new();
+    for &(scope, ref dir) in scoped_dirs {
         if !dir.exists() {
             continue;
         }
@@ -3196,66 +3233,149 @@ fn render_dict_list_lines(
         paths.sort();
 
         for path in paths {
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-            let sz = fs::metadata(&path)
-                .map(|m| m.len() as f64 / (1024.0 * 1024.0))
-                .unwrap_or(0.0);
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             let bytes = match fs::read(&path) {
                 Ok(b) => b,
                 Err(e) => {
-                    lines.push(format!(
-                        "  {scope:<8} {stem:<6} ({sz:.2} MiB) [unreadable — {e}] -> {}",
-                        path.display()
-                    ));
-                    found = true;
+                    packs.push(DictPackJson {
+                        scope,
+                        lang: stem,
+                        path: path.display().to_string(),
+                        size_bytes,
+                        status: "unreadable",
+                        version: None,
+                        tier: None,
+                        variants: Vec::new(),
+                        sources: Vec::new(),
+                        error: Some(e.to_string()),
+                    });
                     continue;
                 }
             };
             match peek_skdict_header_and_manifest(&bytes) {
                 Ok((hdr, manifest)) => {
-                    lines.push(format!(
-                        "  {scope:<8} {:<6} v{}.{}.{} ({}, variants=[{}], {:.2} MiB) -> {}",
-                        hdr.lang,
-                        hdr.pack_version[0],
-                        hdr.pack_version[1],
-                        hdr.pack_version[2],
-                        tier_label(hdr.tier),
-                        hdr.variants.join(", "),
-                        sz,
-                        path.display()
-                    ));
-                    if verbose {
-                        if manifest.is_empty() {
-                            lines.push("           sources: (none)".to_string());
-                        } else {
-                            for src in manifest {
-                                lines.push(format!(
-                                    "           source: {} sha256={} license={}",
-                                    src.name,
-                                    format_hex_bytes(&src.sha256),
-                                    src.license
-                                ));
-                            }
+                    let sources = if include_sources {
+                        manifest
+                            .into_iter()
+                            .map(|src| DictSourceJson {
+                                name: src.name,
+                                sha256: format_hex_bytes(&src.sha256),
+                                license: src.license,
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    packs.push(DictPackJson {
+                        scope,
+                        lang: hdr.lang,
+                        path: path.display().to_string(),
+                        size_bytes,
+                        status: "ok",
+                        version: Some(format!(
+                            "{}.{}.{}",
+                            hdr.pack_version[0], hdr.pack_version[1], hdr.pack_version[2]
+                        )),
+                        tier: Some(tier_label(hdr.tier)),
+                        variants: hdr.variants,
+                        sources,
+                        error: None,
+                    });
+                }
+                Err(LexiconError::LegacyFormat(v)) => {
+                    packs.push(DictPackJson {
+                        scope,
+                        lang: stem,
+                        path: path.display().to_string(),
+                        size_bytes,
+                        status: "legacy",
+                        version: Some(format!("v{v}")),
+                        tier: None,
+                        variants: Vec::new(),
+                        sources: Vec::new(),
+                        error: Some(format!("legacy v{v}")),
+                    });
+                }
+                Err(e) => {
+                    packs.push(DictPackJson {
+                        scope,
+                        lang: stem,
+                        path: path.display().to_string(),
+                        size_bytes,
+                        status: "invalid",
+                        version: None,
+                        tier: None,
+                        variants: Vec::new(),
+                        sources: Vec::new(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+    }
+    packs
+}
+
+fn render_dict_list_lines(
+    scoped_dirs: &[(&'static str, PathBuf)],
+    verbose: bool,
+) -> (Vec<String>, bool) {
+    let packs = collect_dict_packs(scoped_dirs, verbose);
+    let found = !packs.is_empty();
+    let mut lines = Vec::new();
+    for p in packs {
+        let sz = p.size_bytes as f64 / (1024.0 * 1024.0);
+        let scope = format!("[{}]", p.scope);
+        match p.status {
+            "ok" => {
+                lines.push(format!(
+                    "  {scope:<8} {:<6} v{} ({}, variants=[{}], {:.2} MiB) -> {}",
+                    p.lang,
+                    p.version.as_deref().unwrap_or("0.0.0"),
+                    p.tier.unwrap_or("data"),
+                    p.variants.join(", "),
+                    sz,
+                    p.path
+                ));
+                if verbose {
+                    if p.sources.is_empty() {
+                        lines.push("           sources: (none)".to_string());
+                    } else {
+                        for src in p.sources {
+                            lines.push(format!(
+                                "           source: {} sha256={} license={}",
+                                src.name, src.sha256, src.license
+                            ));
                         }
                     }
                 }
-                Err(LexiconError::LegacyFormat(v)) => {
-                    lines.push(format!(
-                        "  {scope:<8} {stem:<6} ({sz:.2} MiB) [legacy v{v} — ignored; run: smartkey dict update {stem}] -> {}",
-                        path.display()
-                    ));
-                }
-                Err(e) => {
-                    lines.push(format!(
-                        "  {scope:<8} {stem:<6} ({sz:.2} MiB) [invalid — ignored: {e}] -> {}",
-                        path.display()
-                    ));
-                }
             }
-            found = true;
+            "unreadable" => lines.push(format!(
+                "  {scope:<8} {:<6} ({sz:.2} MiB) [unreadable — {}] -> {}",
+                p.lang,
+                p.error.as_deref().unwrap_or("read error"),
+                p.path
+            )),
+            "legacy" => lines.push(format!(
+                "  {scope:<8} {:<6} ({sz:.2} MiB) [legacy {} — ignored; run: smartkey dict update {}] -> {}",
+                p.lang,
+                p.version.as_deref().unwrap_or("?"),
+                p.lang,
+                p.path
+            )),
+            _ => lines.push(format!(
+                "  {scope:<8} {:<6} ({sz:.2} MiB) [invalid — ignored: {}] -> {}",
+                p.lang,
+                p.error.as_deref().unwrap_or("invalid"),
+                p.path
+            )),
         }
     }
-
     (lines, found)
 }
 
@@ -3263,41 +3383,68 @@ fn cmd_dict(args: &[String]) -> CliResult {
     match args.first().map(String::as_str) {
         Some("--help" | "-h") => {
             println!(
-                "USAGE:\n  smartkey dict [list [-v|--verbose]|dir|install <lang> <path_or_url>|remove <lang>|update [lang]]\n  Alias: dicts\n\n\
+                "USAGE:\n  smartkey dict [list [-v|--verbose] [--json]|dir|install <lang> <path_or_url>|remove <lang>|update [lang]]\n  Alias: dicts\n\n\
                  Inspect, install, update, or remove modular .skdict language dictionary packs."
             );
             Ok(())
         }
-        Some("list" | "ls") | None => {
+        Some("list" | "ls") | Some("--json" | "-v" | "--verbose") | None => {
+            let skip_n = usize::from(matches!(args.first().map(String::as_str), Some("list" | "ls")));
             let mut verbose = false;
-            for arg in args.iter().skip(1) {
+            let mut as_json = false;
+            for arg in args.iter().skip(skip_n) {
                 match arg.as_str() {
                     "-v" | "--verbose" => verbose = true,
+                    "--json" => as_json = true,
                     other => {
                         return Err(CliError::Usage(format!(
-                            "unexpected argument {other:?} (usage: smartkey dict list [-v|--verbose])"
+                            "unexpected argument {other:?} (usage: smartkey dict list [-v|--verbose] [--json])"
                         )));
                     }
                 }
             }
-            println!("=== SmartKey Language Packs ===");
             let user_dir = smartkey_core::default_user_dict_dir();
-            println!("User Dict Directory   : {}", user_dir.display());
-            println!("System Dict Directory : /usr/share/smartkey/dicts\n");
-
-            let mut scoped_dirs: Vec<(&str, PathBuf)> = Vec::new();
+            let system_dir = "/usr/share/smartkey/dicts";
+            let mut scoped_dirs: Vec<(&'static str, PathBuf)> = Vec::new();
             if let Ok(env_dir) = env::var("SMARTKEY_DICT_DIR") {
                 if !env_dir.trim().is_empty() {
-                    scoped_dirs.push(("[env]", PathBuf::from(env_dir.trim())));
+                    scoped_dirs.push(("env", PathBuf::from(env_dir.trim())));
                 }
             }
-            scoped_dirs.push(("[user]", user_dir));
-            for sys in ["/usr/local/share/smartkey/dicts", "/usr/share/smartkey/dicts"] {
+            scoped_dirs.push(("user", user_dir.clone()));
+            for sys in ["/usr/local/share/smartkey/dicts", system_dir] {
                 let p = PathBuf::from(sys);
                 if !scoped_dirs.iter().any(|(_, d)| d == &p) {
-                    scoped_dirs.push(("[system]", p));
+                    scoped_dirs.push(("system", p));
                 }
             }
+
+            if as_json {
+                let packs = collect_dict_packs(&scoped_dirs, verbose);
+                let mut bundled_fallbacks = Vec::new();
+                if packs.is_empty() {
+                    #[cfg(feature = "bundled-en")]
+                    bundled_fallbacks.push("en");
+                    #[cfg(feature = "bundled-vi")]
+                    bundled_fallbacks.push("vi");
+                }
+                let payload = DictListJson {
+                    user_dir: user_dir.display().to_string(),
+                    system_dir: system_dir.to_string(),
+                    packs,
+                    bundled_fallbacks,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| CliError::Runtime(e.to_string()))?
+                );
+                return Ok(());
+            }
+
+            println!("=== SmartKey Language Packs ===");
+            println!("User Dict Directory   : {}", user_dir.display());
+            println!("System Dict Directory : {system_dir}\n");
 
             let (lines, found) = render_dict_list_lines(&scoped_dirs, verbose);
             for line in lines {
@@ -3503,8 +3650,23 @@ fn canonical_plugin_display(key: &str) -> &str {
     }
 }
 
+#[derive(Serialize)]
+struct PluginEntryJson {
+    name: &'static str,
+    key: &'static str,
+    enabled: bool,
+    host_detected: bool,
+    host_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PluginListJson {
+    plugins: Vec<PluginEntryJson>,
+}
+
 fn cmd_plugin(args: &[String]) -> CliResult {
     let mut dir = default_config_dir();
+    let mut as_json = false;
     let mut pos: Vec<&str> = Vec::new();
 
     let mut i = 0;
@@ -3512,10 +3674,13 @@ fn cmd_plugin(args: &[String]) -> CliResult {
         match args[i].as_str() {
             "--help" | "-h" => {
                 println!(
-                    "USAGE:\n  smartkey plugin [list|enable|disable|toggle] [vi-lotus] [--dir <path>]\n  Alias: plugins\n\n\
+                    "USAGE:\n  smartkey plugin [list|enable|disable|toggle] [vi-lotus] [--json] [--dir <path>]\n  Alias: plugins\n\n\
                      Inspect or toggle modular input-method bridge plugins."
                 );
                 return Ok(());
+            }
+            "--json" => {
+                as_json = true;
             }
             "--dir" => {
                 i += 1;
@@ -3526,7 +3691,7 @@ fn cmd_plugin(args: &[String]) -> CliResult {
             }
             other if other.starts_with('-') => {
                 return Err(CliError::Usage(format!(
-                    "unknown flag {other} (usage: smartkey plugin [list|enable|disable|toggle] [vi-lotus] [--dir <path>])"
+                    "unknown flag {other} (usage: smartkey plugin [list|enable|disable|toggle] [vi-lotus] [--json] [--dir <path>])"
                 )));
             }
             other => pos.push(other),
@@ -3539,13 +3704,30 @@ fn cmd_plugin(args: &[String]) -> CliResult {
         "list" | "ls" => {
             if pos.len() > 1 {
                 return Err(CliError::Usage(format!(
-                    "unexpected argument {:?} (usage: smartkey plugin list [--dir <path>])",
+                    "unexpected argument {:?} (usage: smartkey plugin list [--json] [--dir <path>])",
                     pos[1]
                 )));
             }
             let (store, _) = load_rule_store_readonly(&dir, Preset::Balanced)?;
             let c = store.compiled();
             let lotus_so = detect_fcitx5_module_so("liblotus.so");
+            if as_json {
+                let payload = PluginListJson {
+                    plugins: vec![PluginEntryJson {
+                        name: "vi-lotus",
+                        key: "vi_lotus",
+                        enabled: c.vi_lotus_enabled,
+                        host_detected: lotus_so.is_some(),
+                        host_path: lotus_so.as_ref().map(|p| p.display().to_string()),
+                    }],
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| CliError::Runtime(e.to_string()))?
+                );
+                return Ok(());
+            }
             let host_label = match lotus_so {
                 Some(p) => format!("detected ({})", p.display()),
                 None => "fcitx5-lotus not detected".to_string(),
@@ -3564,6 +3746,11 @@ fn cmd_plugin(args: &[String]) -> CliResult {
             Ok(())
         }
         "enable" | "on" | "install" | "disable" | "off" | "remove" | "toggle" => {
+            if as_json {
+                return Err(CliError::Usage(
+                    "--json is only supported on `smartkey plugin list`".to_string(),
+                ));
+            }
             if pos.len() > 2 {
                 return Err(CliError::Usage(format!(
                     "unexpected extra argument {:?} (usage: smartkey plugin {action} [vi-lotus] [--dir <path>])",
@@ -3617,7 +3804,7 @@ fn parse_app_profile(raw: &str) -> Result<AppProfile, CliError> {
     }
 }
 
-fn app_profile_label(profile: AppProfile) -> &'static str {
+pub(crate) fn app_profile_label(profile: AppProfile) -> &'static str {
     match profile {
         AppProfile::Bypass => "bypass",
         AppProfile::Browser => "browser",
@@ -4088,10 +4275,11 @@ COMMANDS:
                                                          Explain scoring, proper nouns & candidate ranking
   app|apps [list|classify|add|remove] ... [--json] [--dir <path>]
                                                          Inspect resolved app profiles or edit [app_profiles] overrides
-  plugin|plugins [list|enable|disable|toggle] [vi-lotus] [--dir <path>]
+  plugin|plugins [list|enable|disable|toggle] [vi-lotus] [--json] [--dir <path>]
                                                          Manage modular input-method & language bridge plugins
-  dict|dicts [list|dir|install <lang> <src>|remove <lang>|update [lang]]
+  dict|dicts [list [-v] [--json]|dir|install <lang> <src>|remove <lang>|update [lang]]
                                                          Inspect and manage modular language dictionary packs
+  tui|ui [--dir <path>] [--log-dir <path>]               Interactive terminal manager for rules, settings, apps, and logs
   init [--preset <name>] [--dir <path>] [--force]        Initialize ~/.config/smartkey/rules.toml
   repl [--lang en|vi] [--dir <path>] [--in-memory]       Interactive terminal typing & learning sandbox
 
@@ -4120,6 +4308,7 @@ fn run_cli(args: &[String]) -> CliResult {
         Some("app" | "apps") => cmd_app(&args[1..]),
         Some("plugin" | "plugins") => cmd_plugin(&args[1..]),
         Some("dict" | "dicts") => cmd_dict(&args[1..]),
+        Some("tui" | "ui") => tui::cmd_tui(&args[1..]),
         Some("repl") => cmd_repl(&args[1..]),
         Some("--version" | "-V") => {
             println!("smartkey {} ({GIT_VERSION})", env!("CARGO_PKG_VERSION"));
@@ -5001,5 +5190,34 @@ mod tests {
         assert!(!store_off.compiled().diagnostics.trace_log);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cli_plugin_and_dict_json_and_tui_cli_parsing() {
+        let dir = std::env::temp_dir().join(format!("smartkey_cli_json_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap();
+
+        assert_eq!(
+            run_cli(&vec_args(&["plugin", "list", "--json", "--dir", dir_str])),
+            Ok(())
+        );
+        assert_eq!(run_cli(&vec_args(&["plugin", "--json", "--dir", dir_str])), Ok(()));
+        assert!(matches!(
+            run_cli(&vec_args(&["plugin", "enable", "--json", "--dir", dir_str])),
+            Err(CliError::Usage(_))
+        ));
+
+        assert_eq!(run_cli(&vec_args(&["dict", "list", "--json"])), Ok(()));
+        assert_eq!(run_cli(&vec_args(&["dict", "--json"])), Ok(()));
+
+        assert_eq!(run_cli(&vec_args(&["tui", "--help"])), Ok(()));
+        assert!(matches!(
+            run_cli(&vec_args(&["tui", "--bogus"])),
+            Err(CliError::Usage(_))
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
