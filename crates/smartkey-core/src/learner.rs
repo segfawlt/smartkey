@@ -5,7 +5,7 @@ use crate::keyboard::damerau_levenshtein_chars;
 use crate::lexicon::PackLexicon;
 use crate::scorer::{allows_personal_proper_case, is_staged_rejection_pair_for, UserRuleView};
 use crate::store::{RuleStore, UndoResolution};
-use crate::types::LangId;
+use crate::types::{LangId, SpaceHabitKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +81,10 @@ pub enum LearnEvent {
     },
     GraduatedTelexPassthrough {
         raw_ascii: String,
+    },
+    RecordedSpaceHabit {
+        habit: SpaceHabitKind,
+        count: u32,
     },
     Ignored(SkipReason),
 }
@@ -784,6 +788,27 @@ fn record_manual_edit_inner(
         return LearnEvent::Ignored(SkipReason::DeltaSpanRewrite);
     }
 
+    // Reject prefix truncation by >= 2 non-bounce chars (`wantto -> want`, `haveto -> have`)
+    // that results from deleting word 2 after forgetting a space.
+    if orig_chars.len() > fixed_chars.len() && orig_chars.starts_with(&fixed_chars) {
+        let deleted = &orig_chars[fixed_chars.len()..];
+        let is_repeat_bounce = fixed_chars
+            .last()
+            .copied()
+            .is_some_and(|lf| deleted.iter().all(|&c| c == lf));
+        if deleted.len() >= 2 && !is_repeat_bounce {
+            store.state_mut().record_skipped(
+                effective_lang.as_str(),
+                prev_word,
+                &orig_lower,
+                &fixed_lower,
+                SkipReason::DeltaSpanRewrite.as_str(),
+            );
+            let _ = store.flush_state();
+            return LearnEvent::Ignored(SkipReason::DeltaSpanRewrite);
+        }
+    }
+
     // Guard 1: Whole-word similarity + Stripped Delta-Span overlap
     let max_len = cmp_orig_chars.len().max(cmp_fixed_chars.len());
     let whole_dl = damerau_levenshtein_chars(&cmp_orig_str, &cmp_fixed_str);
@@ -1260,4 +1285,211 @@ pub fn record_telex_passthrough_repair(store: &mut RuleStore, raw_ascii: &str) -
         let _ = store.flush_state();
         LearnEvent::None
     }
+}
+
+fn is_valid_prose_word_for_space(
+    store: &RuleStore,
+    lexicon: Option<&PackLexicon>,
+    lower: &str,
+) -> bool {
+    if lower.is_empty() || !is_prose_word_token(lower) {
+        return false;
+    }
+    let single_ok = lower.len() >= 2 || lower == "a" || lower == "i";
+    if !single_ok {
+        return false;
+    }
+    match lexicon {
+        Some(lex) => lex.contains_any_variant_or_elided(lower) || store.is_personal_word(lower),
+        None => true,
+    }
+}
+
+/// Records a manual missed-space split repair (`orig -> "w1 w2"`, e.g. `wantto<BS><BS> to `),
+/// blocking any rejected single-word autocorrect on `orig` and graduating exact fused pairs at `2x`.
+#[allow(clippy::too_many_arguments)]
+pub fn record_manual_space_split(
+    store: &mut RuleStore,
+    lexicon: Option<&PackLexicon>,
+    lang: &LangId,
+    orig_raw: &str,
+    w1_raw: &str,
+    w2_raw: &str,
+    rejected_autocorrect: Option<&str>,
+    is_complete_fused: bool,
+) -> Vec<LearnEvent> {
+    if lang.as_str() == "vi" {
+        return Vec::new();
+    }
+    let orig_trimmed = orig_raw.trim();
+    let w1_trimmed = w1_raw.trim();
+    let w2_trimmed = w2_raw.trim();
+    let orig_lower = orig_trimmed.to_lowercase();
+    let w1_lower = w1_trimmed.to_lowercase();
+    let w2_lower = w2_trimmed.to_lowercase();
+
+    let mut events = Vec::new();
+    let habit_count = store.record_space_habit(SpaceHabitKind::MissedSpace);
+    events.push(LearnEvent::RecordedSpaceHabit {
+        habit: SpaceHabitKind::MissedSpace,
+        count: habit_count,
+    });
+
+    if let Some(rejected) = rejected_autocorrect {
+        let final_phrase = format!("{w1_trimmed} {w2_trimmed}");
+        store.resolve_pending_undo_log(
+            orig_trimmed,
+            rejected,
+            UndoResolution::EditedToThird {
+                final_word: final_phrase,
+            },
+        );
+        let rej_lower = rejected.to_lowercase();
+        if reject_pair_permanently(store, lexicon, lang, &orig_lower, &rej_lower) {
+            events.push(LearnEvent::BlockedPairPermanent {
+                typed: orig_lower.clone(),
+                rejected: rej_lower,
+            });
+        }
+    }
+
+    if !is_complete_fused {
+        store.log_manual_backspace_fix(
+            orig_trimmed,
+            &format!("{w1_trimmed} {w2_trimmed}"),
+            "space_split_partial",
+        );
+        return events;
+    }
+
+    if !is_prose_word_token(&orig_lower)
+        || !is_prose_word_token(&w1_lower)
+        || !is_prose_word_token(&w2_lower)
+        || orig_lower.chars().count() < 4
+        || lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&orig_lower))
+        || !is_valid_prose_word_for_space(store, lexicon, &w1_lower)
+        || !is_valid_prose_word_for_space(store, lexicon, &w2_lower)
+    {
+        return events;
+    }
+
+    let w1_fmt = if w1_lower == "i"
+        && store.scorer_config().auto_capitalize_i
+        && lexicon.is_none_or(|l| l.rules().capitalize_standalone_i)
+    {
+        "I"
+    } else {
+        w1_lower.as_str()
+    };
+    let target = format!("{w1_fmt} {w2_lower}");
+    let target_lower = target.to_lowercase();
+
+    store.reload_if_modified();
+    store.clear_undo_shield(lang, &orig_lower);
+
+    let stage_key = format!("{}:{}->{}", lang.as_str(), orig_lower, target_lower);
+    let count = {
+        let e = store
+            .state_mut()
+            .staged_corrections
+            .entry(stage_key)
+            .or_insert(0);
+        *e = e.saturating_add(1);
+        *e
+    };
+
+    if count >= 2 {
+        if store.is_explicit_personal_word(lang, &orig_lower) {
+            store.remove_personal_word(lang, &orig_lower);
+        }
+        store.add_correction(lang, &orig_lower, &target);
+        clear_pair_rejection(store, lexicon, lang, &orig_lower, &target);
+        let _ = store.flush_state();
+        store.log_manual_backspace_fix(orig_trimmed, &target, "graduated");
+        events.push(LearnEvent::GraduatedCorrection {
+            lang: lang.0.clone(),
+            orig: orig_lower,
+            fixed: target,
+        });
+    } else {
+        let _ = store.flush_state();
+        store.log_manual_backspace_fix(orig_trimmed, &target, "staged (1x)");
+        events.push(LearnEvent::StagedCorrection {
+            lang: lang.0.clone(),
+            orig: orig_lower,
+            fixed: target,
+            count,
+        });
+    }
+
+    events
+}
+
+/// Records a manual cross-space shift or extra-space merge repair (`addi n -> add in`,
+/// `fo rme -> for me`, `th e -> the`) to reinforce the corresponding `SpaceHabitKind`.
+pub fn record_manual_space_shift(
+    store: &mut RuleStore,
+    lexicon: Option<&PackLexicon>,
+    lang: &LangId,
+    orig_w1: &str,
+    orig_w2: &str,
+    new_w1: &str,
+    new_w2: Option<&str>,
+) -> LearnEvent {
+    if lang.as_str() == "vi" {
+        return LearnEvent::None;
+    }
+    let ow1 = orig_w1.trim().to_lowercase();
+    let ow2 = orig_w2.trim().to_lowercase();
+    let nw1 = new_w1.trim().to_lowercase();
+    if ow1.is_empty()
+        || ow2.is_empty()
+        || nw1.is_empty()
+        || !ow1.is_ascii()
+        || !ow2.is_ascii()
+        || !nw1.is_ascii()
+        || !is_prose_word_token(&ow1)
+        || !is_prose_word_token(&ow2)
+        || !is_prose_word_token(&nw1)
+    {
+        return LearnEvent::None;
+    }
+
+    let orig_concat = format!("{ow1}{ow2}");
+    let (habit, fixed_display) = match new_w2 {
+        None => {
+            if nw1 != orig_concat || !is_valid_prose_word_for_space(store, lexicon, &nw1) {
+                return LearnEvent::None;
+            }
+            (SpaceHabitKind::ExtraSpace, new_w1.trim().to_string())
+        }
+        Some(nw2_raw) => {
+            let nw2 = nw2_raw.trim().to_lowercase();
+            if nw2.is_empty() || !nw2.is_ascii() || !is_prose_word_token(&nw2) {
+                return LearnEvent::None;
+            }
+            let new_concat = format!("{nw1}{nw2}");
+            if new_concat != orig_concat
+                || ow1.len().abs_diff(nw1.len()) != 1
+                || !is_valid_prose_word_for_space(store, lexicon, &nw1)
+                || !is_valid_prose_word_for_space(store, lexicon, &nw2)
+            {
+                return LearnEvent::None;
+            }
+            let habit = if ow1.len() > nw1.len() {
+                SpaceHabitKind::LateSpace
+            } else {
+                SpaceHabitKind::EarlySpace
+            };
+            (habit, format!("{} {}", new_w1.trim(), nw2_raw.trim()))
+        }
+    };
+
+    let count = store.record_space_habit(habit);
+    store.log_manual_backspace_fix(
+        &format!("{} {}", orig_w1.trim(), orig_w2.trim()),
+        &fixed_display,
+        &format!("space_habit:{habit:?}"),
+    );
+    LearnEvent::RecordedSpaceHabit { habit, count }
 }

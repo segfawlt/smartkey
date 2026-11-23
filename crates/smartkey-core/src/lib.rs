@@ -25,7 +25,8 @@ pub use pack_builder::{
     build_pack_from_dir, sha256_bytes, sha256_hex, BuiltPack, PackBuildOptions, PackRecipe,
 };
 pub use scorer::{
-    EmptyUserRules, EnglishScorer, EvalContext, LanguageScorer, LatinScorer, UserRuleView,
+    EmptyUserRules, EnglishScorer, EvalContext, LanguageScorer, LatinScorer, SpaceShiftCandidate,
+    UserRuleView,
 };
 pub use session::{
     apply_key_to_buffer, KeyInput, LexiconRegistry, SessionAction, SessionDebugSnapshot,
@@ -34,11 +35,11 @@ pub use session::{
 pub use store::{
     classify_builtin_program, normalize_program_id, BlockPair, CompiledRules, ConfidenceTier,
     DiagnosticEvent, LearnerState, Preset, PruneCandidate, PruneKinds, PruneOptions, PruneReport,
-    RuleOrigin, RuleStat, RuleStore, SkippedEditEntry, UndoResolution,
+    RuleOrigin, RuleStat, RuleStore, SkippedEditEntry, SpaceHabitStats, UndoResolution,
 };
 pub use types::{
     Aggressiveness, AppProfile, Candidate, Dialect, EvalOutcome, Explanation, InputOrigin, LangId,
-    MatchKind, ScorerConfig, UndoMode,
+    MatchKind, ScorerConfig, SpaceHabitKind, UndoMode,
 };
 pub use vi_telex::{
     has_any_vietnamese_rune, is_vietnamese_dict_word, is_vietnamese_slang_word,

@@ -146,3 +146,28 @@ steps = [
   { keys = "it is kind of ", expect_buf = "it is kind of " },
   { keys = "em owr nhaf ", expect_buf = "it is kind of em ở nhà " },
 ]
+
+[[trace]]
+name = "space_shift_late_early_and_extra_space_en"
+steps = [
+  { keys = "addi n ", expect_buf = "add in " },
+  { keys = "theo ther ", expect_buf = "add in the other " },
+  { keys = "fo rme ", expect_buf = "add in the other for me " },
+  { keys = "th e ", expect_buf = "add in the other for me the " },
+]
+
+[[trace]]
+name = "space_shift_step_undo_blocks_pair_en"
+steps = [
+  { keys = "addi n <BS><BS> ", expect_buf = "addi n " },
+  { keys = "addi n ", expect_buf = "addi n addi n " },
+]
+
+[[trace]]
+name = "missed_space_broader_split_and_manual_fix_2x_en"
+steps = [
+  { keys = "herson ", expect_buf = "her son " },
+  { keys = "canadd ", expect_buf = "her son can add " },
+  { keys = "wantto<BS><BS> to ", expect_buf = "her son can add want to " },
+  { keys = "wantto<BS><BS> to ", expect_buf = "her son can add want to want to " },
+]

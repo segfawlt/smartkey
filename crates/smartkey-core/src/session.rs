@@ -4,9 +4,11 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::casing::is_abbreviation_with_rules;
+use crate::keyboard::damerau_levenshtein_chars;
 use crate::learner::{
-    record_manual_edit, record_telex_passthrough_repair, record_undo_keep_verbatim,
-    record_untouched_unknown, resolve_restored_edit, LearnEvent,
+    record_manual_edit, record_manual_space_shift, record_manual_space_split,
+    record_telex_passthrough_repair, record_undo_keep_verbatim, record_untouched_unknown,
+    resolve_restored_edit, LearnEvent,
 };
 use crate::lexicon::{LexiconError, PackLexicon, PackTier};
 use crate::scorer::{EvalContext, LanguageScorer, LatinScorer, UserRuleView};
@@ -892,10 +894,61 @@ impl SessionOutput {
 }
 
 #[derive(Debug, Clone)]
+struct ContiguousPrevWord {
+    raw_typed: String,
+    on_screen: String,
+    prev_before: Option<String>,
+    space_count: usize,
+    at_sentence_start: bool,
+}
+
+#[derive(Debug, Clone)]
+enum PendingSplit {
+    ManualEdit {
+        orig_word: String,
+        prev_word_before: Option<String>,
+        w1: String,
+    },
+    RestoredEdit {
+        raw_typed: String,
+        rejected: String,
+        prev_word_before: Option<String>,
+        w1: String,
+        was_space_fix: bool,
+    },
+}
+
+fn is_split_prose_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().any(|c| c.is_alphabetic())
+        && s.chars()
+            .all(|c| c.is_alphabetic() || c == '\'' || c == '’')
+}
+
+fn should_defer_pending_split(lang: &LangId, is_pure_space: bool, orig: &str, w1: &str) -> bool {
+    if lang.as_str() == "vi" || !is_pure_space {
+        return false;
+    }
+    let orig_l = orig.trim().to_lowercase();
+    let w1_l = w1.trim().to_lowercase();
+    if !is_split_prose_token(&orig_l) || !is_split_prose_token(&w1_l) {
+        return false;
+    }
+    let orig_chars: Vec<char> = orig_l.chars().collect();
+    let w1_chars: Vec<char> = w1_l.chars().collect();
+    if orig_chars.len() <= w1_chars.len() || !orig_chars.starts_with(&w1_chars) {
+        return false;
+    }
+    let deleted = &orig_chars[w1_chars.len()..];
+    deleted.len() >= 2 || matches!(deleted, ['a' | 'i'])
+}
+
+#[derive(Debug, Clone)]
 struct PostAutocorrectOrigin {
     raw_typed: String,
     prev_word_before: Option<String>,
     is_snippet: bool,
+    was_space_fix: bool,
 }
 
 enum Mode {
@@ -927,6 +980,7 @@ enum Mode {
     AfterWord {
         word: String,
         prev_word_before: Option<String>,
+        prev_pair: Option<(String, Option<String>)>,
         trailing_spaces: usize,
     },
     /// Word was just autocorrected (`raw_typed -> applied + trailing_boundaries`);
@@ -939,6 +993,7 @@ enum Mode {
         trailing_boundaries: String,
         is_snippet: bool,
         corrected_at_ms: u64,
+        was_space_fix: bool,
     },
     /// User pressed `1x BackSpace` on `JustAutocorrected`, restoring `buf = raw_typed`.
     EditingRestored {
@@ -947,12 +1002,23 @@ enum Mode {
         prev_word_before: Option<String>,
         buf: String,
         is_snippet: bool,
+        was_space_fix: bool,
     },
     /// User backspaced across `Space` into the previously committed untouched word.
     EditingPrevious {
         orig_word: String,
         prev_word_before: Option<String>,
+        prev_pair: Option<(String, Option<String>)>,
         buf: String,
+    },
+    /// User backspaced across a second `Space` into a `(word1, word2)` pair.
+    EditingPreviousPair {
+        orig_w1: String,
+        orig_w2: String,
+        prev_word_before: Option<String>,
+        buf_w1: String,
+        committed_w1: Option<String>,
+        buf_w2: String,
     },
 }
 
@@ -989,6 +1055,10 @@ pub struct SmartKeySession {
     pending_unknown: Option<(LangId, String)>,
     /// Tracks pending mobile `revertCommit` for HeliBoard word-level hooks.
     mobile_pending_undo: Option<(String, String, Option<String>)>,
+    /// Contiguous single-word history before a single `' '` for cross-space resegmentation / rollback.
+    last_contiguous: Option<ContiguousPrevWord>,
+    /// Deferred manual edit waiting one word to detect `orig -> "w1 w2"` missed-space splits.
+    pending_split: Option<PendingSplit>,
 }
 
 impl Default for SmartKeySession {
@@ -1012,6 +1082,8 @@ impl SmartKeySession {
             last_key_ms: 0,
             pending_unknown: None,
             mobile_pending_undo: None,
+            last_contiguous: None,
+            pending_split: None,
         }
     }
 
@@ -1111,6 +1183,18 @@ impl SmartKeySession {
             Mode::EditingPrevious { orig_word, buf, .. } => {
                 ("EditingPrevious", buf.as_str(), orig_word.as_str(), 0)
             }
+            Mode::EditingPreviousPair {
+                buf_w1,
+                committed_w1,
+                buf_w2,
+                ..
+            } => {
+                if let Some(w1) = committed_w1 {
+                    ("EditingPrevPair", buf_w2.as_str(), w1.as_str(), 0)
+                } else {
+                    ("EditingPrevPair", buf_w1.as_str(), "", 0)
+                }
+            }
         };
         SessionDebugSnapshot {
             mode,
@@ -1132,6 +1216,8 @@ impl SmartKeySession {
         self.last_key_ms = 0;
         self.pending_unknown = None;
         self.mobile_pending_undo = None;
+        self.last_contiguous = None;
+        self.pending_split = None;
     }
 
     /// Reconciles the shadow buffer when the client notifies `InputContextSurroundingTextUpdated`
@@ -1207,28 +1293,48 @@ impl SmartKeySession {
                 let expected = format!("{word}{}", " ".repeat(*trailing_spaces));
                 !ends_with_or_window_suffix(before, &expected)
             }
+            Mode::EditingPreviousPair {
+                buf_w1,
+                committed_w1,
+                buf_w2,
+                ..
+            } => {
+                let expected = match committed_w1 {
+                    Some(w1) => format!("{w1} {buf_w2}"),
+                    None => buf_w1.clone(),
+                };
+                if expected.is_empty() {
+                    false
+                } else {
+                    !before.to_lowercase().ends_with(&expected.to_lowercase())
+                }
+            }
             Mode::Composing { buf, .. }
             | Mode::EditingRestored { buf, .. }
             | Mode::EditingPrevious { buf, .. }
                 if !buf.is_empty() =>
             {
-                let tail_token = before
-                    .rsplit(|c: char| {
-                        Self::is_immediate_boundary(c)
-                            || Self::is_opening_delimiter_when_idle(c)
-                            || c == '\n'
-                            || c == '\r'
-                    })
-                    .next()
-                    .unwrap_or("");
-                if self.lang.as_str() == "vi" && self.lotus_composing {
-                    let preedit = engine
-                        .simulate_vi_lotus(buf, engine.store.lotus_options())
-                        .preedit_before_break;
-                    !tail_token_matches(tail_token, buf)
-                        && !tail_token_matches(tail_token, &preedit)
+                if buf.chars().any(char::is_whitespace) {
+                    !before.to_lowercase().ends_with(&buf.to_lowercase())
                 } else {
-                    !tail_token_matches(tail_token, buf)
+                    let tail_token = before
+                        .rsplit(|c: char| {
+                            Self::is_immediate_boundary(c)
+                                || Self::is_opening_delimiter_when_idle(c)
+                                || c == '\n'
+                                || c == '\r'
+                        })
+                        .next()
+                        .unwrap_or("");
+                    if self.lang.as_str() == "vi" && self.lotus_composing {
+                        let preedit = engine
+                            .simulate_vi_lotus(buf, engine.store.lotus_options())
+                            .preedit_before_break;
+                        !tail_token_matches(tail_token, buf)
+                            && !tail_token_matches(tail_token, &preedit)
+                    } else {
+                        !tail_token_matches(tail_token, buf)
+                    }
                 }
             }
             _ => false,
@@ -1256,10 +1362,138 @@ impl SmartKeySession {
                 self.commit_active_without_autocorrect(engine, &mut events);
             }
         }
+        self.flush_pending_split(engine, None, &mut events);
         self.flush_pending_unknown(engine, &mut events);
         let _ = engine.store.flush_dirty_state();
         self.reset_state_only();
         events
+    }
+
+    fn resolve_restored_non_snippet(
+        engine: &mut SmartKeyEngine,
+        lang: &LangId,
+        prev_word_before: Option<&str>,
+        raw_typed: &str,
+        rejected: &str,
+        buf: &str,
+        was_space_fix: bool,
+        events: &mut Vec<LearnEvent>,
+    ) {
+        let lex = engine.registry.lexicon(lang.as_str());
+        let evs = resolve_restored_edit(
+            &mut engine.store,
+            lex,
+            lang,
+            prev_word_before,
+            raw_typed,
+            rejected,
+            buf,
+        );
+        let is_self_confirm = evs
+            .iter()
+            .any(|e| matches!(e, LearnEvent::SelfConfirmCancelled));
+        if was_space_fix && !is_self_confirm {
+            engine.store.record_space_fix_undo();
+        }
+        events.extend(evs.into_iter().filter(|e| !matches!(e, LearnEvent::None)));
+    }
+
+    fn flush_pending_split(
+        &mut self,
+        engine: &mut SmartKeyEngine,
+        w2_final: Option<&str>,
+        events: &mut Vec<LearnEvent>,
+    ) {
+        let Some(ps) = self.pending_split.take() else {
+            return;
+        };
+        let (orig, w1, prev_before, restored_info) = match ps {
+            PendingSplit::ManualEdit {
+                orig_word,
+                prev_word_before,
+                w1,
+            } => (orig_word, w1, prev_word_before, None),
+            PendingSplit::RestoredEdit {
+                raw_typed,
+                rejected,
+                prev_word_before,
+                w1,
+                was_space_fix,
+            } => (
+                raw_typed,
+                w1,
+                prev_word_before,
+                Some((rejected, was_space_fix)),
+            ),
+        };
+
+        if let Some(w2) = w2_final {
+            let orig_l = orig.trim().to_lowercase();
+            let w1_l = w1.trim().to_lowercase();
+            let orig_chars: Vec<char> = orig_l.chars().collect();
+            let w1_chars: Vec<char> = w1_l.chars().collect();
+            if orig_chars.len() > w1_chars.len() && orig_chars.starts_with(&w1_chars) {
+                let tail_chars = &orig_chars[w1_chars.len()..];
+                let tail_lower: String = tail_chars.iter().collect();
+                let w2_l = w2.trim().to_lowercase();
+                let w2_chars: Vec<char> = w2_l.chars().collect();
+                let is_complete_fused = is_split_prose_token(&w2_l)
+                    && (w2_l == tail_lower
+                        || (tail_chars.len() >= 3
+                            && w2_chars.len() >= 3
+                            && damerau_levenshtein_chars(&tail_lower, &w2_l) <= 1));
+                let is_partial_prefix = !is_complete_fused
+                    && is_split_prose_token(&w2_l)
+                    && w2_l.starts_with(&tail_lower)
+                    && w2_l.len() > tail_lower.len();
+                if is_complete_fused || is_partial_prefix {
+                    let lex = engine.registry.lexicon(self.lang.as_str());
+                    let rejected_ref = restored_info.as_ref().map(|(r, _)| r.as_str());
+                    let evs = record_manual_space_split(
+                        &mut engine.store,
+                        lex,
+                        &self.lang,
+                        &orig,
+                        &w1,
+                        w2,
+                        rejected_ref,
+                        is_complete_fused,
+                    );
+                    if let Some((_, true)) = restored_info {
+                        engine.store.record_space_fix_undo();
+                    }
+                    events.extend(evs.into_iter().filter(|e| !matches!(e, LearnEvent::None)));
+                    return;
+                }
+            }
+        }
+
+        // Tier C fallback: normal manual edit / restored edit on `w1`
+        if let Some((rejected, was_space_fix)) = restored_info {
+            Self::resolve_restored_non_snippet(
+                engine,
+                &self.lang,
+                prev_before.as_deref(),
+                &orig,
+                &rejected,
+                &w1,
+                was_space_fix,
+                events,
+            );
+        } else {
+            let lex = engine.registry.lexicon(self.lang.as_str());
+            let ev = record_manual_edit(
+                &mut engine.store,
+                lex,
+                &self.lang,
+                prev_before.as_deref(),
+                &orig,
+                &w1,
+            );
+            if !matches!(ev, LearnEvent::None) {
+                events.push(ev);
+            }
+        }
     }
 
     fn flush_pending_unknown(&mut self, engine: &mut SmartKeyEngine, events: &mut Vec<LearnEvent>) {
@@ -1303,6 +1537,7 @@ impl SmartKeySession {
             .trim_matches(|c: char| !c.is_alphabetic() && c != '\'' && c != '’');
 
         if let Some(p) = punct {
+            self.last_contiguous = None;
             if Self::ends_sentence(p) {
                 self.prev_word = None;
                 self.at_sentence_start = true;
@@ -1327,6 +1562,7 @@ impl SmartKeySession {
             self.suppress_sentence_cap = false;
         } else {
             self.prev_word = None;
+            self.last_contiguous = None;
             self.at_sentence_start = false;
             self.suppress_sentence_cap = false;
         }
@@ -1351,6 +1587,7 @@ impl SmartKeySession {
         match key {
             KeyInput::NavOrClick | KeyInput::Tab => {
                 let mut events = Vec::new();
+                self.flush_pending_split(engine, None, &mut events);
                 if let Mode::EditingRestored {
                     ref raw_typed,
                     ref buf,
@@ -1364,6 +1601,7 @@ impl SmartKeySession {
                 self.flush_pending_unknown(engine, &mut events);
                 self.mode = Mode::Idle;
                 self.prev_word = None;
+                self.last_contiguous = None;
                 self.suppress_sentence_cap = false;
                 SessionOutput::with_events(events)
             }
@@ -1375,10 +1613,12 @@ impl SmartKeySession {
                 // Never mutate text on `Enter` so chat messages (Discord/Telegram/Slack) are never
                 // unexpectedly altered at submit time without an undo opportunity.
                 let mut events = Vec::new();
+                self.flush_pending_split(engine, None, &mut events);
                 self.commit_active_without_autocorrect(engine, &mut events);
                 self.flush_pending_unknown(engine, &mut events);
                 self.mode = Mode::Idle;
                 self.prev_word = None;
+                self.last_contiguous = None;
                 self.at_sentence_start = true;
                 self.suppress_sentence_cap = false;
                 self.in_markdown_code = false;
@@ -1403,19 +1643,19 @@ impl SmartKeySession {
                 prev_word_before,
                 buf,
                 is_snippet,
+                was_space_fix,
             } => {
                 if !is_snippet && !buf.is_empty() {
-                    let lex = engine.registry.lexicon(self.lang.as_str());
-                    let evs = resolve_restored_edit(
-                        &mut engine.store,
-                        lex,
+                    Self::resolve_restored_non_snippet(
+                        engine,
                         &self.lang,
                         prev_word_before.as_deref(),
                         &raw_typed,
                         &rejected,
                         &buf,
+                        was_space_fix,
+                        events,
                     );
-                    events.extend(evs.into_iter().filter(|e| !matches!(e, LearnEvent::None)));
                 } else if is_snippet && !buf.is_empty() {
                     let res = if buf.eq_ignore_ascii_case(&raw_typed) {
                         UndoResolution::KeptVerbatim
@@ -1433,6 +1673,7 @@ impl SmartKeySession {
                 orig_word,
                 prev_word_before,
                 buf,
+                ..
             } => {
                 if !buf.is_empty() {
                     {
@@ -1587,6 +1828,7 @@ impl SmartKeySession {
                     engine.store.cancel_pending_unfixed_unknown(&pending_w);
                 }
                 self.prev_word = None;
+                self.last_contiguous = None;
                 SessionOutput::passthrough()
             }
             Mode::JustAutocorrected {
@@ -1596,6 +1838,7 @@ impl SmartKeySession {
                 mut trailing_boundaries,
                 is_snippet,
                 corrected_at_ms,
+                was_space_fix,
             } => {
                 let (undo_window, undo_mode) = {
                     let c = engine.store.compiled();
@@ -1614,12 +1857,14 @@ impl SmartKeySession {
                                 applied.chars().count() + trailing_boundaries.chars().count();
                             let restored = raw_typed.clone();
                             self.prev_word = prev_word_before.clone();
+                            self.last_contiguous = None;
                             self.mode = Mode::EditingRestored {
                                 raw_typed,
                                 rejected: applied,
                                 prev_word_before,
                                 buf: restored.clone(),
                                 is_snippet,
+                                was_space_fix,
                             };
                             SessionOutput {
                                 action: SessionAction::Replace {
@@ -1631,15 +1876,18 @@ impl SmartKeySession {
                             }
                         } else {
                             self.prev_word = None;
+                            self.last_contiguous = None;
                             SessionOutput::passthrough()
                         }
                     }
                     UndoMode::Step => {
                         if !in_window {
                             self.prev_word = None;
+                            self.last_contiguous = None;
                             SessionOutput::passthrough()
                         } else if !trailing_boundaries.is_empty() {
                             trailing_boundaries.pop();
+                            self.last_contiguous = None;
                             if trailing_boundaries.is_empty() {
                                 self.at_sentence_start = false;
                                 self.suppress_sentence_cap = false;
@@ -1651,6 +1899,7 @@ impl SmartKeySession {
                                 trailing_boundaries,
                                 is_snippet,
                                 corrected_at_ms: now_ms,
+                                was_space_fix,
                             };
                             SessionOutput::passthrough()
                         } else {
@@ -1662,12 +1911,14 @@ impl SmartKeySession {
                             let delete_chars = applied.chars().count();
                             let restored = raw_typed.clone();
                             self.prev_word = prev_word_before.clone();
+                            self.last_contiguous = None;
                             self.mode = Mode::EditingRestored {
                                 raw_typed,
                                 rejected: applied,
                                 prev_word_before,
                                 buf: restored.clone(),
                                 is_snippet,
+                                was_space_fix,
                             };
                             SessionOutput {
                                 action: SessionAction::Replace {
@@ -1682,6 +1933,7 @@ impl SmartKeySession {
                     UndoMode::Off => {
                         if in_window && !trailing_boundaries.is_empty() {
                             trailing_boundaries.pop();
+                            self.last_contiguous = None;
                             if trailing_boundaries.is_empty() {
                                 self.at_sentence_start = false;
                                 self.suppress_sentence_cap = false;
@@ -1693,8 +1945,10 @@ impl SmartKeySession {
                                 trailing_boundaries,
                                 is_snippet,
                                 corrected_at_ms: now_ms,
+                                was_space_fix,
                             };
                         } else if trailing_boundaries.is_empty() {
+                            self.last_contiguous = None;
                             let mut buf = applied;
                             buf.pop();
                             if buf.is_empty() {
@@ -1709,6 +1963,7 @@ impl SmartKeySession {
                             }
                         } else {
                             self.prev_word = None;
+                            self.last_contiguous = None;
                         }
                         SessionOutput::passthrough()
                     }
@@ -1720,6 +1975,7 @@ impl SmartKeySession {
                 prev_word_before,
                 mut buf,
                 is_snippet,
+                was_space_fix,
             } => {
                 if buf.is_empty() {
                     // Clause-Erase Cancel: user held BackSpace past index 0 into previous word!
@@ -1728,7 +1984,11 @@ impl SmartKeySession {
                         &rejected,
                         UndoResolution::ClauseErased,
                     );
+                    if was_space_fix {
+                        engine.store.record_space_fix_undo();
+                    }
                     self.prev_word = None;
+                    self.last_contiguous = None;
                 } else {
                     buf.pop();
                     self.mode = Mode::EditingRestored {
@@ -1737,6 +1997,7 @@ impl SmartKeySession {
                         prev_word_before,
                         buf,
                         is_snippet,
+                        was_space_fix,
                     };
                 }
                 SessionOutput::passthrough()
@@ -1744,23 +2005,60 @@ impl SmartKeySession {
             Mode::AfterWord {
                 word,
                 prev_word_before,
+                prev_pair,
                 trailing_spaces,
             } => {
                 // Cancel untouched-unknown staging since user immediately backspaced into this word!
                 if let Some((_, pending_w)) = self.pending_unknown.take() {
                     engine.store.cancel_pending_unfixed_unknown(&pending_w);
                 }
+                self.last_contiguous = None;
                 if trailing_spaces > 1 {
                     self.mode = Mode::AfterWord {
                         word,
                         prev_word_before,
+                        prev_pair,
                         trailing_spaces: trailing_spaces - 1,
                     };
+                } else if let Some(ps) = self.pending_split.take() {
+                    match ps {
+                        PendingSplit::ManualEdit {
+                            orig_word,
+                            prev_word_before: pwb,
+                            w1,
+                        } => {
+                            self.prev_word = pwb.clone();
+                            self.mode = Mode::EditingPrevious {
+                                orig_word,
+                                prev_word_before: pwb,
+                                prev_pair,
+                                buf: w1,
+                            };
+                        }
+                        PendingSplit::RestoredEdit {
+                            raw_typed,
+                            rejected,
+                            prev_word_before: pwb,
+                            w1,
+                            was_space_fix,
+                        } => {
+                            self.prev_word = pwb.clone();
+                            self.mode = Mode::EditingRestored {
+                                raw_typed,
+                                rejected,
+                                prev_word_before: pwb,
+                                buf: w1,
+                                is_snippet: false,
+                                was_space_fix,
+                            };
+                        }
+                    }
                 } else {
                     self.prev_word = prev_word_before.clone();
                     self.mode = Mode::EditingPrevious {
                         orig_word: word.clone(),
                         prev_word_before,
+                        prev_pair,
                         buf: word,
                     };
                 }
@@ -1769,17 +2067,70 @@ impl SmartKeySession {
             Mode::EditingPrevious {
                 orig_word,
                 prev_word_before,
+                prev_pair,
                 mut buf,
             } => {
+                self.last_contiguous = None;
                 if buf.is_empty() {
-                    // Row 6: Backspaced past index 0 into a 2nd word -> ignore (`>1` word erase)!
-                    self.prev_word = None;
+                    if let Some((orig_w1, prev_before_w1)) = prev_pair {
+                        self.prev_word = prev_before_w1.clone();
+                        self.mode = Mode::EditingPreviousPair {
+                            orig_w1: orig_w1.clone(),
+                            orig_w2: orig_word,
+                            prev_word_before: prev_before_w1,
+                            buf_w1: orig_w1,
+                            committed_w1: None,
+                            buf_w2: String::new(),
+                        };
+                    } else {
+                        // Row 6: Backspaced past index 0 into a 2nd word -> ignore (`>1` word erase)!
+                        self.prev_word = None;
+                    }
                 } else {
                     buf.pop();
                     self.mode = Mode::EditingPrevious {
                         orig_word,
                         prev_word_before,
+                        prev_pair,
                         buf,
+                    };
+                }
+                SessionOutput::passthrough()
+            }
+            Mode::EditingPreviousPair {
+                orig_w1,
+                orig_w2,
+                prev_word_before,
+                mut buf_w1,
+                mut committed_w1,
+                mut buf_w2,
+            } => {
+                self.last_contiguous = None;
+                if committed_w1.is_some() {
+                    if buf_w2.is_empty() {
+                        buf_w1 = committed_w1.take().unwrap_or_default();
+                    } else {
+                        buf_w2.pop();
+                    }
+                    self.mode = Mode::EditingPreviousPair {
+                        orig_w1,
+                        orig_w2,
+                        prev_word_before,
+                        buf_w1,
+                        committed_w1,
+                        buf_w2,
+                    };
+                } else if buf_w1.is_empty() {
+                    self.prev_word = None;
+                } else {
+                    buf_w1.pop();
+                    self.mode = Mode::EditingPreviousPair {
+                        orig_w1,
+                        orig_w2,
+                        prev_word_before,
+                        buf_w1,
+                        committed_w1,
+                        buf_w2,
                     };
                 }
                 SessionOutput::passthrough()
@@ -1807,6 +2158,7 @@ impl SmartKeySession {
                         trailing_boundaries: String::new(),
                         is_snippet: origin.is_snippet,
                         corrected_at_ms: now_ms,
+                        was_space_fix: origin.was_space_fix,
                     };
                 } else {
                     self.mode = Mode::Composing {
@@ -1857,11 +2209,13 @@ impl SmartKeySession {
                 trailing_boundaries,
                 is_snippet,
                 corrected_at_ms,
+                was_space_fix,
             } => {
                 let (undo_window, undo_mode) = {
                     let c = engine.store.compiled();
                     (c.undo_window_ms, c.undo_mode)
                 };
+                self.last_contiguous = None;
                 let single_word_space = !applied.chars().any(char::is_whitespace)
                     && trailing_boundaries.chars().all(char::is_whitespace);
                 if undo_mode == UndoMode::Off {
@@ -1885,6 +2239,7 @@ impl SmartKeySession {
                         prev_word_before,
                         buf: String::new(),
                         is_snippet,
+                        was_space_fix,
                     };
                 } else {
                     self.prev_word = None;
@@ -1893,26 +2248,37 @@ impl SmartKeySession {
             Mode::AfterWord {
                 word,
                 prev_word_before,
+                prev_pair,
                 ..
             } => {
                 if let Some((_, pending_w)) = self.pending_unknown.take() {
                     engine.store.cancel_pending_unfixed_unknown(&pending_w);
                 }
+                self.last_contiguous = None;
+                if let Some(ps) = self.pending_split.take() {
+                    let mut dummy = Vec::new();
+                    self.pending_split = Some(ps);
+                    self.flush_pending_split(engine, None, &mut dummy);
+                }
                 self.prev_word = prev_word_before.clone();
                 self.mode = Mode::EditingPrevious {
                     orig_word: word,
                     prev_word_before,
+                    prev_pair,
                     buf: String::new(),
                 };
             }
             Mode::EditingPrevious {
                 orig_word,
                 prev_word_before,
+                prev_pair,
                 buf,
             } if !buf.is_empty() => {
+                self.last_contiguous = None;
                 self.mode = Mode::EditingPrevious {
                     orig_word,
                     prev_word_before,
+                    prev_pair,
                     buf: String::new(),
                 };
             }
@@ -1922,13 +2288,18 @@ impl SmartKeySession {
                 prev_word_before,
                 buf,
                 is_snippet,
+                was_space_fix,
             } => {
+                self.last_contiguous = None;
                 if buf.is_empty() {
                     engine.store.resolve_pending_undo_log(
                         &raw_typed,
                         &rejected,
                         UndoResolution::ClauseErased,
                     );
+                    if was_space_fix {
+                        engine.store.record_space_fix_undo();
+                    }
                     self.prev_word = None;
                 } else {
                     self.mode = Mode::EditingRestored {
@@ -1937,6 +2308,7 @@ impl SmartKeySession {
                         prev_word_before,
                         buf: String::new(),
                         is_snippet,
+                        was_space_fix,
                     };
                 }
             }
@@ -1988,6 +2360,7 @@ impl SmartKeySession {
                 trailing_boundaries,
                 is_snippet: origin.is_snippet,
                 corrected_at_ms: now_ms,
+                was_space_fix: origin.was_space_fix,
             };
         } else {
             self.prev_word = origin.prev_word_before;
@@ -2007,9 +2380,11 @@ impl SmartKeySession {
         // Backtick toggles inline Markdown code immunity (`` `code` ``)
         if ch == '`' {
             let mut learn_events = Vec::new();
+            self.flush_pending_split(engine, None, &mut learn_events);
             self.commit_active_without_autocorrect(engine, &mut learn_events);
             self.flush_pending_unknown(engine, &mut learn_events);
             self.mode = Mode::Idle;
+            self.last_contiguous = None;
             self.in_markdown_code = !self.in_markdown_code;
             return SessionOutput::with_events(learn_events);
         }
@@ -2101,23 +2476,39 @@ impl SmartKeySession {
                 prev_word_before,
                 mut buf,
                 is_snippet,
+                was_space_fix,
             } => {
                 if Self::is_immediate_boundary(ch)
                     || (!buf.is_empty() && matches!(ch, '.' | ':' | ';'))
                 {
+                    let is_space = ch == ' ' || ch == '\t';
+                    let is_pure_space = ch == ' ';
+                    let punct = if is_space { None } else { Some(ch) };
                     if !is_snippet && !buf.is_empty() {
-                        let lex = engine.registry.lexicon(self.lang.as_str());
-                        let evs = resolve_restored_edit(
-                            &mut engine.store,
-                            lex,
-                            &self.lang,
-                            prev_word_before.as_deref(),
-                            &raw_typed,
-                            &rejected,
-                            &buf,
-                        );
-                        learn_events
-                            .extend(evs.into_iter().filter(|e| !matches!(e, LearnEvent::None)));
+                        let is_keep_or_cancel = buf.eq_ignore_ascii_case(&raw_typed)
+                            || buf.eq_ignore_ascii_case(&rejected);
+                        if !is_keep_or_cancel
+                            && should_defer_pending_split(&self.lang, is_pure_space, &raw_typed, &buf)
+                        {
+                            self.pending_split = Some(PendingSplit::RestoredEdit {
+                                raw_typed,
+                                rejected,
+                                prev_word_before: prev_word_before.clone(),
+                                w1: buf.clone(),
+                                was_space_fix,
+                            });
+                        } else {
+                            Self::resolve_restored_non_snippet(
+                                engine,
+                                &self.lang,
+                                prev_word_before.as_deref(),
+                                &raw_typed,
+                                &rejected,
+                                &buf,
+                                was_space_fix,
+                                &mut learn_events,
+                            );
+                        }
                     } else if is_snippet && !buf.is_empty() {
                         let res = if buf.eq_ignore_ascii_case(&raw_typed) {
                             UndoResolution::KeptVerbatim
@@ -2132,13 +2523,27 @@ impl SmartKeySession {
                             .store
                             .resolve_pending_undo_log(&raw_typed, &rejected, res);
                     }
-                    let is_space = ch == ' ' || ch == '\t';
-                    let punct = if is_space { None } else { Some(ch) };
+                    let prev_at_sentence_start =
+                        self.at_sentence_start && !self.suppress_sentence_cap;
                     self.update_context_after_commit(engine, &buf, punct, is_space);
+                    if is_pure_space && !buf.is_empty() && !buf.chars().any(char::is_whitespace)
+                        && self.lang.as_str() != "vi"
+                    {
+                        self.last_contiguous = Some(ContiguousPrevWord {
+                            raw_typed: buf.clone(),
+                            on_screen: buf.clone(),
+                            prev_before: prev_word_before.clone(),
+                            space_count: 1,
+                            at_sentence_start: prev_at_sentence_start,
+                        });
+                    } else {
+                        self.last_contiguous = None;
+                    }
                     if is_space && !buf.is_empty() {
                         self.mode = Mode::AfterWord {
                             word: buf,
                             prev_word_before,
+                            prev_pair: None,
                             trailing_spaces: 1,
                         };
                     }
@@ -2151,6 +2556,7 @@ impl SmartKeySession {
                     prev_word_before,
                     buf,
                     is_snippet,
+                    was_space_fix,
                 };
                 return SessionOutput::passthrough();
             }
@@ -2159,67 +2565,94 @@ impl SmartKeySession {
             Mode::EditingPrevious {
                 orig_word,
                 prev_word_before,
+                prev_pair,
                 mut buf,
             } => {
                 if Self::is_immediate_boundary(ch)
                     || (!buf.is_empty() && matches!(ch, '.' | ':' | ';'))
                 {
                     let is_space = ch == ' ' || ch == '\t';
+                    let is_pure_space = ch == ' ';
                     let punct = if is_space { None } else { Some(ch) };
                     if !buf.is_empty() {
-                        {
-                            let (vi_dict, store) = engine.vi_dict_and_store_mut();
-                            self.maybe_record_vi_passthrough_repair(
-                                vi_dict,
-                                store,
+                        self.flush_pending_split(engine, Some(&buf), &mut learn_events);
+                        if should_defer_pending_split(&self.lang, is_pure_space, &orig_word, &buf) {
+                            self.pending_split = Some(PendingSplit::ManualEdit {
+                                orig_word,
+                                prev_word_before: prev_word_before.clone(),
+                                w1: buf.clone(),
+                            });
+                        } else {
+                            {
+                                let (vi_dict, store) = engine.vi_dict_and_store_mut();
+                                self.maybe_record_vi_passthrough_repair(
+                                    vi_dict,
+                                    store,
+                                    &orig_word,
+                                    &buf,
+                                    &mut learn_events,
+                                );
+                            }
+                            let lex = engine.registry.lexicon(self.lang.as_str());
+                            let ev = record_manual_edit(
+                                &mut engine.store,
+                                lex,
+                                &self.lang,
+                                prev_word_before.as_deref(),
                                 &orig_word,
                                 &buf,
-                                &mut learn_events,
                             );
-                        }
-                        let lex = engine.registry.lexicon(self.lang.as_str());
-                        let ev = record_manual_edit(
-                            &mut engine.store,
-                            lex,
-                            &self.lang,
-                            prev_word_before.as_deref(),
-                            &orig_word,
-                            &buf,
-                        );
-                        let check_unknown = matches!(
-                            ev,
-                            LearnEvent::Ignored(
-                                crate::learner::SkipReason::TargetNotValidWord
-                                    | crate::learner::SkipReason::SameWord
-                            )
-                        );
-                        if !matches!(ev, LearnEvent::None) {
-                            learn_events.push(ev);
-                        }
-                        if check_unknown && !self.in_markdown_code {
-                            let ctx = EvalContext {
-                                prev_word: prev_word_before.as_deref(),
-                                boundary_punct: punct,
-                                at_sentence_start: self.at_sentence_start,
-                                suppress_sentence_cap: self.suppress_sentence_cap,
-                                in_markdown_code: self.in_markdown_code,
-                                profile: self.profile,
-                            };
-                            if let EvalOutcome::Unchanged {
-                                do_not_learn: false,
-                                ..
-                            } = engine.evaluate_token_internal(&buf, &ctx, self.lotus_composing)
-                            {
-                                self.flush_pending_unknown(engine, &mut learn_events);
-                                self.pending_unknown = Some((self.lang.clone(), buf.clone()));
+                            let check_unknown = matches!(
+                                ev,
+                                LearnEvent::Ignored(
+                                    crate::learner::SkipReason::TargetNotValidWord
+                                        | crate::learner::SkipReason::SameWord
+                                )
+                            );
+                            if !matches!(ev, LearnEvent::None) {
+                                learn_events.push(ev);
+                            }
+                            if check_unknown && !self.in_markdown_code {
+                                let ctx = EvalContext {
+                                    prev_word: prev_word_before.as_deref(),
+                                    boundary_punct: punct,
+                                    at_sentence_start: self.at_sentence_start,
+                                    suppress_sentence_cap: self.suppress_sentence_cap,
+                                    in_markdown_code: self.in_markdown_code,
+                                    profile: self.profile,
+                                };
+                                if let EvalOutcome::Unchanged {
+                                    do_not_learn: false,
+                                    ..
+                                } = engine.evaluate_token_internal(&buf, &ctx, self.lotus_composing)
+                                {
+                                    self.flush_pending_unknown(engine, &mut learn_events);
+                                    self.pending_unknown = Some((self.lang.clone(), buf.clone()));
+                                }
                             }
                         }
                     }
+                    let prev_at_sentence_start =
+                        self.at_sentence_start && !self.suppress_sentence_cap;
                     self.update_context_after_commit(engine, &buf, punct, is_space);
+                    if is_pure_space && !buf.is_empty() && !buf.chars().any(char::is_whitespace)
+                        && self.lang.as_str() != "vi"
+                    {
+                        self.last_contiguous = Some(ContiguousPrevWord {
+                            raw_typed: buf.clone(),
+                            on_screen: buf.clone(),
+                            prev_before: prev_word_before.clone(),
+                            space_count: 1,
+                            at_sentence_start: prev_at_sentence_start,
+                        });
+                    } else {
+                        self.last_contiguous = None;
+                    }
                     if is_space && !buf.is_empty() {
                         self.mode = Mode::AfterWord {
                             word: buf,
                             prev_word_before,
+                            prev_pair,
                             trailing_spaces: 1,
                         };
                     }
@@ -2229,9 +2662,157 @@ impl SmartKeySession {
                 self.mode = Mode::EditingPrevious {
                     orig_word,
                     prev_word_before,
+                    prev_pair,
                     buf,
                 };
                 return SessionOutput::passthrough();
+            }
+
+            // 4b. User backspaced across a second `Space` into `(word1, word2)`
+            Mode::EditingPreviousPair {
+                orig_w1,
+                orig_w2,
+                prev_word_before,
+                mut buf_w1,
+                committed_w1,
+                mut buf_w2,
+            } => {
+                if let Some(new_w1) = committed_w1 {
+                    if Self::is_immediate_boundary(ch)
+                        || (!buf_w2.is_empty() && matches!(ch, '.' | ':' | ';'))
+                    {
+                        let is_space = ch == ' ' || ch == '\t';
+                        let punct = if is_space { None } else { Some(ch) };
+                        if !buf_w2.is_empty() {
+                            let lex = engine.registry.lexicon(self.lang.as_str());
+                            let ev = record_manual_space_shift(
+                                &mut engine.store,
+                                lex,
+                                &self.lang,
+                                &orig_w1,
+                                &orig_w2,
+                                &new_w1,
+                                Some(&buf_w2),
+                            );
+                            if !matches!(ev, LearnEvent::None) {
+                                learn_events.push(ev);
+                            }
+                        }
+                        let prev_at_sentence_start =
+                            self.at_sentence_start && !self.suppress_sentence_cap;
+                        self.update_context_after_commit(engine, &buf_w2, punct, is_space);
+                        if ch == ' ' && !buf_w2.is_empty() {
+                            let pair_prev = Some((new_w1.clone(), prev_word_before));
+                            self.last_contiguous = Some(ContiguousPrevWord {
+                                raw_typed: buf_w2.clone(),
+                                on_screen: buf_w2.clone(),
+                                prev_before: Some(new_w1.clone()),
+                                space_count: 1,
+                                at_sentence_start: prev_at_sentence_start,
+                            });
+                            self.mode = Mode::AfterWord {
+                                word: buf_w2,
+                                prev_word_before: Some(new_w1),
+                                prev_pair: pair_prev,
+                                trailing_spaces: 1,
+                            };
+                        } else {
+                            self.last_contiguous = None;
+                        }
+                        return SessionOutput::with_events(learn_events);
+                    }
+                    buf_w2.push(ch);
+                    self.mode = Mode::EditingPreviousPair {
+                        orig_w1,
+                        orig_w2,
+                        prev_word_before,
+                        buf_w1,
+                        committed_w1: Some(new_w1),
+                        buf_w2,
+                    };
+                    return SessionOutput::passthrough();
+                } else if Self::is_immediate_boundary(ch)
+                    || (!buf_w1.is_empty() && matches!(ch, '.' | ':' | ';'))
+                {
+                    let concat_lower = format!("{orig_w1}{orig_w2}").to_lowercase();
+                    if ch == ' ' {
+                        if buf_w1.is_empty() {
+                            self.prev_word = None;
+                            self.last_contiguous = None;
+                            return SessionOutput::with_events(learn_events);
+                        }
+                        if buf_w1.to_lowercase() == concat_lower {
+                            let lex = engine.registry.lexicon(self.lang.as_str());
+                            let ev = record_manual_space_shift(
+                                &mut engine.store,
+                                lex,
+                                &self.lang,
+                                &orig_w1,
+                                &orig_w2,
+                                &buf_w1,
+                                None,
+                            );
+                            if !matches!(ev, LearnEvent::None) {
+                                learn_events.push(ev);
+                            }
+                            let prev_at_sentence_start =
+                                self.at_sentence_start && !self.suppress_sentence_cap;
+                            self.update_context_after_commit(engine, &buf_w1, None, true);
+                            self.last_contiguous = Some(ContiguousPrevWord {
+                                raw_typed: buf_w1.clone(),
+                                on_screen: buf_w1.clone(),
+                                prev_before: prev_word_before.clone(),
+                                space_count: 1,
+                                at_sentence_start: prev_at_sentence_start,
+                            });
+                            self.mode = Mode::AfterWord {
+                                word: buf_w1,
+                                prev_word_before,
+                                prev_pair: None,
+                                trailing_spaces: 1,
+                            };
+                            return SessionOutput::with_events(learn_events);
+                        }
+                        self.mode = Mode::EditingPreviousPair {
+                            orig_w1,
+                            orig_w2,
+                            prev_word_before,
+                            buf_w1: String::new(),
+                            committed_w1: Some(buf_w1),
+                            buf_w2: String::new(),
+                        };
+                        return SessionOutput::passthrough();
+                    }
+                    if !buf_w1.is_empty() && buf_w1.to_lowercase() == concat_lower {
+                        let lex = engine.registry.lexicon(self.lang.as_str());
+                        let ev = record_manual_space_shift(
+                            &mut engine.store,
+                            lex,
+                            &self.lang,
+                            &orig_w1,
+                            &orig_w2,
+                            &buf_w1,
+                            None,
+                        );
+                        if !matches!(ev, LearnEvent::None) {
+                            learn_events.push(ev);
+                        }
+                    }
+                    self.update_context_after_commit(engine, &buf_w1, Some(ch), false);
+                    self.last_contiguous = None;
+                    return SessionOutput::with_events(learn_events);
+                } else {
+                    buf_w1.push(ch);
+                    self.mode = Mode::EditingPreviousPair {
+                        orig_w1,
+                        orig_w2,
+                        prev_word_before,
+                        buf_w1,
+                        committed_w1: None,
+                        buf_w2,
+                    };
+                    return SessionOutput::passthrough();
+                }
             }
 
             // 5. Normal composing word
@@ -2291,6 +2872,7 @@ impl SmartKeySession {
                 mut trailing_boundaries,
                 is_snippet,
                 corrected_at_ms,
+                was_space_fix,
             } => {
                 if (ch == ' ' || ch == '\t')
                     && !trailing_boundaries.ends_with(' ')
@@ -2299,7 +2881,22 @@ impl SmartKeySession {
                     let was_empty = trailing_boundaries.is_empty();
                     trailing_boundaries.push(ch);
                     if was_empty {
+                        let prev_at_sentence_start =
+                            self.at_sentence_start && !self.suppress_sentence_cap;
                         self.update_context_after_commit(engine, &applied, None, true);
+                        if ch == ' '
+                            && self.lang.as_str() != "vi"
+                            && !applied.chars().any(char::is_whitespace)
+                            && !raw_typed.chars().any(char::is_whitespace)
+                        {
+                            self.last_contiguous = Some(ContiguousPrevWord {
+                                raw_typed: raw_typed.clone(),
+                                on_screen: applied.clone(),
+                                prev_before: prev_word_before.clone(),
+                                space_count: 1,
+                                at_sentence_start: prev_at_sentence_start,
+                            });
+                        }
                     }
                     self.mode = Mode::JustAutocorrected {
                         raw_typed,
@@ -2308,6 +2905,7 @@ impl SmartKeySession {
                         trailing_boundaries,
                         is_snippet,
                         corrected_at_ms,
+                        was_space_fix,
                     };
                     return SessionOutput::passthrough();
                 }
@@ -2323,6 +2921,7 @@ impl SmartKeySession {
                                 raw_typed,
                                 prev_word_before,
                                 is_snippet,
+                                was_space_fix,
                             }),
                         };
                         return SessionOutput::passthrough();
@@ -2337,6 +2936,7 @@ impl SmartKeySession {
                                 raw_typed,
                                 prev_word_before,
                                 is_snippet,
+                                was_space_fix,
                             }),
                         };
                         return SessionOutput::passthrough();
@@ -2351,11 +2951,13 @@ impl SmartKeySession {
                             trailing_boundaries,
                             is_snippet,
                             corrected_at_ms,
+                            was_space_fix,
                         };
                         return SessionOutput::passthrough();
                     }
                     if !Self::is_opening_delimiter_when_idle(ch) {
                         self.prev_word = prev_word_before;
+                        self.last_contiguous = None;
                         let mut buf = applied;
                         buf.push(ch);
                         self.mode = Mode::Composing {
@@ -2373,15 +2975,19 @@ impl SmartKeySession {
             Mode::AfterWord {
                 word,
                 prev_word_before,
+                prev_pair,
                 trailing_spaces,
             } => {
                 if ch == ' ' || ch == '\t' {
+                    self.flush_pending_split(engine, None, &mut learn_events);
+                    self.last_contiguous = None;
                     self.mode = Mode::AfterWord {
                         word,
                         prev_word_before,
+                        prev_pair,
                         trailing_spaces: trailing_spaces + 1,
                     };
-                    return SessionOutput::passthrough();
+                    return SessionOutput::with_events(learn_events);
                 }
                 // User started typing the next word without backspacing `word` -> confirm untouched unknown!
                 self.flush_pending_unknown(engine, &mut learn_events);
@@ -2395,6 +3001,8 @@ impl SmartKeySession {
         // while non-snippets (`:wq`, `;)`) safely hit `TokenAnalysis::Bypass`.
         if Self::is_immediate_boundary(ch) || Self::is_opening_delimiter_when_idle(ch) || ch == '.'
         {
+            self.flush_pending_split(engine, None, &mut learn_events);
+            self.last_contiguous = None;
             if Self::ends_sentence(ch) {
                 self.prev_word = None;
                 self.at_sentence_start = true;
@@ -2609,38 +3217,59 @@ impl SmartKeySession {
     ) -> SessionOutput {
         self.flush_pending_unknown(engine, &mut learn_events);
         let is_trigger_space = trigger_ch == ' ' || trigger_ch == '\t';
+        let is_pure_space = trigger_ch == ' ' && prior_punct.is_none();
         let effective_punct = prior_punct.or(if is_trigger_space {
             None
         } else {
             Some(trigger_ch)
         });
         let prev_before = self.prev_word.clone();
+        let prev_at_sentence_start = self.at_sentence_start && !self.suppress_sentence_cap;
+        let prev_pair_for_after = self
+            .last_contiguous
+            .as_ref()
+            .filter(|lc| lc.space_count == 1 && self.lang.as_str() != "vi")
+            .map(|lc| (lc.on_screen.clone(), lc.prev_before.clone()));
 
         // Pre-Space mid-word manual fix (`"cna" -> BS -> "can "`):
         // The user ALREADY manually edited this word mid-flight; learn from `(peak -> word)` and
         // do not overwrite their fresh manual edit with statistical guesses!
         if let Some(peak) = peak_before_bs {
+            if !word.is_empty() {
+                self.flush_pending_split(engine, Some(&word), &mut learn_events);
+            } else {
+                self.flush_pending_split(engine, None, &mut learn_events);
+            }
             let check_unknown = if self.lang.as_str() != "vi" {
-                let lex = engine.registry.lexicon(self.lang.as_str());
-                let ev = record_manual_edit(
-                    &mut engine.store,
-                    lex,
-                    &self.lang,
-                    prev_before.as_deref(),
-                    &peak,
-                    &word,
-                );
-                let is_unk = matches!(
-                    ev,
-                    LearnEvent::Ignored(
-                        crate::learner::SkipReason::TargetNotValidWord
-                            | crate::learner::SkipReason::SameWord
-                    )
-                );
-                if !matches!(ev, LearnEvent::None) {
-                    learn_events.push(ev);
+                if should_defer_pending_split(&self.lang, is_pure_space, &peak, &word) {
+                    self.pending_split = Some(PendingSplit::ManualEdit {
+                        orig_word: peak,
+                        prev_word_before: prev_before.clone(),
+                        w1: word.clone(),
+                    });
+                    false
+                } else {
+                    let lex = engine.registry.lexicon(self.lang.as_str());
+                    let ev = record_manual_edit(
+                        &mut engine.store,
+                        lex,
+                        &self.lang,
+                        prev_before.as_deref(),
+                        &peak,
+                        &word,
+                    );
+                    let is_unk = matches!(
+                        ev,
+                        LearnEvent::Ignored(
+                            crate::learner::SkipReason::TargetNotValidWord
+                                | crate::learner::SkipReason::SameWord
+                        )
+                    );
+                    if !matches!(ev, LearnEvent::None) {
+                        learn_events.push(ev);
+                    }
+                    is_unk
                 }
-                is_unk
             } else {
                 true
             };
@@ -2667,10 +3296,24 @@ impl SmartKeySession {
                 effective_punct,
                 is_trigger_space && prior_punct.is_none(),
             );
+            if is_pure_space && !word.is_empty() && !word.chars().any(char::is_whitespace)
+                && self.lang.as_str() != "vi"
+            {
+                self.last_contiguous = Some(ContiguousPrevWord {
+                    raw_typed: word.clone(),
+                    on_screen: word.clone(),
+                    prev_before: prev_before.clone(),
+                    space_count: 1,
+                    at_sentence_start: prev_at_sentence_start,
+                });
+            } else {
+                self.last_contiguous = None;
+            }
             if is_trigger_space && prior_punct.is_none() {
                 self.mode = Mode::AfterWord {
                     word,
                     prev_word_before: prev_before,
+                    prev_pair: prev_pair_for_after,
                     trailing_spaces: 1,
                 };
             }
@@ -2718,6 +3361,7 @@ impl SmartKeySession {
                     self.mode = Mode::AfterWord {
                         word: sim.committed_at_break,
                         prev_word_before: prev_before,
+                        prev_pair: None,
                         trailing_spaces: 1,
                     };
                 }
@@ -2729,10 +3373,119 @@ impl SmartKeySession {
         };
 
         let outcome = engine.evaluate_token_internal(&word, &ctx, self.lotus_composing);
+
+        // Layer 1 cross-space resegmentation (`addi n -> add in`, `theo ther -> the other`,
+        // `cany ou -> can you`, `th e -> the`) for direct-keyboard Latin/English.
+        if engine.store.compiled().enabled
+            && !is_vi_lotus
+            && self.lang.as_str() != "vi"
+            && !self.in_markdown_code
+            && self.profile != AppProfile::Bypass
+        {
+            if let (Some(last), Some(scorer)) = (
+                self.last_contiguous.as_ref().filter(|lc| lc.space_count == 1),
+                engine.scorer_for(self.lang.as_str()),
+            ) {
+                let prev_raw_opt = if last.on_screen != last.raw_typed {
+                    Some(last.raw_typed.as_str())
+                } else {
+                    None
+                };
+                if let Some(shift) = scorer.evaluate_space_shift(
+                    &last.on_screen,
+                    prev_raw_opt,
+                    &word,
+                    last.prev_before.as_deref(),
+                    last.at_sentence_start,
+                    engine.store.scorer_config(),
+                    &engine.store,
+                ) {
+                    let wins = match &outcome {
+                        EvalOutcome::Unchanged { .. } => true,
+                        EvalOutcome::Autocorrect { kind, .. } => match kind {
+                            MatchKind::UserSnippet
+                            | MatchKind::UserContextRule
+                            | MatchKind::UserCorrectionRule
+                            | MatchKind::ShorthandExpansion
+                            | MatchKind::ShiftSlip
+                            | MatchKind::ProperNoun
+                            | MatchKind::DialectNormalization
+                            | MatchKind::Contraction => false,
+                            _ => {
+                                !shift.prev_on_screen_valid
+                                    || shift.used_prev_raw
+                                    || (shift.prev_on_screen_freq < 130
+                                        && shift.bg_12 >= 0.65
+                                        && shift.avg_freq >= 220.0)
+                            }
+                        },
+                    };
+                    if wins {
+                        let raw_pair = format!("{} {word}", last.on_screen);
+                        let prev_before_pair = last.prev_before.clone();
+                        let prev_on_screen_chars = last.on_screen.chars().count();
+                        self.flush_pending_split(engine, None, &mut learn_events);
+                        let mut trailing_boundaries = String::with_capacity(2);
+                        if let Some(p) = prior_punct {
+                            trailing_boundaries.push(p);
+                        }
+                        trailing_boundaries.push(trigger_ch);
+                        let mut insert = String::with_capacity(
+                            shift.replacement.len() + trailing_boundaries.len(),
+                        );
+                        insert.push_str(&shift.replacement);
+                        insert.push_str(&trailing_boundaries);
+                        let base_chars = on_screen_word_override.unwrap_or_else(|| word.chars().count());
+                        let delete_chars = prev_on_screen_chars
+                            + 1
+                            + base_chars
+                            + extra_buffered_chars
+                            + usize::from(boundary_already_committed);
+
+                        engine.store.log_autocorrect_applied_with_context(
+                            prev_before_pair.as_deref(),
+                            &raw_pair,
+                            &shift.replacement,
+                            MatchKind::SpaceShift,
+                        );
+                        self.update_context_after_commit(
+                            engine,
+                            &shift.replacement,
+                            effective_punct,
+                            is_trigger_space && prior_punct.is_none(),
+                        );
+                        self.last_contiguous = None;
+                        self.mode = Mode::JustAutocorrected {
+                            raw_typed: raw_pair,
+                            applied: shift.replacement,
+                            prev_word_before: prev_before_pair,
+                            trailing_boundaries,
+                            is_snippet: false,
+                            corrected_at_ms: now_ms,
+                            was_space_fix: true,
+                        };
+                        return SessionOutput {
+                            action: SessionAction::Replace {
+                                delete_chars,
+                                insert,
+                            },
+                            matched_kind: Some(MatchKind::SpaceShift),
+                            learn_events,
+                        };
+                    }
+                }
+            }
+        }
+
         match outcome {
             EvalOutcome::Autocorrect {
                 replacement, kind, ..
             } => {
+                if !replacement.is_empty() {
+                    self.flush_pending_split(engine, Some(&replacement), &mut learn_events);
+                } else {
+                    self.flush_pending_split(engine, None, &mut learn_events);
+                }
                 let mut trailing_boundaries = String::with_capacity(2);
                 if let Some(p) = prior_punct {
                     trailing_boundaries.push(p);
@@ -2756,6 +3509,7 @@ impl SmartKeySession {
                             effective_punct,
                             is_trigger_space && prior_punct.is_none(),
                         );
+                        self.last_contiguous = None;
                         return SessionOutput::with_events(learn_events);
                     }
                 }
@@ -2791,6 +3545,23 @@ impl SmartKeySession {
                     effective_punct,
                     is_trigger_space && prior_punct.is_none(),
                 );
+                if is_pure_space
+                    && self.lang.as_str() != "vi"
+                    && !undo_raw_typed.chars().any(char::is_whitespace)
+                    && !replacement.chars().any(char::is_whitespace)
+                {
+                    self.last_contiguous = Some(ContiguousPrevWord {
+                        raw_typed: undo_raw_typed.clone(),
+                        on_screen: replacement.clone(),
+                        prev_before: prev_before.clone(),
+                        space_count: 1,
+                        at_sentence_start: prev_at_sentence_start,
+                    });
+                } else {
+                    self.last_contiguous = None;
+                }
+                let was_space_fix =
+                    matches!(kind, MatchKind::SpaceShift | MatchKind::MissedSpaceSplit);
                 self.mode = Mode::JustAutocorrected {
                     raw_typed: undo_raw_typed,
                     applied: replacement,
@@ -2798,6 +3569,7 @@ impl SmartKeySession {
                     trailing_boundaries,
                     is_snippet: kind == MatchKind::UserSnippet,
                     corrected_at_ms: now_ms,
+                    was_space_fix,
                 };
 
                 SessionOutput {
@@ -2905,16 +3677,37 @@ impl SmartKeySession {
                     .as_ref()
                     .map(|s| s.committed_at_break.clone())
                     .unwrap_or(word);
+                if !on_screen_final.is_empty() {
+                    self.flush_pending_split(engine, Some(&on_screen_final), &mut learn_events);
+                } else {
+                    self.flush_pending_split(engine, None, &mut learn_events);
+                }
                 self.update_context_after_commit(
                     engine,
                     &on_screen_final,
                     effective_punct,
                     is_trigger_space && prior_punct.is_none(),
                 );
+                if is_pure_space
+                    && !on_screen_final.is_empty()
+                    && !on_screen_final.chars().any(char::is_whitespace)
+                    && self.lang.as_str() != "vi"
+                {
+                    self.last_contiguous = Some(ContiguousPrevWord {
+                        raw_typed: on_screen_final.clone(),
+                        on_screen: on_screen_final.clone(),
+                        prev_before: prev_before.clone(),
+                        space_count: 1,
+                        at_sentence_start: prev_at_sentence_start,
+                    });
+                } else {
+                    self.last_contiguous = None;
+                }
                 if is_trigger_space && prior_punct.is_none() {
                     self.mode = Mode::AfterWord {
                         word: on_screen_final,
                         prev_word_before: prev_before,
+                        prev_pair: prev_pair_for_after,
                         trailing_spaces: 1,
                     };
                 }

@@ -7,6 +7,7 @@ use crate::keyboard::{
 use crate::lexicon::{PackLexicon, ReplacementKind};
 use crate::types::{
     Aggressiveness, AppProfile, Candidate, EvalOutcome, Explanation, MatchKind, ScorerConfig,
+    SpaceHabitKind,
 };
 
 /// Read-only view of user-learned rules (`rules.toml` + session shields) queried during Layer 1 evaluation.
@@ -47,6 +48,10 @@ pub trait UserRuleView {
     }
     fn trouble_word_boost(&self, candidate_lower: &str) -> f32 {
         let _ = candidate_lower;
+        0.0
+    }
+    fn space_habit_boost(&self, habit: SpaceHabitKind) -> f32 {
+        let _ = habit;
         0.0
     }
     /// Bounded personal-dict usage frequency (`175..=225`) used by Step 5f fuzzy rescue.
@@ -1038,7 +1043,7 @@ impl LatinScorer {
             && core_lower.is_ascii()
             && (4..=14).contains(&char_len)
         {
-            self.collect_space_splits(&core_lower, config, &mut |c, f, b, k, cost| {
+            self.collect_space_splits(&core_lower, config, rules, &mut |c, f, b, k, cost| {
                 push_candidate(&mut pool, c, f, b, k, cost);
             });
         }
@@ -1301,12 +1306,14 @@ impl LatinScorer {
         &self,
         core_lower: &str,
         config: &ScorerConfig,
+        rules: &dyn UserRuleView,
         push_candidate: &mut impl FnMut(&str, u8, f32, MatchKind, Option<f32>),
     ) {
         let lang_rules = self.lexicon.rules();
         let is_func = |w: &str| lang_rules.function_words.iter().any(|fw| fw == w);
         let n = core_lower.len();
-        // 1. Direct missed space: `w1 + w2` (`ofthe -> of the`, `inthe -> in the`)
+        let habit_boost = rules.space_habit_boost(SpaceHabitKind::MissedSpace);
+        // 1. Direct missed space: `w1 + w2` (`ofthe -> of the`, `inthe -> in the`, `herson -> her son`)
         for split in 1..n {
             let w1 = &core_lower[..split];
             let w2 = &core_lower[split..];
@@ -1329,13 +1336,9 @@ impl LatinScorer {
                 continue;
             }
             let bg = self.lexicon.bigram_score_ids(m1.word_id, m2.word_id);
-            if bg < 0.72 {
-                continue;
-            }
-            let min_f = self
-                .lexicon
-                .effective_freq_meta(m1, config.dialect)
-                .min(self.lexicon.effective_freq_meta(m2, config.dialect));
+            let f1 = self.lexicon.effective_freq_meta(m1, config.dialect);
+            let f2 = self.lexicon.effective_freq_meta(m2, config.dialect);
+            let min_f = f1.min(f2);
             let w1_fmt =
                 if w1 == "i" && config.auto_capitalize_i && lang_rules.capitalize_standalone_i {
                     "I"
@@ -1343,13 +1346,69 @@ impl LatinScorer {
                     w1
                 };
             let joined = format!("{w1_fmt} {w2}");
-            push_candidate(
-                &joined,
-                min_f,
-                0.25 * bg,
-                MatchKind::MissedSpaceSplit,
-                Some(0.55),
-            );
+
+            if bg >= 0.72 {
+                push_candidate(
+                    &joined,
+                    min_f,
+                    0.25 * bg,
+                    MatchKind::MissedSpaceSplit,
+                    Some(0.55),
+                );
+            } else if !m1.is_offensive() && !m2.is_offensive() && !m2.is_tech() {
+                let tier2a_thresh = (0.35 - habit_boost).clamp(0.22, 0.45);
+                if bg >= tier2a_thresh && min_f >= 145 {
+                    push_candidate(
+                        &joined,
+                        min_f,
+                        0.18 * bg + habit_boost.max(0.0),
+                        MatchKind::MissedSpaceSplit,
+                        Some((0.62 - habit_boost * 0.5).clamp(0.55, 0.72)),
+                    );
+                } else if is_func(w1)
+                    && w1.len() >= 2
+                    && w2.len() >= 3
+                    && f1 >= 150
+                    && f2 >= 125
+                    && !m1.is_tech()
+                    && (bg >= 0.12
+                        || habit_boost > 0.0
+                        || matches!(
+                            w1,
+                            "the"
+                                | "her"
+                                | "his"
+                                | "our"
+                                | "your"
+                                | "their"
+                                | "my"
+                                | "can"
+                                | "will"
+                                | "would"
+                                | "not"
+                                | "this"
+                                | "that"
+                                | "to"
+                                | "for"
+                                | "from"
+                                | "with"
+                                | "have"
+                                | "has"
+                                | "had"
+                                | "are"
+                                | "was"
+                                | "were"
+                        ))
+                {
+                    push_candidate(
+                        &joined,
+                        min_f,
+                        0.14 * bg + habit_boost.max(0.0),
+                        MatchKind::MissedSpaceSplit,
+                        Some((0.58 - habit_boost * 0.5).clamp(0.48, 0.66)),
+                    );
+                }
+            }
         }
 
         // 2. Thumb-spacebar bottom-row clip: `w1 + [b|n|v|m|c] + w2` (`inbthe -> in the`, `andnthe -> and the`)
@@ -1385,6 +1444,273 @@ impl LatinScorer {
             );
         }
     }
+
+    /// Evaluates whether `(prev_on_screen, curr)` is a ±1-char space-position slip (`addi n -> add in`,
+    /// `theo ther -> the other`, `fo rme -> for me`, `cany ou -> can you`) or extra-space split (`th e -> the`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_space_shift(
+        &self,
+        prev_on_screen: &str,
+        prev_raw: Option<&str>,
+        curr: &str,
+        prev_prev: Option<&str>,
+        prev_at_sentence_start: bool,
+        config: &ScorerConfig,
+        rules: &dyn UserRuleView,
+    ) -> Option<SpaceShiftCandidate> {
+        if !config.enable_missed_space_split {
+            return None;
+        }
+        if prev_on_screen.is_empty()
+            || curr.is_empty()
+            || !curr.chars().all(|c| c.is_ascii_lowercase())
+        {
+            return None;
+        }
+        let mut prev_chars = prev_on_screen.chars();
+        let first_prev = prev_chars.next()?;
+        if !first_prev.is_ascii_alphabetic() || !prev_chars.all(|c| c.is_ascii_lowercase()) {
+            return None;
+        }
+        let total_len = prev_on_screen.len() + curr.len();
+        if !(3..=20).contains(&total_len) {
+            return None;
+        }
+
+        let prev_lower = prev_on_screen.to_lowercase();
+        let curr_lower = curr.to_lowercase();
+
+        let is_valid_prose = |w: &str| -> bool {
+            if w.len() == 1 {
+                w == "a" || w == "i"
+            } else {
+                self.lexicon.contains_valid(w, config.dialect) || rules.is_personal_word(w)
+            }
+        };
+
+        let prev_valid = is_valid_prose(&prev_lower);
+        let curr_valid = is_valid_prose(&curr_lower);
+        if prev_valid && curr_valid {
+            return None;
+        }
+        if rules.is_undo_shielded(&prev_lower) || rules.is_undo_shielded(&curr_lower) {
+            return None;
+        }
+
+        let prev_on_screen_freq = if prev_lower.len() == 1 && (prev_lower == "a" || prev_lower == "i")
+        {
+            255
+        } else {
+            self.lexicon
+                .lookup_word(&prev_lower)
+                .filter(|m| self.lexicon.is_valid_meta(*m, config.dialect))
+                .map(|m| self.lexicon.effective_freq_meta(m, config.dialect))
+                .unwrap_or(0)
+        };
+
+        let prev_prev_lower = prev_prev.map(str::to_lowercase);
+        let typed_pair = format!("{prev_lower} {curr_lower}");
+        let prev_was_title = first_prev.is_ascii_uppercase();
+        let cap_first =
+            prev_was_title || (prev_at_sentence_start && config.auto_capitalize_sentence);
+        let lang_rules = self.lexicon.rules();
+
+        let mut sources: Vec<(String, String, bool)> =
+            vec![(prev_lower.clone(), curr_lower.clone(), false)];
+        if let Some(raw) = prev_raw {
+            if raw.is_ascii() && raw.chars().all(|c| c.is_ascii_alphabetic()) {
+                let raw_lower = raw.to_lowercase();
+                if raw_lower != prev_lower {
+                    sources.push((raw_lower, curr_lower.clone(), true));
+                }
+            }
+        }
+
+        let pair_thresh = match config.aggressiveness {
+            Aggressiveness::Conservative => 0.78,
+            Aggressiveness::Balanced => 0.62,
+            Aggressiveness::Aggressive => 0.50,
+        };
+        let merge_thresh = match config.aggressiveness {
+            Aggressiveness::Conservative => 0.80,
+            Aggressiveness::Balanced => 0.65,
+            Aggressiveness::Aggressive => 0.55,
+        };
+
+        let mut best: Option<SpaceShiftCandidate> = None;
+
+        for (p, c, used_prev_raw) in sources {
+            let eff_prev_valid = if used_prev_raw {
+                is_valid_prose(&p)
+            } else {
+                prev_valid
+            };
+
+            let mut two_word_moves: Vec<(SpaceHabitKind, String, String)> = Vec::new();
+            if p.len() >= 2 {
+                let w1 = &p[..p.len() - 1];
+                let w2 = format!("{}{}", &p[p.len() - 1..], c);
+                two_word_moves.push((SpaceHabitKind::LateSpace, w1.to_string(), w2));
+            }
+            if c.len() >= 2 {
+                let w1 = format!("{}{}", p, &c[..1]);
+                let w2 = &c[1..];
+                two_word_moves.push((SpaceHabitKind::EarlySpace, w1, w2.to_string()));
+            }
+
+            for (habit, w1, w2) in two_word_moves {
+                if (w1.len() < 2 && w1 != "a" && w1 != "i") || (w2.len() < 2 && w2 != "a") {
+                    continue;
+                }
+                let (Some(m1), Some(m2)) =
+                    (self.lexicon.lookup_word(&w1), self.lexicon.lookup_word(&w2))
+                else {
+                    continue;
+                };
+                if m1.is_offensive()
+                    || m2.is_offensive()
+                    || !self.lexicon.is_valid_meta(m1, config.dialect)
+                    || !self.lexicon.is_valid_meta(m2, config.dialect)
+                {
+                    continue;
+                }
+                let cand_lower = format!("{w1} {w2}");
+                if rules.is_pair_blocked(&typed_pair, &cand_lower) {
+                    continue;
+                }
+                let f1 = self.lexicon.effective_freq_meta(m1, config.dialect);
+                let f2 = self.lexicon.effective_freq_meta(m2, config.dialect);
+                let min_f = f1.min(f2);
+                let avg_f = (f1 as f32 + f2 as f32) * 0.5;
+                let has_invalid_orphan = (!curr_valid && c.len() == 1) || (!eff_prev_valid && p.len() == 1);
+                let weak_prev_and_orphan =
+                    !curr_valid && c.len() == 1 && eff_prev_valid && prev_on_screen_freq < 110;
+                if min_f < if weak_prev_and_orphan { 120 } else { 135 }
+                    && !(!eff_prev_valid && !curr_valid && min_f >= 110)
+                {
+                    continue;
+                }
+                let bg_12 = self.lexicon.bigram_score_ids(m1.word_id, m2.word_id);
+                if !eff_prev_valid && !curr_valid {
+                    if avg_f < 145.0 && bg_12 < 0.25 {
+                        continue;
+                    }
+                } else if bg_12 < 0.30
+                    && avg_f < 195.0
+                    && !used_prev_raw
+                    && !(weak_prev_and_orphan && avg_f >= 170.0)
+                {
+                    continue;
+                }
+
+                let bg_01 = prev_prev_lower
+                    .as_deref()
+                    .map(|pp| self.lexicon.bigram_score(pp, &w1))
+                    .unwrap_or(0.0);
+                let habit_boost = rules.space_habit_boost(habit);
+                let orphan_boost = if has_invalid_orphan { 0.12 } else { 0.0 };
+                let penalty = if eff_prev_valid || curr_valid {
+                    0.12
+                } else {
+                    0.0
+                };
+                let score = 0.85 * (avg_f / 255.0)
+                    + 0.55 * bg_12
+                    + 0.25 * bg_01
+                    + orphan_boost
+                    + habit_boost
+                    - penalty;
+                if score < pair_thresh {
+                    continue;
+                }
+
+                let w1_fmt =
+                    if w1 == "i" && config.auto_capitalize_i && lang_rules.capitalize_standalone_i {
+                        "I".to_string()
+                    } else {
+                        project_case(&w1, cap_first)
+                    };
+                let replacement = format!("{w1_fmt} {w2}");
+                if best.as_ref().is_none_or(|b| score > b.score) {
+                    best = Some(SpaceShiftCandidate {
+                        replacement,
+                        habit,
+                        score,
+                        used_prev_raw,
+                        bg_12,
+                        avg_freq: avg_f,
+                        prev_on_screen_valid: prev_valid,
+                        prev_on_screen_freq,
+                    });
+                }
+            }
+
+            // Extra-space merge (`th e -> the`, `ha ve -> have`)
+            if prev_on_screen != "I" {
+                let merged = format!("{p}{c}");
+                if merged.len() >= 3 && !rules.is_pair_blocked(&typed_pair, &merged) {
+                    if let Some(meta) = self.lexicon.lookup_word(&merged) {
+                        if !meta.is_offensive()
+                            && !meta.is_tech()
+                            && self.lexicon.is_valid_meta(meta, config.dialect)
+                        {
+                            let f = self.lexicon.effective_freq_meta(meta, config.dialect);
+                            let one_char_side = p.len() == 1 || c.len() == 1;
+                            let min_merge_f = if one_char_side { 150 } else { 170 };
+                            if f >= min_merge_f {
+                                let bg_01 = prev_prev_lower
+                                    .as_deref()
+                                    .map(|pp| self.lexicon.bigram_score(pp, &merged))
+                                    .unwrap_or(0.0);
+                                let habit_boost =
+                                    rules.space_habit_boost(SpaceHabitKind::ExtraSpace);
+                                let penalty = if (eff_prev_valid && prev_on_screen_freq >= 150)
+                                    || curr_valid
+                                {
+                                    0.18
+                                } else if eff_prev_valid {
+                                    0.06
+                                } else {
+                                    0.0
+                                };
+                                let score =
+                                    1.05 * (f as f32 / 255.0) + 0.30 * bg_01 + habit_boost - penalty;
+                                if score >= merge_thresh
+                                    && best.as_ref().is_none_or(|b| score > b.score)
+                                {
+                                    let replacement = project_case(&merged, cap_first);
+                                    best = Some(SpaceShiftCandidate {
+                                        replacement,
+                                        habit: SpaceHabitKind::ExtraSpace,
+                                        score,
+                                        used_prev_raw,
+                                        bg_12: 0.0,
+                                        avg_freq: f as f32,
+                                        prev_on_screen_valid: prev_valid,
+                                        prev_on_screen_freq,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        best
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpaceShiftCandidate {
+    pub replacement: String,
+    pub habit: SpaceHabitKind,
+    pub score: f32,
+    pub used_prev_raw: bool,
+    pub bg_12: f32,
+    pub avg_freq: f32,
+    pub prev_on_screen_valid: bool,
+    pub prev_on_screen_freq: u8,
 }
 
 impl LanguageScorer for LatinScorer {

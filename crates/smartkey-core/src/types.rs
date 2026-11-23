@@ -146,6 +146,7 @@ pub enum MatchKind {
     KnownTypoDict,
     SwitchChatter,
     MissedSpaceSplit,
+    SpaceShift,
     FuzzyLexicon,
     SmashRescue,
     PersonalDict,
@@ -188,4 +189,13 @@ pub struct Explanation {
     pub boundary_punct: Option<char>,
     pub outcome: EvalOutcome,
     pub top_candidates: Vec<Candidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceHabitKind {
+    MissedSpace,
+    LateSpace,
+    EarlySpace,
+    ExtraSpace,
 }

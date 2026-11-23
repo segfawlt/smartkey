@@ -1796,6 +1796,7 @@ fn match_kind_slug(kind: MatchKind) -> &'static str {
         MatchKind::KnownTypoDict => "known_typo_dict",
         MatchKind::SwitchChatter => "switch_chatter",
         MatchKind::MissedSpaceSplit => "missed_space_split",
+        MatchKind::SpaceShift => "space_shift",
         MatchKind::FuzzyLexicon => "fuzzy_lexicon",
         MatchKind::SmashRescue => "smash_rescue",
         MatchKind::VietnameseTelexRescue => "vietnamese_telex_rescue",

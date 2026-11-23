@@ -11,7 +11,8 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 use crate::event_log::{current_epoch_ms, date_string, DiagnosticsConfig, EventLog, EventLogLevel};
 use crate::scorer::UserRuleView;
 use crate::types::{
-    Aggressiveness, AppProfile, Dialect, LangId, MatchKind, ScorerConfig, UndoMode,
+    Aggressiveness, AppProfile, Dialect, LangId, MatchKind, ScorerConfig, SpaceHabitKind,
+    UndoMode,
 };
 use crate::vi_telex::LotusOptions;
 
@@ -323,6 +324,17 @@ pub struct PruneReport {
     pub dry_run: bool,
 }
 
+/// Per-habit counters for space-timing slips and user undo damping (`learner_state.json`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SpaceHabitStats {
+    pub missed_space: u32,
+    pub late_space: u32,
+    pub early_space: u32,
+    pub extra_space: u32,
+    pub space_fix_undos: u32,
+}
+
 /// High-churn staging counters and diagnostic log stored in `learner_state.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -342,6 +354,7 @@ pub struct LearnerState {
     pub staged_personal_canonical: BTreeMap<String, String>,
     pub staged_telex_passthrough: BTreeMap<String, u32>,
     pub trouble_words: BTreeMap<String, u32>,
+    pub space_habits: SpaceHabitStats,
     /// Per-rule lifecycle metadata keyed by canonical rule stat key (`"fix:..."`, `"ctx:..."`, `"word:..."`, `"block:..."`, `"pt:..."`).
     pub rule_stats: BTreeMap<String, RuleStat>,
     pub skipped_edits: Vec<SkippedEditEntry>,
@@ -1841,6 +1854,29 @@ impl RuleStore {
             return;
         }
         self.log_backspace_undo(typed, rejected, resolution);
+    }
+
+    pub fn record_space_habit(&mut self, habit: SpaceHabitKind) -> u32 {
+        self.sync_external_state_before_write();
+        let slot = match habit {
+            SpaceHabitKind::MissedSpace => &mut self.state.space_habits.missed_space,
+            SpaceHabitKind::LateSpace => &mut self.state.space_habits.late_space,
+            SpaceHabitKind::EarlySpace => &mut self.state.space_habits.early_space,
+            SpaceHabitKind::ExtraSpace => &mut self.state.space_habits.extra_space,
+        };
+        *slot = slot.saturating_add(1);
+        let count = *slot;
+        let _ = self.flush_state();
+        count
+    }
+
+    pub fn record_space_fix_undo(&mut self) -> u32 {
+        self.sync_external_state_before_write();
+        let slot = &mut self.state.space_habits.space_fix_undos;
+        *slot = slot.saturating_add(1);
+        let count = *slot;
+        let _ = self.flush_state();
+        count
     }
 
     pub fn log_manual_backspace_fix(&mut self, orig: &str, fixed: &str, outcome: &str) {
@@ -4368,6 +4404,23 @@ impl UserRuleView for RuleStore {
             Some(cnt) if cnt >= 2 => (0.06 * (cnt.min(4) as f32)).min(0.22),
             _ => 0.0,
         }
+    }
+
+    fn space_habit_boost(&self, habit: SpaceHabitKind) -> f32 {
+        let h = &self.state.space_habits;
+        let hits = match habit {
+            SpaceHabitKind::MissedSpace => h.missed_space,
+            SpaceHabitKind::LateSpace => h.late_space,
+            SpaceHabitKind::EarlySpace => h.early_space,
+            SpaceHabitKind::ExtraSpace => h.extra_space,
+        };
+        let pos = if hits >= 2 {
+            (0.025 * (hits.min(6) - 1) as f32).min(0.10)
+        } else {
+            0.0
+        };
+        let brake = (0.04 * (h.space_fix_undos.min(4) as f32)).min(0.12);
+        (pos - brake).clamp(-0.12, 0.10)
     }
 
     fn personal_word_freq(&self, lower_word: &str) -> u8 {

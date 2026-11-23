@@ -7,7 +7,7 @@ use serde::Deserialize;
 use smartkey_core::{
     apply_key_to_buffer, Candidate, DiagnosticEvent, EvalContext, EvalOutcome, KeyInput, LangId,
     LearnEvent, MatchKind, Preset, RuleStore, SessionAction, SkipReason, SmartKeyEngine,
-    SmartKeySession, UndoResolution, UserRuleView,
+    SmartKeySession, SpaceHabitKind, UndoResolution, UserRuleView,
 };
 
 fn workspace_root() -> PathBuf {
@@ -2387,5 +2387,303 @@ fn undo_mode_immediate_and_off_behave_per_setting() {
         feed_keys(&mut session, &mut engine, &mut buf, "chagnes <CBS>");
         assert_eq!(buf, "");
         assert!(engine.store().state().undo_counts.is_empty());
+    }
+}
+
+#[test]
+fn prefix_truncation_is_rejected_and_pending_split_learns_fused_pairs() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    // 1. `wantto<BS><BS> to `: 1x stages `en:wantto->want to`, NEVER `en:wantto->want`.
+    let evs1 = feed_keys(&mut session, &mut engine, &mut buf, "wantto<BS><BS> to ");
+    assert_eq!(buf, "want to ");
+    assert!(
+        !engine
+            .store()
+            .state()
+            .staged_corrections
+            .contains_key("en:wantto->want"),
+        "must never stage prefix truncation en:wantto->want"
+    );
+    assert!(
+        evs1.iter().any(|e| matches!(
+            e,
+            LearnEvent::StagedCorrection { orig, fixed, count: 1, .. }
+                if orig == "wantto" && fixed == "want to"
+        )),
+        "expected StagedCorrection wantto->want to, got {evs1:?}"
+    );
+    assert_eq!(engine.store().state().space_habits.missed_space, 1);
+
+    // 2. 2x graduates `wantto = "want to"`, and 3rd `wantto ` auto-fixes cleanly.
+    buf.clear();
+    let evs2 = feed_keys(&mut session, &mut engine, &mut buf, "wantto<BS><BS> to ");
+    assert!(
+        evs2.iter().any(|e| matches!(
+            e,
+            LearnEvent::GraduatedCorrection { orig, fixed, .. }
+                if orig == "wantto" && fixed == "want to"
+        )),
+        "expected GraduatedCorrection wantto->want to, got {evs2:?}"
+    );
+    assert_eq!(
+        engine.store().compiled().corrections.get("wantto").map(String::as_str),
+        Some("want to")
+    );
+    buf.clear();
+    feed_keys(&mut session, &mut engine, &mut buf, "wantto ");
+    assert_eq!(buf, "want to ");
+
+    // 3. Partial word-2 prefix (`thati<BS> is `, `partyri<BS><BS> rims `) cancels truncation,
+    //    increments `missed_space`, and never stages prefix truncation.
+    let mut s2 = SmartKeySession::new();
+    let mut b2 = String::new();
+    feed_keys(&mut s2, &mut engine, &mut b2, "thati<BS> is ");
+    assert_eq!(b2, "that is ");
+    feed_keys(&mut s2, &mut engine, &mut b2, "partyri<BS><BS> rims ");
+    assert_eq!(b2, "that is party rims ");
+    assert!(
+        !engine
+            .store()
+            .state()
+            .staged_corrections
+            .contains_key("en:thati->that")
+            && !engine
+                .store()
+                .state()
+                .staged_corrections
+                .contains_key("en:partyri->party")
+    );
+    assert_eq!(engine.store().state().space_habits.missed_space, 4);
+
+    // 4. Incomplete-w2 split (`movieevr<BS><BS><BS> ever `) matches via `dl <= 1` and graduates at 2x.
+    let mut s3 = SmartKeySession::new();
+    let mut b3 = String::new();
+    feed_keys(&mut s3, &mut engine, &mut b3, "movieevr<BS><BS><BS> ever ");
+    assert_eq!(b3, "movie ever ");
+    let evs4 = feed_keys(&mut s3, &mut engine, &mut b3, "movieevr<BS><BS><BS> ever ");
+    assert!(
+        evs4.iter().any(|e| matches!(
+            e,
+            LearnEvent::GraduatedCorrection { orig, fixed, .. }
+                if orig == "movieevr" && fixed == "movie ever"
+        )),
+        "expected movieevr->movie ever graduation, got {evs4:?}"
+    );
+
+    // 5. Direct manual truncation `wantto -> want` followed by unrelated word never graduates or stages.
+    let mut s4 = SmartKeySession::new();
+    let mut b4 = String::new();
+    feed_keys(&mut s4, &mut engine, &mut b4, "haveto<BS><BS> sleep ");
+    assert!(
+        !engine
+            .store()
+            .state()
+            .staged_corrections
+            .contains_key("en:haveto->have")
+    );
+}
+
+#[test]
+fn editing_restored_split_blocks_wrong_autocorrect_and_graduates_split() {
+    let mut store = RuleStore::in_memory(Preset::Balanced);
+    // Force `herson` to hit single-word fuzzy `herons` first to exercise `EditingRestored` split.
+    store.set_setting("enable_missed_space_split", "false").unwrap();
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+    let mut session = SmartKeySession::new();
+    let mut buf = String::new();
+
+    // Verify `herson ` autocorrected to `herons `, then user undoes (`Step`: <BS> space, <BS> word -> `herson`),
+    // deletes `son` -> `her`, types ` son `.
+    feed_keys(&mut session, &mut engine, &mut buf, "herson ");
+    assert_eq!(buf, "herons ");
+    let evs1 = feed_keys(&mut session, &mut engine, &mut buf, "<BS><BS><BS><BS><BS> son ");
+    assert_eq!(buf, "her son ");
+    assert!(
+        engine.store().is_pair_blocked("herson", "herons"),
+        "expected wrong single-word autocorrect (herson, herons) to be blocked on restored split"
+    );
+    assert!(
+        evs1.iter().any(|e| matches!(
+            e,
+            LearnEvent::StagedCorrection { orig, fixed, count: 1, .. }
+                if orig == "herson" && fixed == "her son"
+        )),
+        "expected StagedCorrection herson->her son, got {evs1:?}"
+    );
+
+    // Next `herson ` no longer becomes `herons `; at 2x `herson -> her son` graduates!
+    buf.clear();
+    feed_keys(&mut session, &mut engine, &mut buf, "herson ");
+    assert_eq!(buf, "herson ");
+    let evs2 = feed_keys(&mut session, &mut engine, &mut buf, "<BS><BS><BS><BS> son ");
+    assert!(
+        evs2.iter().any(|e| matches!(
+            e,
+            LearnEvent::GraduatedCorrection { orig, fixed, .. }
+                if orig == "herson" && fixed == "her son"
+        )),
+        "expected GraduatedCorrection herson->her son, got {evs2:?}"
+    );
+    buf.clear();
+    feed_keys(&mut session, &mut engine, &mut buf, "herson ");
+    assert_eq!(buf, "her son ");
+}
+
+#[test]
+fn layer1_broader_fused_split_and_cross_space_shift_work() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+
+    for (input, expected) in [
+        ("herson ", "her son "),
+        ("canadd ", "can add "),
+        ("thelearning ", "the learning "),
+        ("addi n ", "add in "),
+        ("theo ther ", "the other "),
+        ("fo rme ", "for me "),
+        ("th e ", "the "),
+        ("ha ve ", "have "),
+        ("Theo ther ", "The other "),
+        ("cany ou ", "can you "),
+    ] {
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+        feed_keys(&mut session, &mut engine, &mut buf, input);
+        assert_eq!(buf, expected, "input={input:?}");
+    }
+}
+
+#[test]
+fn layer1_space_shift_zero_false_positives_and_boundary_guards() {
+    let store = RuleStore::in_memory(Preset::Balanced);
+    let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+
+    for (input, expected) in [
+        ("an other ", "an other "),
+        ("in to ", "in to "),
+        ("a lot ", "a lot "),
+        ("the end ", "the end "),
+        ("git hub ", "git hub "),
+        ("hypr land ", "hypr land "),
+        ("I n ", "I n "),
+        ("addi <NAV>n ", "addi n "),
+        ("addi, n ", "addi, n "),
+        ("addi  n ", "addi  n "),
+    ] {
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+        feed_keys(&mut session, &mut engine, &mut buf, input);
+        assert_eq!(buf, expected, "must remain untouched for {input:?}");
+    }
+
+    // `vi` (`fcitx5-lotus`) mode stays excluded from cross-space shifts.
+    let mut vi_session = SmartKeySession::new();
+    vi_session.set_lang(LangId::vi());
+    let mut vi_buf = String::new();
+    feed_keys(&mut vi_session, &mut engine, &mut vi_buf, "addi n th e ");
+    assert_eq!(vi_buf, "addi n th e ");
+}
+
+#[test]
+fn space_shift_undo_blocks_pair_and_adjusts_habit_brake() {
+    // 1. Step undo on `addi n -> add in` restores `addi n`, blocks pair, and increments `space_fix_undos`.
+    {
+        let store = RuleStore::in_memory(Preset::Balanced);
+        let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+
+        feed_keys(&mut session, &mut engine, &mut buf, "addi n ");
+        assert_eq!(buf, "add in ");
+        feed_keys(&mut session, &mut engine, &mut buf, "<BS><BS> ");
+        assert_eq!(buf, "addi n ");
+        assert!(engine.store().is_pair_blocked("addi n", "add in"));
+        assert_eq!(engine.store().state().space_habits.space_fix_undos, 1);
+
+        buf.clear();
+        feed_keys(&mut session, &mut engine, &mut buf, "addi n ");
+        assert_eq!(buf, "addi n ");
+    }
+
+    // 2. Immediate undo on `addi n -> add in` works identically.
+    {
+        let mut store = RuleStore::in_memory(Preset::Balanced);
+        store.set_setting("settings.undo_mode", "immediate").unwrap();
+        let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+
+        feed_keys(&mut session, &mut engine, &mut buf, "addi n ");
+        assert_eq!(buf, "add in ");
+        feed_keys(&mut session, &mut engine, &mut buf, "<BS> ");
+        assert_eq!(buf, "addi n ");
+        assert!(engine.store().is_pair_blocked("addi n", "add in"));
+        assert_eq!(engine.store().state().space_habits.space_fix_undos, 1);
+    }
+
+    // 3. Self-confirming undo (`th e` -> `the` -> BSx6 -> `the `) must NOT increment `space_fix_undos`.
+    {
+        let store = RuleStore::in_memory(Preset::Balanced);
+        let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+        let mut session = SmartKeySession::new();
+        let mut buf = String::new();
+
+        let evs = feed_keys(&mut session, &mut engine, &mut buf, "th e <BS><BS><BS><BS><BS><BS>the ");
+        assert_eq!(buf, "the ");
+        assert!(evs.contains(&LearnEvent::SelfConfirmCancelled));
+        assert_eq!(engine.store().state().space_habits.space_fix_undos, 0);
+    }
+
+    // 4. Manual cross-space shift & extra-space repairs record `late_space`, `early_space`, and `extra_space`.
+    {
+        let mut store = RuleStore::in_memory(Preset::Balanced);
+        store.set_setting("enable_missed_space_split", "false").unwrap();
+        let mut engine = SmartKeyEngine::new_bundled(store).unwrap();
+
+        let mut s1 = SmartKeySession::new();
+        let mut b1 = String::new();
+        let ev1 = feed_keys(&mut s1, &mut engine, &mut b1, "addi n <BS><BS><BS><BS> in ");
+        assert_eq!(b1, "add in ");
+        assert!(ev1.iter().any(|e| matches!(
+            e,
+            LearnEvent::RecordedSpaceHabit {
+                habit: SpaceHabitKind::LateSpace,
+                count: 1,
+            }
+        )));
+
+        let mut s2 = SmartKeySession::new();
+        let mut b2 = String::new();
+        let ev2 = feed_keys(&mut s2, &mut engine, &mut b2, "fo rme <BS><BS><BS><BS><BS>r me ");
+        assert_eq!(b2, "for me ");
+        assert!(ev2.iter().any(|e| matches!(
+            e,
+            LearnEvent::RecordedSpaceHabit {
+                habit: SpaceHabitKind::EarlySpace,
+                count: 1,
+            }
+        )));
+
+        let mut s3 = SmartKeySession::new();
+        let mut b3 = String::new();
+        let ev3 = feed_keys(&mut s3, &mut engine, &mut b3, "th e <BS><BS><BS>e ");
+        assert_eq!(b3, "the ");
+        assert!(ev3.iter().any(|e| matches!(
+            e,
+            LearnEvent::RecordedSpaceHabit {
+                habit: SpaceHabitKind::ExtraSpace,
+                count: 1,
+            }
+        )));
+
+        assert!(engine.store().space_habit_boost(SpaceHabitKind::LateSpace) >= 0.0);
+        engine.store_mut().record_space_habit(SpaceHabitKind::LateSpace);
+        assert!(engine.store().space_habit_boost(SpaceHabitKind::LateSpace) > 0.0);
+        engine.store_mut().record_space_fix_undo();
+        assert!(engine.store().space_habit_boost(SpaceHabitKind::LateSpace) < 0.0);
     }
 }
