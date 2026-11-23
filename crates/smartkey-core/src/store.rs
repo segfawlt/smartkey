@@ -930,6 +930,8 @@ fn salvage_safety_flags_from_broken_toml(raw: &str, compiled: &mut CompiledRules
 pub struct RuleStore {
     rules_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
+    lock_path: Option<PathBuf>,
+    lock_depth: usize,
     lotus_conf_path: Option<PathBuf>,
     last_rules_stamp: Option<FileStamp>,
     last_state_stamp: Option<FileStamp>,
@@ -965,6 +967,8 @@ impl RuleStore {
         Self {
             rules_path: None,
             state_path: None,
+            lock_path: None,
+            lock_depth: 0,
             lotus_conf_path: None,
             last_rules_stamp: None,
             last_state_stamp: None,
@@ -992,6 +996,8 @@ impl RuleStore {
         Ok(Self {
             rules_path: None,
             state_path: None,
+            lock_path: None,
+            lock_depth: 0,
             lotus_conf_path: None,
             last_rules_stamp: None,
             last_state_stamp: None,
@@ -1016,6 +1022,15 @@ impl RuleStore {
         state_path: PathBuf,
         preset: Preset,
     ) -> io::Result<Self> {
+        let lock_path = rules_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| state_path.parent().filter(|p| !p.as_os_str().is_empty()))
+            .map(|d| d.join(".smartkey.lock"));
+        let _init_lock = lock_path
+            .as_deref()
+            .and_then(Self::acquire_lock_file_at);
+
         let raw_toml = if rules_path.exists() {
             fs::read_to_string(&rules_path)?
         } else {
@@ -1078,6 +1093,8 @@ impl RuleStore {
         Ok(Self {
             rules_path: Some(rules_path),
             state_path: Some(state_path),
+            lock_path,
+            lock_depth: 0,
             lotus_conf_path,
             last_rules_stamp,
             last_state_stamp,
@@ -1167,6 +1184,8 @@ impl RuleStore {
             } else {
                 None
             },
+            lock_path: None,
+            lock_depth: 0,
             lotus_conf_path,
             last_rules_stamp: FileStamp::of(&rules_path),
             last_state_stamp: FileStamp::of(&state_path),
@@ -1367,39 +1386,76 @@ impl RuleStore {
         }
     }
 
+    fn acquire_lock_file_at(lp: &Path) -> Option<fs::File> {
+        if let Some(parent) = lp.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _ = fs::create_dir_all(parent);
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lp)
+            .ok()?;
+        file.lock().ok()?;
+        Some(file)
+    }
+
+    fn acquire_file_lock(&self) -> Option<fs::File> {
+        if self.lock_depth > 0 {
+            return None;
+        }
+        let lp = self.lock_path.as_ref()?;
+        Self::acquire_lock_file_at(lp)
+    }
+
+    /// Executes `f` under an exclusive advisory file lock on `<config_dir>/.smartkey.lock`.
+    /// Re-entrant within the same `RuleStore` instance to avoid nested `flock` deadlocks.
+    pub fn with_file_lock<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let _guard = self.acquire_file_lock();
+        self.lock_depth += 1;
+        let out = f(self);
+        self.lock_depth = self.lock_depth.saturating_sub(1);
+        out
+    }
+
     pub fn flush_rules(&mut self) -> io::Result<()> {
-        if self.parse_locked {
-            let detail = self.parse_error.as_deref().unwrap_or("unparseable TOML");
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "rules.toml has a syntax error and is write-locked to prevent data loss ({detail})"
-                ),
-            ));
-        }
-        if let Some(path) = self.rules_path.as_ref().cloned() {
-            let rendered = self.doc.to_string();
-            atomic_write_bytes(&path, rendered.as_bytes())?;
-            self.last_rules_stamp = FileStamp::of(&path);
-        }
-        Ok(())
+        self.with_file_lock(|this| {
+            if this.parse_locked {
+                let detail = this.parse_error.as_deref().unwrap_or("unparseable TOML");
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "rules.toml has a syntax error and is write-locked to prevent data loss ({detail})"
+                    ),
+                ));
+            }
+            if let Some(path) = this.rules_path.as_ref().cloned() {
+                let rendered = this.doc.to_string();
+                atomic_write_bytes(&path, rendered.as_bytes())?;
+                this.last_rules_stamp = FileStamp::of(&path);
+            }
+            Ok(())
+        })
     }
 
     /// Updates `[settings].enabled` in `rules.toml` while preserving all comments.
     pub fn set_enabled(&mut self, enabled: bool) -> io::Result<()> {
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            return self.flush_rules();
-        }
-        self.compiled.enabled = enabled;
-        let settings = self
-            .doc
-            .entry("settings")
-            .or_insert(Item::Table(Table::new()))
-            .as_table_mut()
-            .unwrap();
-        settings["enabled"] = toml_edit::value(enabled);
-        self.flush_rules()
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                return this.flush_rules();
+            }
+            this.compiled.enabled = enabled;
+            let settings = this
+                .doc
+                .entry("settings")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .unwrap();
+            settings["enabled"] = toml_edit::value(enabled);
+            this.flush_rules()
+        })
     }
 
     /// Normalizes a plugin name (`"vi-lotus"`, `"vi_lotus"`, `"lotus"`, `"vi"`) to its canonical key.
@@ -1422,22 +1478,24 @@ impl RuleStore {
         let Some(key) = Self::normalize_plugin_key(name) else {
             return Ok(false);
         };
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        if key == "vi_lotus" {
-            self.compiled.vi_lotus_enabled = enabled;
-        }
-        let plugins = self
-            .doc
-            .entry("plugins")
-            .or_insert(Item::Table(Table::new()))
-            .as_table_mut()
-            .unwrap();
-        plugins[key] = toml_edit::value(enabled);
-        self.flush_rules()?;
-        Ok(true)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            if key == "vi_lotus" {
+                this.compiled.vi_lotus_enabled = enabled;
+            }
+            let plugins = this
+                .doc
+                .entry("plugins")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .unwrap();
+            plugins[key] = toml_edit::value(enabled);
+            this.flush_rules()?;
+            Ok(true)
+        })
     }
 
     fn trim_core_lower(s: &str) -> String {
@@ -1747,18 +1805,22 @@ impl RuleStore {
         if self.pending_personal_hits.is_empty() {
             return Ok(());
         }
-        self.sync_external_state_before_write();
-        self.flush_state()
+        self.with_file_lock(|this| {
+            this.sync_external_state_before_write();
+            this.flush_state()
+        })
     }
 
     pub fn flush_state(&mut self) -> io::Result<()> {
-        self.merge_pending_personal_hits();
-        if let Some(path) = self.state_path.as_ref().cloned() {
-            let json = serde_json::to_string_pretty(&self.state).map_err(io::Error::other)?;
-            atomic_write_bytes(&path, json.as_bytes())?;
-            self.last_state_stamp = FileStamp::of(&path);
-        }
-        Ok(())
+        self.with_file_lock(|this| {
+            this.merge_pending_personal_hits();
+            if let Some(path) = this.state_path.as_ref().cloned() {
+                let json = serde_json::to_string_pretty(&this.state).map_err(io::Error::other)?;
+                atomic_write_bytes(&path, json.as_bytes())?;
+                this.last_state_stamp = FileStamp::of(&path);
+            }
+            Ok(())
+        })
     }
 
     pub fn log_autocorrect_applied(&mut self, typed: &str, applied: &str, kind: MatchKind) {
@@ -1772,45 +1834,49 @@ impl RuleStore {
         applied: &str,
         kind: MatchKind,
     ) {
-        self.sync_external_state_before_write();
-        self.record_rule_hit_from_autocorrect(prev_word, typed, applied, kind);
-        let key = format!("{}->{}", typed.to_lowercase(), applied.to_lowercase());
-        let total_count = {
-            let e = self.state.applied_counts.entry(key).or_insert(0);
-            *e = e.saturating_add(1);
-            *e
-        };
-        let ev = DiagnosticEvent::AutocorrectApplied {
-            typed: typed.to_string(),
-            applied: applied.to_string(),
-            kind,
-            total_count,
-        };
-        self.record_event_only(&ev);
-        self.state.push_event(ev);
-        let _ = self.flush_state();
+        self.with_file_lock(|this| {
+            this.sync_external_state_before_write();
+            this.record_rule_hit_from_autocorrect(prev_word, typed, applied, kind);
+            let key = format!("{}->{}", typed.to_lowercase(), applied.to_lowercase());
+            let total_count = {
+                let e = this.state.applied_counts.entry(key).or_insert(0);
+                *e = e.saturating_add(1);
+                *e
+            };
+            let ev = DiagnosticEvent::AutocorrectApplied {
+                typed: typed.to_string(),
+                applied: applied.to_string(),
+                kind,
+                total_count,
+            };
+            this.record_event_only(&ev);
+            this.state.push_event(ev);
+            let _ = this.flush_state();
+        });
     }
 
     pub fn log_backspace_undo(&mut self, typed: &str, rejected: &str, resolution: UndoResolution) {
-        self.sync_external_state_before_write();
-        let key = format!("{}->{}", typed.to_lowercase(), rejected.to_lowercase());
-        let undo_count = {
-            let e = self.state.undo_counts.entry(key).or_insert(0);
-            *e = e.saturating_add(1);
-            *e
-        };
-        let is_triggered = matches!(resolution, UndoResolution::Triggered);
-        let ev = DiagnosticEvent::BackspaceUndo {
-            typed: typed.to_string(),
-            rejected: rejected.to_string(),
-            resolution,
-            undo_count,
-        };
-        if !is_triggered {
-            self.record_event_only(&ev);
-        }
-        self.state.push_event(ev);
-        let _ = self.flush_state();
+        self.with_file_lock(|this| {
+            this.sync_external_state_before_write();
+            let key = format!("{}->{}", typed.to_lowercase(), rejected.to_lowercase());
+            let undo_count = {
+                let e = this.state.undo_counts.entry(key).or_insert(0);
+                *e = e.saturating_add(1);
+                *e
+            };
+            let is_triggered = matches!(resolution, UndoResolution::Triggered);
+            let ev = DiagnosticEvent::BackspaceUndo {
+                typed: typed.to_string(),
+                rejected: rejected.to_string(),
+                resolution,
+                undo_count,
+            };
+            if !is_triggered {
+                this.record_event_only(&ev);
+            }
+            this.state.push_event(ev);
+            let _ = this.flush_state();
+        });
     }
 
     /// Updates the most recent `Triggered` `BackspaceUndo` entry in place once the user finishes
@@ -1821,66 +1887,71 @@ impl RuleStore {
         rejected: &str,
         resolution: UndoResolution,
     ) {
-        self.sync_external_state_before_write();
-        let mut resolved_count = None;
-        if let Some(DiagnosticEvent::BackspaceUndo {
-            typed: t,
-            rejected: r,
-            resolution: res_slot,
-            undo_count,
-        }) = self.state.recent_events.iter_mut().rev().find(|ev| {
-            matches!(
-                ev,
-                DiagnosticEvent::BackspaceUndo {
-                    resolution: UndoResolution::Triggered,
-                    ..
-                }
-            )
-        }) {
-            if t == typed && r == rejected {
-                *res_slot = resolution.clone();
-                resolved_count = Some(*undo_count);
-            }
-        }
-        if let Some(undo_count) = resolved_count {
-            let _ = self.flush_state();
-            let ev = DiagnosticEvent::BackspaceUndo {
-                typed: typed.to_string(),
-                rejected: rejected.to_string(),
-                resolution,
+        self.with_file_lock(|this| {
+            this.sync_external_state_before_write();
+            let mut resolved_count = None;
+            if let Some(DiagnosticEvent::BackspaceUndo {
+                typed: t,
+                rejected: r,
+                resolution: res_slot,
                 undo_count,
-            };
-            self.record_event_only(&ev);
-            return;
-        }
-        self.log_backspace_undo(typed, rejected, resolution);
+            }) = this.state.recent_events.iter_mut().rev().find(|ev| {
+                matches!(
+                    ev,
+                    DiagnosticEvent::BackspaceUndo {
+                        resolution: UndoResolution::Triggered,
+                        ..
+                    }
+                )
+            }) {
+                if t == typed && r == rejected {
+                    *res_slot = resolution.clone();
+                    resolved_count = Some(*undo_count);
+                }
+            }
+            if let Some(undo_count) = resolved_count {
+                let _ = this.flush_state();
+                let ev = DiagnosticEvent::BackspaceUndo {
+                    typed: typed.to_string(),
+                    rejected: rejected.to_string(),
+                    resolution,
+                    undo_count,
+                };
+                this.record_event_only(&ev);
+                return;
+            }
+            this.log_backspace_undo(typed, rejected, resolution);
+        });
     }
 
     pub fn record_space_habit(&mut self, habit: SpaceHabitKind) -> u32 {
-        self.sync_external_state_before_write();
-        let slot = match habit {
-            SpaceHabitKind::MissedSpace => &mut self.state.space_habits.missed_space,
-            SpaceHabitKind::LateSpace => &mut self.state.space_habits.late_space,
-            SpaceHabitKind::EarlySpace => &mut self.state.space_habits.early_space,
-            SpaceHabitKind::ExtraSpace => &mut self.state.space_habits.extra_space,
-        };
-        *slot = slot.saturating_add(1);
-        let count = *slot;
-        let _ = self.flush_state();
-        count
+        self.with_file_lock(|this| {
+            this.sync_external_state_before_write();
+            let slot = match habit {
+                SpaceHabitKind::MissedSpace => &mut this.state.space_habits.missed_space,
+                SpaceHabitKind::LateSpace => &mut this.state.space_habits.late_space,
+                SpaceHabitKind::EarlySpace => &mut this.state.space_habits.early_space,
+                SpaceHabitKind::ExtraSpace => &mut this.state.space_habits.extra_space,
+            };
+            *slot = slot.saturating_add(1);
+            let count = *slot;
+            let _ = this.flush_state();
+            count
+        })
     }
 
     pub fn record_space_fix_undo(&mut self) -> u32 {
-        self.sync_external_state_before_write();
-        let slot = &mut self.state.space_habits.space_fix_undos;
-        *slot = slot.saturating_add(1);
-        let count = *slot;
-        let _ = self.flush_state();
-        count
+        self.with_file_lock(|this| {
+            this.sync_external_state_before_write();
+            let slot = &mut this.state.space_habits.space_fix_undos;
+            *slot = slot.saturating_add(1);
+            let count = *slot;
+            let _ = this.flush_state();
+            count
+        })
     }
 
     pub fn log_manual_backspace_fix(&mut self, orig: &str, fixed: &str, outcome: &str) {
-        self.sync_external_state_before_write();
         let orig_t = orig.trim();
         let fixed_t = fixed.trim();
         let orig_l = orig_t.to_lowercase();
@@ -1888,25 +1959,28 @@ impl RuleStore {
         if orig_t.is_empty() || fixed_t.is_empty() || orig_t == fixed_t {
             return;
         }
-        let key = if orig_l == fixed_l {
-            format!("{orig_t}->{fixed_t}")
-        } else {
-            format!("{orig_l}->{fixed_l}")
-        };
-        let attempt_count = {
-            let e = self.state.manual_fix_counts.entry(key).or_insert(0);
-            *e = e.saturating_add(1);
-            *e
-        };
-        let ev = DiagnosticEvent::ManualBackspaceFix {
-            orig: orig_t.to_string(),
-            fixed: fixed_t.to_string(),
-            outcome: outcome.to_string(),
-            attempt_count,
-        };
-        self.record_event_only(&ev);
-        self.state.push_event(ev);
-        let _ = self.flush_state();
+        self.with_file_lock(|this| {
+            this.sync_external_state_before_write();
+            let key = if orig_l == fixed_l {
+                format!("{orig_t}->{fixed_t}")
+            } else {
+                format!("{orig_l}->{fixed_l}")
+            };
+            let attempt_count = {
+                let e = this.state.manual_fix_counts.entry(key).or_insert(0);
+                *e = e.saturating_add(1);
+                *e
+            };
+            let ev = DiagnosticEvent::ManualBackspaceFix {
+                orig: orig_t.to_string(),
+                fixed: fixed_t.to_string(),
+                outcome: outcome.to_string(),
+                attempt_count,
+            };
+            this.record_event_only(&ev);
+            this.state.push_event(ev);
+            let _ = this.flush_state();
+        });
     }
 
     pub fn log_unfixed_unknown(
@@ -1916,58 +1990,63 @@ impl RuleStore {
         best_score: f32,
         threshold: f32,
     ) {
-        self.sync_external_state_before_write();
-        let word_l = word.trim().to_lowercase();
+        let word_t = word.trim();
+        let word_l = word_t.to_lowercase();
         if word_l.is_empty() {
             return;
         }
-        let total_count = {
-            let e = self
-                .state
-                .untouched_unknowns
-                .entry(word_l.clone())
-                .or_insert(0);
-            *e = e.saturating_add(1);
-            *e
-        };
-        let ev = DiagnosticEvent::UnfixedUnknown {
-            word: word.trim().to_string(),
-            best_candidate: best_candidate.map(str::to_string),
-            best_score,
-            threshold,
-            total_count,
-        };
-        self.record_event_only(&ev);
-        self.state.push_event(ev);
-        let _ = self.flush_state();
+        self.with_file_lock(|this| {
+            this.sync_external_state_before_write();
+            let total_count = {
+                let e = this
+                    .state
+                    .untouched_unknowns
+                    .entry(word_l.clone())
+                    .or_insert(0);
+                *e = e.saturating_add(1);
+                *e
+            };
+            let ev = DiagnosticEvent::UnfixedUnknown {
+                word: word_t.to_string(),
+                best_candidate: best_candidate.map(str::to_string),
+                best_score,
+                threshold,
+                total_count,
+            };
+            this.record_event_only(&ev);
+            this.state.push_event(ev);
+            let _ = this.flush_state();
+        });
     }
 
     /// Reverts the tentative `log_unfixed_unknown` counter and trailing diagnostic event when the user
     /// immediately backspaces into or deletes a just-committed unknown word.
     pub fn cancel_pending_unfixed_unknown(&mut self, word: &str) {
-        self.sync_external_state_before_write();
         let word_trimmed = word.trim();
         let word_l = word_trimmed.to_lowercase();
         if word_l.is_empty() {
             return;
         }
-        if let Some(cnt) = self.state.untouched_unknowns.get_mut(&word_l) {
-            if *cnt <= 1 {
-                self.state.untouched_unknowns.remove(&word_l);
-            } else {
-                *cnt -= 1;
+        self.with_file_lock(|this| {
+            this.sync_external_state_before_write();
+            if let Some(cnt) = this.state.untouched_unknowns.get_mut(&word_l) {
+                if *cnt <= 1 {
+                    this.state.untouched_unknowns.remove(&word_l);
+                } else {
+                    *cnt -= 1;
+                }
             }
-        }
-        if let Some(pos) = self.state.recent_events.iter().rposition(|ev| {
-            matches!(
-                ev,
-                DiagnosticEvent::UnfixedUnknown { word: w, .. }
-                    if w.eq_ignore_ascii_case(word_trimmed) || w.to_lowercase() == word_l
-            )
-        }) {
-            self.state.recent_events.remove(pos);
-        }
-        let _ = self.flush_state();
+            if let Some(pos) = this.state.recent_events.iter().rposition(|ev| {
+                matches!(
+                    ev,
+                    DiagnosticEvent::UnfixedUnknown { word: w, .. }
+                        if w.eq_ignore_ascii_case(word_trimmed) || w.to_lowercase() == word_l
+                )
+            }) {
+                this.state.recent_events.remove(pos);
+            }
+            let _ = this.flush_state();
+        });
     }
 
     pub fn log_real_word_declined(
@@ -2045,17 +2124,41 @@ impl RuleStore {
     }
 
     pub fn clear_diagnostic_logs(&mut self) -> io::Result<()> {
-        self.sync_external_state_before_write();
-        self.state.applied_counts.clear();
-        self.state.undo_counts.clear();
-        self.state.manual_fix_counts.clear();
-        self.state.untouched_unknowns.clear();
-        self.state.staged_personal_canonical.clear();
-        self.state.recent_events.clear();
-        self.state.skipped_edits.clear();
-        // Deliberately preserve `self.state.rule_stats` so `smartkey logs clear` never resets
-        // rule age/hit counters needed by `smartkey rules prune` and confidence tiers.
-        self.flush_state()
+        self.with_file_lock(|this| {
+            this.sync_external_state_before_write();
+            this.state.applied_counts.clear();
+            this.state.undo_counts.clear();
+            this.state.manual_fix_counts.clear();
+            this.state.untouched_unknowns.clear();
+            this.state.staged_personal_canonical.clear();
+            this.state.recent_events.clear();
+            this.state.skipped_edits.clear();
+            // Deliberately preserve `self.state.rule_stats` so `smartkey logs clear` never resets
+            // rule age/hit counters needed by `smartkey rules prune` and confidence tiers.
+            this.flush_state()
+        })
+    }
+
+    /// Removes one staged candidate entry from `learner_state.json` and flushes atomically.
+    pub fn dismiss_staged_entry(&mut self, queue: &str, key: &str) -> io::Result<bool> {
+        self.with_file_lock(|this| {
+            this.sync_external_state_before_write();
+            let removed = match queue {
+                "fix" | "case_fix" => this.state.staged_corrections.remove(key).is_some(),
+                "context" => this.state.staged_context.remove(key).is_some(),
+                "untouched_word" | "case_upgrade" => {
+                    let r1 = this.state.untouched_unknowns.remove(key).is_some();
+                    let r2 = this.state.staged_personal_canonical.remove(key).is_some();
+                    r1 || r2
+                }
+                "telex_passthrough" => this.state.staged_telex_passthrough.remove(key).is_some(),
+                _ => false,
+            };
+            if removed {
+                this.flush_state()?;
+            }
+            Ok(removed)
+        })
     }
 
     /// Permanently adds `(typed, rejected)` to `blocklist` in `rules.toml` (comment-preserving),
@@ -2070,88 +2173,90 @@ impl RuleStore {
         rejected_lower: &str,
         origin: RuleOrigin,
     ) {
-        self.sync_external_edits_before_write();
-        let mut modified = false;
-        let mut state_changed = false;
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            let mut modified = false;
+            let mut state_changed = false;
 
-        if self.compiled.corrections.get(typed_lower).is_some_and(|t| {
-            t.eq_ignore_ascii_case(rejected_lower) || t.to_lowercase() == rejected_lower
-        }) {
-            self.compiled.corrections.remove(typed_lower);
-            if let Some(tbl) = self.doc.get_mut("corrections").and_then(Item::as_table_mut) {
-                tbl.remove(typed_lower);
-            }
-            self.state
-                .rule_stats
-                .remove(&Self::stat_key_fix("en", typed_lower));
-            modified = true;
-            state_changed = true;
-        }
-
-        for (lang_key, map) in &mut self.compiled.lang_corrections {
-            if map
-                .get(typed_lower)
-                .is_some_and(|t| t.to_lowercase() == rejected_lower)
-            {
-                map.remove(typed_lower);
-                if let Some(corr_tbl) = self
-                    .doc
-                    .get_mut("lang")
-                    .and_then(Item::as_table_mut)
-                    .and_then(|t| t.get_mut(lang_key.as_str()))
-                    .and_then(Item::as_table_mut)
-                    .and_then(|t| t.get_mut("corrections"))
-                    .and_then(Item::as_table_mut)
-                {
-                    corr_tbl.remove(typed_lower);
+            if this.compiled.corrections.get(typed_lower).is_some_and(|t| {
+                t.eq_ignore_ascii_case(rejected_lower) || t.to_lowercase() == rejected_lower
+            }) {
+                this.compiled.corrections.remove(typed_lower);
+                if let Some(tbl) = this.doc.get_mut("corrections").and_then(Item::as_table_mut) {
+                    tbl.remove(typed_lower);
                 }
-                self.state
+                this.state
                     .rule_stats
-                    .remove(&Self::stat_key_fix(lang_key, typed_lower));
+                    .remove(&Self::stat_key_fix("en", typed_lower));
                 modified = true;
                 state_changed = true;
             }
-        }
 
-        let pair = (typed_lower.to_string(), rejected_lower.to_string());
-        if self.compiled.blocklist.insert(pair) {
-            if !self.doc.contains_key("blocklist") {
-                self.doc["blocklist"] = Item::Value(Value::Array(Array::new()));
+            for (lang_key, map) in &mut this.compiled.lang_corrections {
+                if map
+                    .get(typed_lower)
+                    .is_some_and(|t| t.to_lowercase() == rejected_lower)
+                {
+                    map.remove(typed_lower);
+                    if let Some(corr_tbl) = this
+                        .doc
+                        .get_mut("lang")
+                        .and_then(Item::as_table_mut)
+                        .and_then(|t| t.get_mut(lang_key.as_str()))
+                        .and_then(Item::as_table_mut)
+                        .and_then(|t| t.get_mut("corrections"))
+                        .and_then(Item::as_table_mut)
+                    {
+                        corr_tbl.remove(typed_lower);
+                    }
+                    this.state
+                        .rule_stats
+                        .remove(&Self::stat_key_fix(lang_key, typed_lower));
+                    modified = true;
+                    state_changed = true;
+                }
             }
-            if let Some(arr) = self.doc["blocklist"].as_array_mut() {
-                let mut tbl = InlineTable::new();
-                tbl.insert("typed", Value::from(typed_lower));
-                tbl.insert("rejected", Value::from(rejected_lower));
-                arr.push_formatted(Value::InlineTable(tbl));
-            }
-            self.upsert_rule_stat_in_memory(
-                Self::stat_key_block(typed_lower, rejected_lower),
-                origin,
-                true,
-            );
-            modified = true;
-            state_changed = true;
-            if origin.is_machine_learned() {
-                self.log_rule_learned(
-                    &format!("block:{typed_lower}->{rejected_lower}"),
-                    "block_permanent",
-                    None,
+
+            let pair = (typed_lower.to_string(), rejected_lower.to_string());
+            if this.compiled.blocklist.insert(pair) {
+                if !this.doc.contains_key("blocklist") {
+                    this.doc["blocklist"] = Item::Value(Value::Array(Array::new()));
+                }
+                if let Some(arr) = this.doc["blocklist"].as_array_mut() {
+                    let mut tbl = InlineTable::new();
+                    tbl.insert("typed", Value::from(typed_lower));
+                    tbl.insert("rejected", Value::from(rejected_lower));
+                    arr.push_formatted(Value::InlineTable(tbl));
+                }
+                this.upsert_rule_stat_in_memory(
+                    Self::stat_key_block(typed_lower, rejected_lower),
+                    origin,
+                    true,
                 );
+                modified = true;
+                state_changed = true;
+                if origin.is_machine_learned() {
+                    this.log_rule_learned(
+                        &format!("block:{typed_lower}->{rejected_lower}"),
+                        "block_permanent",
+                        None,
+                    );
+                }
+            } else if origin == RuleOrigin::Manual {
+                this.upsert_rule_stat_in_memory(
+                    Self::stat_key_block(typed_lower, rejected_lower),
+                    RuleOrigin::Manual,
+                    false,
+                );
+                state_changed = true;
             }
-        } else if origin == RuleOrigin::Manual {
-            self.upsert_rule_stat_in_memory(
-                Self::stat_key_block(typed_lower, rejected_lower),
-                RuleOrigin::Manual,
-                false,
-            );
-            state_changed = true;
-        }
-        if modified {
-            let _ = self.flush_rules();
-        }
-        if state_changed {
-            let _ = self.flush_state();
-        }
+            if modified {
+                let _ = this.flush_rules();
+            }
+            if state_changed {
+                let _ = this.flush_state();
+            }
+        });
     }
 
     /// Returns true if `lower_word` is explicitly stored in `[lang.<id>].personal_dict`
@@ -2202,143 +2307,146 @@ impl RuleStore {
         if word_lower.is_empty() {
             return;
         }
-        self.sync_external_edits_before_write();
-        if stage != "undo_keep_2x" {
-            self.session_shielded_words.remove(&word_lower);
-        }
-        let origin = Self::origin_for_personal_stage(stage);
-        let stat_key = Self::stat_key_word(lang.as_str(), &word_lower);
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if stage != "undo_keep_2x" {
+                this.session_shielded_words.remove(&word_lower);
+            }
+            let origin = Self::origin_for_personal_stage(stage);
+            let stat_key = Self::stat_key_word(lang.as_str(), &word_lower);
 
-        if lang.as_str() == "en" {
-            let is_new = self.compiled.personal_dict.insert(word_lower.clone());
-            if !is_new {
-                // Upgrade canonical casing if previously lowercase and now explicitly cased
-                if word_trimmed.chars().any(char::is_uppercase)
-                    && self
-                        .compiled
-                        .personal_dict_canonical
-                        .get(&word_lower)
-                        .is_none_or(|c| c != word_trimmed)
-                {
-                    let prev_canon = self
-                        .compiled
-                        .personal_dict_canonical
-                        .insert(word_lower.clone(), word_trimmed.to_string());
-                    if let Some(arr) = self
-                        .doc
-                        .get_mut("personal_dict")
-                        .and_then(Item::as_array_mut)
+            if lang.as_str() == "en" {
+                let is_new = this.compiled.personal_dict.insert(word_lower.clone());
+                if !is_new {
+                    // Upgrade canonical casing if previously lowercase and now explicitly cased
+                    if word_trimmed.chars().any(char::is_uppercase)
+                        && this
+                            .compiled
+                            .personal_dict_canonical
+                            .get(&word_lower)
+                            .is_none_or(|c| c != word_trimmed)
                     {
-                        for item in arr.iter_mut() {
-                            if item
-                                .as_str()
-                                .is_some_and(|s| s.to_lowercase() == word_lower)
-                            {
-                                *item = Value::from(word_trimmed);
+                        let prev_canon = this
+                            .compiled
+                            .personal_dict_canonical
+                            .insert(word_lower.clone(), word_trimmed.to_string());
+                        if let Some(arr) = this
+                            .doc
+                            .get_mut("personal_dict")
+                            .and_then(Item::as_array_mut)
+                        {
+                            for item in arr.iter_mut() {
+                                if item
+                                    .as_str()
+                                    .is_some_and(|s| s.to_lowercase() == word_lower)
+                                {
+                                    *item = Value::from(word_trimmed);
+                                }
                             }
                         }
+                        this.upsert_rule_stat_in_memory(stat_key, origin, false);
+                        let _ = this.flush_rules();
+                        let _ = this.flush_state();
+                        if origin.is_machine_learned() {
+                            this.log_rule_learned(
+                                &format!("personal_dict:{word_trimmed}"),
+                                stage,
+                                prev_canon,
+                            );
+                        }
+                    } else if origin == RuleOrigin::Manual {
+                        this.upsert_rule_stat_in_memory(stat_key, RuleOrigin::Manual, false);
+                        let _ = this.flush_state();
                     }
-                    self.upsert_rule_stat_in_memory(stat_key, origin, false);
-                    let _ = self.flush_rules();
-                    let _ = self.flush_state();
-                    if origin.is_machine_learned() {
-                        self.log_rule_learned(
-                            &format!("personal_dict:{word_trimmed}"),
-                            stage,
-                            prev_canon,
-                        );
-                    }
-                } else if origin == RuleOrigin::Manual {
-                    self.upsert_rule_stat_in_memory(stat_key, RuleOrigin::Manual, false);
-                    let _ = self.flush_state();
+                    return;
                 }
-                return;
-            }
-            self.compiled
-                .personal_dict_canonical
-                .insert(word_lower.clone(), word_trimmed.to_string());
-            if !self.doc.contains_key("personal_dict") {
-                self.doc["personal_dict"] = Item::Value(Value::Array(Array::new()));
-            }
-            if let Some(arr) = self.doc["personal_dict"].as_array_mut() {
-                arr.push(word_trimmed);
-            }
-        } else {
-            let set = self
-                .compiled
-                .lang_personal_dict
-                .entry(lang.as_str().to_string())
-                .or_default();
-            let is_new = set.insert(word_lower.clone());
-            let canon_map = self
-                .compiled
-                .lang_personal_dict_canonical
-                .entry(lang.as_str().to_string())
-                .or_default();
-            if !is_new {
-                if word_trimmed.chars().any(char::is_uppercase)
-                    && canon_map.get(&word_lower).is_none_or(|c| c != word_trimmed)
-                {
-                    let prev_canon = canon_map.insert(word_lower.clone(), word_trimmed.to_string());
-                    if let Some(arr) = self
-                        .doc
-                        .get_mut("lang")
-                        .and_then(Item::as_table_mut)
-                        .and_then(|t| t.get_mut(lang.as_str()))
-                        .and_then(Item::as_table_mut)
-                        .and_then(|t| t.get_mut("personal_dict"))
-                        .and_then(Item::as_array_mut)
+                this.compiled
+                    .personal_dict_canonical
+                    .insert(word_lower.clone(), word_trimmed.to_string());
+                if !this.doc.contains_key("personal_dict") {
+                    this.doc["personal_dict"] = Item::Value(Value::Array(Array::new()));
+                }
+                if let Some(arr) = this.doc["personal_dict"].as_array_mut() {
+                    arr.push(word_trimmed);
+                }
+            } else {
+                let set = this
+                    .compiled
+                    .lang_personal_dict
+                    .entry(lang.as_str().to_string())
+                    .or_default();
+                let is_new = set.insert(word_lower.clone());
+                let canon_map = this
+                    .compiled
+                    .lang_personal_dict_canonical
+                    .entry(lang.as_str().to_string())
+                    .or_default();
+                if !is_new {
+                    if word_trimmed.chars().any(char::is_uppercase)
+                        && canon_map.get(&word_lower).is_none_or(|c| c != word_trimmed)
                     {
-                        for item in arr.iter_mut() {
-                            if item
-                                .as_str()
-                                .is_some_and(|s| s.to_lowercase() == word_lower)
-                            {
-                                *item = Value::from(word_trimmed);
+                        let prev_canon =
+                            canon_map.insert(word_lower.clone(), word_trimmed.to_string());
+                        if let Some(arr) = this
+                            .doc
+                            .get_mut("lang")
+                            .and_then(Item::as_table_mut)
+                            .and_then(|t| t.get_mut(lang.as_str()))
+                            .and_then(Item::as_table_mut)
+                            .and_then(|t| t.get_mut("personal_dict"))
+                            .and_then(Item::as_array_mut)
+                        {
+                            for item in arr.iter_mut() {
+                                if item
+                                    .as_str()
+                                    .is_some_and(|s| s.to_lowercase() == word_lower)
+                                {
+                                    *item = Value::from(word_trimmed);
+                                }
                             }
                         }
+                        this.upsert_rule_stat_in_memory(stat_key, origin, false);
+                        let _ = this.flush_rules();
+                        let _ = this.flush_state();
+                        if origin.is_machine_learned() {
+                            this.log_rule_learned(
+                                &format!("personal_dict:{word_trimmed}"),
+                                stage,
+                                prev_canon,
+                            );
+                        }
+                    } else if origin == RuleOrigin::Manual {
+                        this.upsert_rule_stat_in_memory(stat_key, RuleOrigin::Manual, false);
+                        let _ = this.flush_state();
                     }
-                    self.upsert_rule_stat_in_memory(stat_key, origin, false);
-                    let _ = self.flush_rules();
-                    let _ = self.flush_state();
-                    if origin.is_machine_learned() {
-                        self.log_rule_learned(
-                            &format!("personal_dict:{word_trimmed}"),
-                            stage,
-                            prev_canon,
-                        );
-                    }
-                } else if origin == RuleOrigin::Manual {
-                    self.upsert_rule_stat_in_memory(stat_key, RuleOrigin::Manual, false);
-                    let _ = self.flush_state();
+                    return;
                 }
-                return;
+                canon_map.insert(word_lower.clone(), word_trimmed.to_string());
+                let lang_root = this
+                    .doc
+                    .entry("lang")
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                let sub = lang_root
+                    .entry(lang.as_str())
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                if !sub.contains_key("personal_dict") {
+                    sub["personal_dict"] = Item::Value(Value::Array(Array::new()));
+                }
+                if let Some(arr) = sub["personal_dict"].as_array_mut() {
+                    arr.push(word_trimmed);
+                }
             }
-            canon_map.insert(word_lower.clone(), word_trimmed.to_string());
-            let lang_root = self
-                .doc
-                .entry("lang")
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap();
-            let sub = lang_root
-                .entry(lang.as_str())
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap();
-            if !sub.contains_key("personal_dict") {
-                sub["personal_dict"] = Item::Value(Value::Array(Array::new()));
+            this.upsert_rule_stat_in_memory(stat_key, origin, true);
+            let _ = this.flush_rules();
+            let _ = this.flush_state();
+            if origin.is_machine_learned() {
+                this.log_rule_learned(&format!("personal_dict:{word_trimmed}"), stage, None);
             }
-            if let Some(arr) = sub["personal_dict"].as_array_mut() {
-                arr.push(word_trimmed);
-            }
-        }
-        self.upsert_rule_stat_in_memory(stat_key, origin, true);
-        let _ = self.flush_rules();
-        let _ = self.flush_state();
-        if origin.is_machine_learned() {
-            self.log_rule_learned(&format!("personal_dict:{word_trimmed}"), stage, None);
-        }
+        });
     }
 
     /// Clears any staged `untouched_unknowns` counters for `word_lower` (both raw and lang-prefixed).
@@ -2372,37 +2480,72 @@ impl RuleStore {
     /// Downgrades a cased `personal_dict` entry (`"Domixi"`) to lowercase (`"domixi"`) while
     /// keeping the word in `personal_dict`, returning `true` if `rules.toml` was updated.
     pub fn downgrade_personal_word_case(&mut self, lang: &LangId, word_lower: &str) -> bool {
-        self.sync_external_edits_before_write();
         let word_l = word_lower.trim().to_lowercase();
         if word_l.is_empty() {
             return false;
         }
-        let staged_key = format!("{}:{word_l}", lang.as_str());
-        let mut state_changed = self
-            .state
-            .staged_personal_canonical
-            .remove(&word_l)
-            .is_some();
-        state_changed |= self
-            .state
-            .staged_personal_canonical
-            .remove(&staged_key)
-            .is_some();
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            let staged_key = format!("{}:{word_l}", lang.as_str());
+            let mut state_changed = this
+                .state
+                .staged_personal_canonical
+                .remove(&word_l)
+                .is_some();
+            state_changed |= this
+                .state
+                .staged_personal_canonical
+                .remove(&staged_key)
+                .is_some();
 
-        let prev_canon = if lang.as_str() == "en" {
-            if self
-                .compiled
-                .personal_dict_canonical
-                .get(&word_l)
-                .is_some_and(|c| c.chars().any(char::is_uppercase))
-            {
-                let prev = self
+            let prev_canon = if lang.as_str() == "en" {
+                if this
                     .compiled
                     .personal_dict_canonical
-                    .insert(word_l.clone(), word_l.clone());
-                if let Some(arr) = self
+                    .get(&word_l)
+                    .is_some_and(|c| c.chars().any(char::is_uppercase))
+                {
+                    let prev = this
+                        .compiled
+                        .personal_dict_canonical
+                        .insert(word_l.clone(), word_l.clone());
+                    if let Some(arr) = this
+                        .doc
+                        .get_mut("personal_dict")
+                        .and_then(Item::as_array_mut)
+                    {
+                        for item in arr.iter_mut() {
+                            if item.as_str().is_some_and(|s| s.to_lowercase() == word_l) {
+                                let decor = item.decor().clone();
+                                let mut val = Value::from(word_l.as_str());
+                                *val.decor_mut() = decor;
+                                *item = val;
+                            }
+                        }
+                    }
+                    prev
+                } else {
+                    None
+                }
+            } else if this
+                .compiled
+                .lang_personal_dict_canonical
+                .get(lang.as_str())
+                .and_then(|m| m.get(&word_l))
+                .is_some_and(|c| c.chars().any(char::is_uppercase))
+            {
+                let prev = this
+                    .compiled
+                    .lang_personal_dict_canonical
+                    .get_mut(lang.as_str())
+                    .and_then(|m| m.insert(word_l.clone(), word_l.clone()));
+                if let Some(arr) = this
                     .doc
-                    .get_mut("personal_dict")
+                    .get_mut("lang")
+                    .and_then(Item::as_table_mut)
+                    .and_then(|t| t.get_mut(lang.as_str()))
+                    .and_then(Item::as_table_mut)
+                    .and_then(|t| t.get_mut("personal_dict"))
                     .and_then(Item::as_array_mut)
                 {
                     for item in arr.iter_mut() {
@@ -2417,56 +2560,23 @@ impl RuleStore {
                 prev
             } else {
                 None
-            }
-        } else if self
-            .compiled
-            .lang_personal_dict_canonical
-            .get(lang.as_str())
-            .and_then(|m| m.get(&word_l))
-            .is_some_and(|c| c.chars().any(char::is_uppercase))
-        {
-            let prev = self
-                .compiled
-                .lang_personal_dict_canonical
-                .get_mut(lang.as_str())
-                .and_then(|m| m.insert(word_l.clone(), word_l.clone()));
-            if let Some(arr) = self
-                .doc
-                .get_mut("lang")
-                .and_then(Item::as_table_mut)
-                .and_then(|t| t.get_mut(lang.as_str()))
-                .and_then(Item::as_table_mut)
-                .and_then(|t| t.get_mut("personal_dict"))
-                .and_then(Item::as_array_mut)
-            {
-                for item in arr.iter_mut() {
-                    if item.as_str().is_some_and(|s| s.to_lowercase() == word_l) {
-                        let decor = item.decor().clone();
-                        let mut val = Value::from(word_l.as_str());
-                        *val.decor_mut() = decor;
-                        *item = val;
-                    }
-                }
-            }
-            prev
-        } else {
-            None
-        };
+            };
 
-        if let Some(prev) = prev_canon {
-            let _ = self.flush_rules();
-            let _ = self.flush_state();
-            self.log_rule_learned(
-                &format!("personal_dict:{word_l}"),
-                "case_downgrade_2x",
-                Some(prev),
-            );
-            return true;
-        }
-        if state_changed {
-            let _ = self.flush_state();
-        }
-        false
+            if let Some(prev) = prev_canon {
+                let _ = this.flush_rules();
+                let _ = this.flush_state();
+                this.log_rule_learned(
+                    &format!("personal_dict:{word_l}"),
+                    "case_downgrade_2x",
+                    Some(prev),
+                );
+                return true;
+            }
+            if state_changed {
+                let _ = this.flush_state();
+            }
+            false
+        })
     }
 
     /// Clears any `1x` undo-keep shield and untouched-unknown staging for `word_lower` when the user
@@ -2531,167 +2641,175 @@ impl RuleStore {
     /// Removes `word_lower` from `personal_dict` (used when a user repeatedly corrects or rejects
     /// a mistaken `personal_dict` entry — automatic "un-dictionary").
     pub fn remove_personal_word(&mut self, lang: &LangId, word_lower: &str) -> bool {
-        self.sync_external_edits_before_write();
         let word_l = word_lower.trim().to_lowercase();
-        self.clear_undo_shield(lang, &word_l);
-        let removed = self.remove_personal_word_entry(lang.as_str(), &word_l);
-        if removed {
-            let skey = Self::stat_key_word(lang.as_str(), &word_l);
-            self.state.rule_stats.remove(&skey);
-            self.pending_personal_hits.remove(&skey);
-            let _ = self.flush_rules();
-            let _ = self.flush_state();
-            self.log_rule_learned(
-                &format!("personal_dict:{word_l}"),
-                "personal_demoted_2x",
-                Some(word_l),
-            );
-        }
-        removed
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            this.clear_undo_shield(lang, &word_l);
+            let removed = this.remove_personal_word_entry(lang.as_str(), &word_l);
+            if removed {
+                let skey = Self::stat_key_word(lang.as_str(), &word_l);
+                this.state.rule_stats.remove(&skey);
+                this.pending_personal_hits.remove(&skey);
+                let _ = this.flush_rules();
+                let _ = this.flush_state();
+                this.log_rule_learned(
+                    &format!("personal_dict:{word_l}"),
+                    "personal_demoted_2x",
+                    Some(word_l),
+                );
+            }
+            removed
+        })
     }
 
     /// Permanently adds `typed_lower = fixed` to `[corrections]` (or `[lang.<id>.corrections]`).
     pub fn add_correction(&mut self, lang: &LangId, typed_lower: &str, fixed: &str) {
-        self.sync_external_edits_before_write();
-        let prev_target = if lang.as_str() == "en" {
-            self.compiled
-                .corrections
-                .insert(typed_lower.to_string(), fixed.to_string())
-        } else {
-            self.compiled
-                .lang_corrections
-                .entry(lang.as_str().to_string())
-                .or_default()
-                .insert(typed_lower.to_string(), fixed.to_string())
-        };
-        let superseded = prev_target.as_deref().filter(|old| *old != fixed);
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            let prev_target = if lang.as_str() == "en" {
+                this.compiled
+                    .corrections
+                    .insert(typed_lower.to_string(), fixed.to_string())
+            } else {
+                this.compiled
+                    .lang_corrections
+                    .entry(lang.as_str().to_string())
+                    .or_default()
+                    .insert(typed_lower.to_string(), fixed.to_string())
+            };
+            let superseded = prev_target.as_deref().filter(|old| *old != fixed);
 
-        let mut item_val = Value::from(fixed);
-        if self.compiled.diagnostics.annotate_rules {
-            let comment = self.format_provenance_comment("learned 2x", superseded);
-            item_val.decor_mut().set_suffix(comment);
-        }
+            let mut item_val = Value::from(fixed);
+            if this.compiled.diagnostics.annotate_rules {
+                let comment = this.format_provenance_comment("learned 2x", superseded);
+                item_val.decor_mut().set_suffix(comment);
+            }
 
-        if lang.as_str() == "en" {
-            let tbl = self
-                .doc
-                .entry("corrections")
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap();
-            tbl[typed_lower] = Item::Value(item_val);
-        } else {
-            let lang_root = self
-                .doc
-                .entry("lang")
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap();
-            let sub = lang_root
-                .entry(lang.as_str())
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap();
-            let corr = sub
-                .entry("corrections")
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap();
-            corr[typed_lower] = Item::Value(item_val);
-        }
-        self.upsert_rule_stat_in_memory(
-            Self::stat_key_fix(lang.as_str(), typed_lower),
-            RuleOrigin::ManualFix2x,
-            prev_target.as_deref() != Some(fixed),
-        );
-        let _ = self.flush_rules();
-        let _ = self.flush_state();
+            if lang.as_str() == "en" {
+                let tbl = this
+                    .doc
+                    .entry("corrections")
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                tbl[typed_lower] = Item::Value(item_val);
+            } else {
+                let lang_root = this
+                    .doc
+                    .entry("lang")
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                let sub = lang_root
+                    .entry(lang.as_str())
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                let corr = sub
+                    .entry("corrections")
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                corr[typed_lower] = Item::Value(item_val);
+            }
+            this.upsert_rule_stat_in_memory(
+                Self::stat_key_fix(lang.as_str(), typed_lower),
+                RuleOrigin::ManualFix2x,
+                prev_target.as_deref() != Some(fixed),
+            );
+            let _ = this.flush_rules();
+            let _ = this.flush_state();
 
-        let rule_str = format!("{typed_lower}->{fixed}");
-        if let Some(old) = superseded {
-            self.log_rule_learned(&rule_str, "superseded", Some(old.to_string()));
-        } else if prev_target.is_none() {
-            self.log_rule_learned(&rule_str, "graduated_2x", None);
-        }
+            let rule_str = format!("{typed_lower}->{fixed}");
+            if let Some(old) = superseded {
+                this.log_rule_learned(&rule_str, "superseded", Some(old.to_string()));
+            } else if prev_target.is_none() {
+                this.log_rule_learned(&rule_str, "graduated_2x", None);
+            }
+        });
     }
 
     /// Permanently adds `"prev typed" = "fixed"` to `[context_corrections]`.
     pub fn add_context_correction(&mut self, prev_lower: &str, typed_lower: &str, fixed: &str) {
-        self.sync_external_edits_before_write();
-        let prev_target = self.compiled.context_corrections.insert(
-            (prev_lower.to_string(), typed_lower.to_string()),
-            fixed.to_string(),
-        );
-        let superseded = prev_target.as_deref().filter(|old| *old != fixed);
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            let prev_target = this.compiled.context_corrections.insert(
+                (prev_lower.to_string(), typed_lower.to_string()),
+                fixed.to_string(),
+            );
+            let superseded = prev_target.as_deref().filter(|old| *old != fixed);
 
-        let mut item_val = Value::from(fixed);
-        if self.compiled.diagnostics.annotate_rules {
-            let comment = self.format_provenance_comment("learned 2x", superseded);
-            item_val.decor_mut().set_suffix(comment);
-        }
+            let mut item_val = Value::from(fixed);
+            if this.compiled.diagnostics.annotate_rules {
+                let comment = this.format_provenance_comment("learned 2x", superseded);
+                item_val.decor_mut().set_suffix(comment);
+            }
 
-        let key = format!("{prev_lower} {typed_lower}");
-        let tbl = self
-            .doc
-            .entry("context_corrections")
-            .or_insert(Item::Table(Table::new()))
-            .as_table_mut()
-            .unwrap();
-        tbl[&key] = Item::Value(item_val);
-        self.upsert_rule_stat_in_memory(
-            Self::stat_key_ctx(prev_lower, typed_lower),
-            RuleOrigin::ManualFix2x,
-            prev_target.as_deref() != Some(fixed),
-        );
-        let _ = self.flush_rules();
-        let _ = self.flush_state();
+            let key = format!("{prev_lower} {typed_lower}");
+            let tbl = this
+                .doc
+                .entry("context_corrections")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .unwrap();
+            tbl[&key] = Item::Value(item_val);
+            this.upsert_rule_stat_in_memory(
+                Self::stat_key_ctx(prev_lower, typed_lower),
+                RuleOrigin::ManualFix2x,
+                prev_target.as_deref() != Some(fixed),
+            );
+            let _ = this.flush_rules();
+            let _ = this.flush_state();
 
-        let rule_str = format!("{prev_lower} {typed_lower}->{fixed}");
-        if let Some(old) = superseded {
-            self.log_rule_learned(&rule_str, "superseded", Some(old.to_string()));
-        } else if prev_target.is_none() {
-            self.log_rule_learned(&rule_str, "graduated_2x", None);
-        }
+            let rule_str = format!("{prev_lower} {typed_lower}->{fixed}");
+            if let Some(old) = superseded {
+                this.log_rule_learned(&rule_str, "superseded", Some(old.to_string()));
+            } else if prev_target.is_none() {
+                this.log_rule_learned(&rule_str, "graduated_2x", None);
+            }
+        });
     }
 
-    /// Permanently adds an ASCII word to `telex_passthrough` (for `fcitx5-lotus` bilingual mode).
+    /// Permanently adds an ASCII word to `telex_passthrough`, propagating write errors.
     pub fn add_telex_passthrough(&mut self, raw_ascii_lower: &str) {
         self.add_telex_passthrough_with_origin(raw_ascii_lower, RuleOrigin::ManualFix2x);
     }
 
     pub fn add_telex_passthrough_with_origin(&mut self, raw_ascii_lower: &str, origin: RuleOrigin) {
-        self.sync_external_edits_before_write();
-        let is_new = self
-            .compiled
-            .telex_passthrough
-            .insert(raw_ascii_lower.to_string());
-        if !is_new {
-            if origin == RuleOrigin::Manual {
-                self.upsert_rule_stat_in_memory(
-                    Self::stat_key_pt(raw_ascii_lower),
-                    RuleOrigin::Manual,
-                    false,
-                );
-                let _ = self.flush_state();
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            let is_new = this
+                .compiled
+                .telex_passthrough
+                .insert(raw_ascii_lower.to_string());
+            if !is_new {
+                if origin == RuleOrigin::Manual {
+                    this.upsert_rule_stat_in_memory(
+                        Self::stat_key_pt(raw_ascii_lower),
+                        RuleOrigin::Manual,
+                        false,
+                    );
+                    let _ = this.flush_state();
+                }
+                return;
             }
-            return;
-        }
-        if !self.doc.contains_key("telex_passthrough") {
-            self.doc["telex_passthrough"] = Item::Value(Value::Array(Array::new()));
-        }
-        if let Some(arr) = self.doc["telex_passthrough"].as_array_mut() {
-            arr.push(raw_ascii_lower);
-        }
-        self.upsert_rule_stat_in_memory(Self::stat_key_pt(raw_ascii_lower), origin, true);
-        let _ = self.flush_rules();
-        let _ = self.flush_state();
-        if origin.is_machine_learned() {
-            self.log_rule_learned(
-                &format!("telex_passthrough:{raw_ascii_lower}"),
-                "telex_passthrough_2x",
-                None,
-            );
-        }
+            if !this.doc.contains_key("telex_passthrough") {
+                this.doc["telex_passthrough"] = Item::Value(Value::Array(Array::new()));
+            }
+            if let Some(arr) = this.doc["telex_passthrough"].as_array_mut() {
+                arr.push(raw_ascii_lower);
+            }
+            this.upsert_rule_stat_in_memory(Self::stat_key_pt(raw_ascii_lower), origin, true);
+            let _ = this.flush_rules();
+            let _ = this.flush_state();
+            if origin.is_machine_learned() {
+                this.log_rule_learned(
+                    &format!("telex_passthrough:{raw_ascii_lower}"),
+                    "telex_passthrough_2x",
+                    None,
+                );
+            }
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -2714,71 +2832,73 @@ impl RuleStore {
                 "typed token and replacement must be non-empty",
             ));
         }
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let stat_key = Self::stat_key_fix(lang.as_str(), &typed_lower);
-        let prev_target = if lang.as_str() == "en" {
-            let tbl = self
-                .doc
-                .entry("corrections")
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap();
-            let stale_keys: Vec<String> = tbl
-                .iter()
-                .filter(|(k, _)| *k != typed_lower && k.to_lowercase() == typed_lower)
-                .map(|(k, _)| k.to_string())
-                .collect();
-            for k in stale_keys {
-                tbl.remove(&k);
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
             }
-            tbl[&typed_lower] = toml_edit::value(fixed_trimmed);
-            self.compiled
-                .corrections
-                .insert(typed_lower, fixed_trimmed.to_string())
-        } else {
-            let lang_root = self
-                .doc
-                .entry("lang")
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap();
-            let sub = lang_root
-                .entry(lang.as_str())
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap();
-            let corr = sub
-                .entry("corrections")
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap();
-            let stale_keys: Vec<String> = corr
-                .iter()
-                .filter(|(k, _)| *k != typed_lower && k.to_lowercase() == typed_lower)
-                .map(|(k, _)| k.to_string())
-                .collect();
-            for k in stale_keys {
-                corr.remove(&k);
-            }
-            corr[&typed_lower] = toml_edit::value(fixed_trimmed);
-            self.compiled
-                .lang_corrections
-                .entry(lang.as_str().to_string())
-                .or_default()
-                .insert(typed_lower, fixed_trimmed.to_string())
-        };
-        self.sync_external_state_before_write();
-        self.upsert_rule_stat_in_memory(
-            stat_key,
-            RuleOrigin::Manual,
-            prev_target.as_deref() != Some(fixed_trimmed),
-        );
-        self.flush_rules()?;
-        self.flush_state()?;
-        Ok(prev_target)
+            let stat_key = Self::stat_key_fix(lang.as_str(), &typed_lower);
+            let prev_target = if lang.as_str() == "en" {
+                let tbl = this
+                    .doc
+                    .entry("corrections")
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                let stale_keys: Vec<String> = tbl
+                    .iter()
+                    .filter(|(k, _)| *k != typed_lower && k.to_lowercase() == typed_lower)
+                    .map(|(k, _)| k.to_string())
+                    .collect();
+                for k in stale_keys {
+                    tbl.remove(&k);
+                }
+                tbl[&typed_lower] = toml_edit::value(fixed_trimmed);
+                this.compiled
+                    .corrections
+                    .insert(typed_lower, fixed_trimmed.to_string())
+            } else {
+                let lang_root = this
+                    .doc
+                    .entry("lang")
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                let sub = lang_root
+                    .entry(lang.as_str())
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                let corr = sub
+                    .entry("corrections")
+                    .or_insert(Item::Table(Table::new()))
+                    .as_table_mut()
+                    .unwrap();
+                let stale_keys: Vec<String> = corr
+                    .iter()
+                    .filter(|(k, _)| *k != typed_lower && k.to_lowercase() == typed_lower)
+                    .map(|(k, _)| k.to_string())
+                    .collect();
+                for k in stale_keys {
+                    corr.remove(&k);
+                }
+                corr[&typed_lower] = toml_edit::value(fixed_trimmed);
+                this.compiled
+                    .lang_corrections
+                    .entry(lang.as_str().to_string())
+                    .or_default()
+                    .insert(typed_lower, fixed_trimmed.to_string())
+            };
+            this.sync_external_state_before_write();
+            this.upsert_rule_stat_in_memory(
+                stat_key,
+                RuleOrigin::Manual,
+                prev_target.as_deref() != Some(fixed_trimmed),
+            );
+            this.flush_rules()?;
+            this.flush_state()?;
+            Ok(prev_target)
+        })
     }
 
     fn remove_correction_entry(&mut self, lang_id: &str, typed_lower: &str) -> bool {
@@ -2832,20 +2952,22 @@ impl RuleStore {
                 "typed token must be non-empty",
             ));
         }
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let removed = self.remove_correction_entry(lang.as_str(), &typed_lower);
-        if removed {
-            self.sync_external_state_before_write();
-            self.state
-                .rule_stats
-                .remove(&Self::stat_key_fix(lang.as_str(), &typed_lower));
-            self.flush_rules()?;
-            self.flush_state()?;
-        }
-        Ok(removed)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let removed = this.remove_correction_entry(lang.as_str(), &typed_lower);
+            if removed {
+                this.sync_external_state_before_write();
+                this.state
+                    .rule_stats
+                    .remove(&Self::stat_key_fix(lang.as_str(), &typed_lower));
+                this.flush_rules()?;
+                this.flush_state()?;
+            }
+            Ok(removed)
+        })
     }
 
     /// Inserts or updates `"prev typed" = "fixed"` in `[context_corrections]` without machine provenance comments.
@@ -2869,46 +2991,48 @@ impl RuleStore {
                 "prev, typed, and replacement must be non-empty single words (forprev/typed)",
             ));
         }
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let key = format!("{prev_lower} {typed_lower}");
-        let stat_key = Self::stat_key_ctx(&prev_lower, &typed_lower);
-        let tbl = self
-            .doc
-            .entry("context_corrections")
-            .or_insert(Item::Table(Table::new()))
-            .as_table_mut()
-            .unwrap();
-        let stale_keys: Vec<String> = tbl
-            .iter()
-            .filter_map(|(k, _)| {
-                k.split_once(' ').and_then(|(p, t)| {
-                    (k != key
-                        && p.trim().to_lowercase() == prev_lower
-                        && t.trim().to_lowercase() == typed_lower)
-                        .then(|| k.to_string())
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let key = format!("{prev_lower} {typed_lower}");
+            let stat_key = Self::stat_key_ctx(&prev_lower, &typed_lower);
+            let tbl = this
+                .doc
+                .entry("context_corrections")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .unwrap();
+            let stale_keys: Vec<String> = tbl
+                .iter()
+                .filter_map(|(k, _)| {
+                    k.split_once(' ').and_then(|(p, t)| {
+                        (k != key
+                            && p.trim().to_lowercase() == prev_lower
+                            && t.trim().to_lowercase() == typed_lower)
+                            .then(|| k.to_string())
+                    })
                 })
-            })
-            .collect();
-        for k in stale_keys {
-            tbl.remove(&k);
-        }
-        tbl[&key] = toml_edit::value(fixed_trimmed);
-        let prev_target = self
-            .compiled
-            .context_corrections
-            .insert((prev_lower, typed_lower), fixed_trimmed.to_string());
-        self.sync_external_state_before_write();
-        self.upsert_rule_stat_in_memory(
-            stat_key,
-            RuleOrigin::Manual,
-            prev_target.as_deref() != Some(fixed_trimmed),
-        );
-        self.flush_rules()?;
-        self.flush_state()?;
-        Ok(prev_target)
+                .collect();
+            for k in stale_keys {
+                tbl.remove(&k);
+            }
+            tbl[&key] = toml_edit::value(fixed_trimmed);
+            let prev_target = this
+                .compiled
+                .context_corrections
+                .insert((prev_lower, typed_lower), fixed_trimmed.to_string());
+            this.sync_external_state_before_write();
+            this.upsert_rule_stat_in_memory(
+                stat_key,
+                RuleOrigin::Manual,
+                prev_target.as_deref() != Some(fixed_trimmed),
+            );
+            this.flush_rules()?;
+            this.flush_state()?;
+            Ok(prev_target)
+        })
     }
 
     fn remove_context_correction_entry(&mut self, prev_lower: &str, typed_lower: &str) -> bool {
@@ -2949,20 +3073,22 @@ impl RuleStore {
                 "prev and typed tokens must be non-empty",
             ));
         }
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let removed = self.remove_context_correction_entry(&prev_lower, &typed_lower);
-        if removed {
-            self.sync_external_state_before_write();
-            self.state
-                .rule_stats
-                .remove(&Self::stat_key_ctx(&prev_lower, &typed_lower));
-            self.flush_rules()?;
-            self.flush_state()?;
-        }
-        Ok(removed)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let removed = this.remove_context_correction_entry(&prev_lower, &typed_lower);
+            if removed {
+                this.sync_external_state_before_write();
+                this.state
+                    .rule_stats
+                    .remove(&Self::stat_key_ctx(&prev_lower, &typed_lower));
+                this.flush_rules()?;
+                this.flush_state()?;
+            }
+            Ok(removed)
+        })
     }
 
     /// Inserts or updates a snippet expansion (`trigger = expansion`) in `[snippets]`.
@@ -2974,23 +3100,25 @@ impl RuleStore {
                 "snippet trigger must be a non-empty token without whitespace, and expansion must be non-empty",
             ));
         }
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let tbl = self
-            .doc
-            .entry("snippets")
-            .or_insert(Item::Table(Table::new()))
-            .as_table_mut()
-            .unwrap();
-        tbl[trig] = toml_edit::value(expansion);
-        let prev = self
-            .compiled
-            .snippets
-            .insert(trig.to_string(), expansion.to_string());
-        self.flush_rules()?;
-        Ok(prev)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let tbl = this
+                .doc
+                .entry("snippets")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .unwrap();
+            tbl[trig] = toml_edit::value(expansion);
+            let prev = this
+                .compiled
+                .snippets
+                .insert(trig.to_string(), expansion.to_string());
+            this.flush_rules()?;
+            Ok(prev)
+        })
     }
 
     /// Removes `trigger` from `[snippets]`.
@@ -3002,18 +3130,20 @@ impl RuleStore {
                 "snippet trigger must be non-empty",
             ));
         }
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let removed = self.compiled.snippets.remove(trig).is_some();
-        if let Some(tbl) = self.doc.get_mut("snippets").and_then(Item::as_table_mut) {
-            tbl.remove(trig);
-        }
-        if removed {
-            self.flush_rules()?;
-        }
-        Ok(removed)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let removed = this.compiled.snippets.remove(trig).is_some();
+            if let Some(tbl) = this.doc.get_mut("snippets").and_then(Item::as_table_mut) {
+                tbl.remove(trig);
+            }
+            if removed {
+                this.flush_rules()?;
+            }
+            Ok(removed)
+        })
     }
 
     /// Adds `word` to `personal_dict` (or `[lang.<id>].personal_dict`), returning `Ok(true)` if modified.
@@ -3026,42 +3156,44 @@ impl RuleStore {
                 "personal word must be a non-empty single word",
             ));
         }
-        self.sync_external_edits_before_write();
-        self.sync_external_state_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let already_same = if lang.as_str() == "en" {
-            self.compiled.personal_dict.contains(&word_lower)
-                && self
-                    .compiled
-                    .personal_dict_canonical
-                    .get(&word_lower)
-                    .is_some_and(|c| c == word_trimmed)
-        } else {
-            self.compiled
-                .lang_personal_dict
-                .get(lang.as_str())
-                .is_some_and(|s| s.contains(&word_lower))
-                && self
-                    .compiled
-                    .lang_personal_dict_canonical
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            this.sync_external_state_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let already_same = if lang.as_str() == "en" {
+                this.compiled.personal_dict.contains(&word_lower)
+                    && this
+                        .compiled
+                        .personal_dict_canonical
+                        .get(&word_lower)
+                        .is_some_and(|c| c == word_trimmed)
+            } else {
+                this.compiled
+                    .lang_personal_dict
                     .get(lang.as_str())
-                    .and_then(|m| m.get(&word_lower))
-                    .is_some_and(|c| c == word_trimmed)
-        };
-        if already_same {
-            self.upsert_rule_stat_in_memory(
-                Self::stat_key_word(lang.as_str(), &word_lower),
-                RuleOrigin::Manual,
-                false,
-            );
-            self.flush_state()?;
-            return Ok(false);
-        }
-        self.add_personal_word_with_stage(lang, word_trimmed, "manual_cli");
-        self.flush_rules()?;
-        Ok(true)
+                    .is_some_and(|s| s.contains(&word_lower))
+                    && this
+                        .compiled
+                        .lang_personal_dict_canonical
+                        .get(lang.as_str())
+                        .and_then(|m| m.get(&word_lower))
+                        .is_some_and(|c| c == word_trimmed)
+            };
+            if already_same {
+                this.upsert_rule_stat_in_memory(
+                    Self::stat_key_word(lang.as_str(), &word_lower),
+                    RuleOrigin::Manual,
+                    false,
+                );
+                this.flush_state()?;
+                return Ok(false);
+            }
+            this.add_personal_word_with_stage(lang, word_trimmed, "manual_cli");
+            this.flush_rules()?;
+            Ok(true)
+        })
     }
 
     /// Removes `word` from `personal_dict` (or `[lang.<id>].personal_dict`), propagating write errors.
@@ -3073,16 +3205,18 @@ impl RuleStore {
                 "personal word must be non-empty",
             ));
         }
-        self.sync_external_edits_before_write();
-        self.sync_external_state_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let removed = self.remove_personal_word(lang, &word_l);
-        if removed {
-            self.flush_rules()?;
-        }
-        Ok(removed)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            this.sync_external_state_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let removed = this.remove_personal_word(lang, &word_l);
+            if removed {
+                this.flush_rules()?;
+            }
+            Ok(removed)
+        })
     }
 
     /// Adds `(typed, rejected)` to `blocklist`, propagating write errors.
@@ -3095,19 +3229,21 @@ impl RuleStore {
                 "typed and rejected words must be non-empty",
             ));
         }
-        self.sync_external_edits_before_write();
-        self.sync_external_state_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let already = self
-            .compiled
-            .blocklist
-            .contains(&(typed_l.clone(), rejected_l.clone()));
-        self.add_permanent_block_with_origin(&typed_l, &rejected_l, RuleOrigin::Manual);
-        self.flush_rules()?;
-        self.flush_state()?;
-        Ok(!already)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            this.sync_external_state_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let already = this
+                .compiled
+                .blocklist
+                .contains(&(typed_l.clone(), rejected_l.clone()));
+            this.add_permanent_block_with_origin(&typed_l, &rejected_l, RuleOrigin::Manual);
+            this.flush_rules()?;
+            this.flush_state()?;
+            Ok(!already)
+        })
     }
 
     fn remove_blocklist_pair_entry(&mut self, typed_l: &str, rejected_l: &str) -> bool {
@@ -3165,19 +3301,21 @@ impl RuleStore {
                 "typed and rejected words must be non-empty",
             ));
         }
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let removed = self.remove_blocklist_pair_entry(&typed_l, &rejected_l);
-        if removed {
-            self.state
-                .rule_stats
-                .remove(&Self::stat_key_block(&typed_l, &rejected_l));
-            self.flush_rules()?;
-            self.flush_state()?;
-        }
-        Ok(removed)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let removed = this.remove_blocklist_pair_entry(&typed_l, &rejected_l);
+            if removed {
+                this.state
+                    .rule_stats
+                    .remove(&Self::stat_key_block(&typed_l, &rejected_l));
+                this.flush_rules()?;
+                this.flush_state()?;
+            }
+            Ok(removed)
+        })
     }
 
     /// True when `word` is pinned: its curated capitalization always applies.
@@ -3195,21 +3333,23 @@ impl RuleStore {
                 "pinned entry must be a single non-empty word",
             ));
         }
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        if !self.compiled.pinned.insert(word_l.clone()) {
-            return Ok(false);
-        }
-        if !self.doc.contains_key("pinned") {
-            self.doc["pinned"] = Item::Value(Value::Array(Array::new()));
-        }
-        if let Some(arr) = self.doc["pinned"].as_array_mut() {
-            arr.push(word_l.as_str());
-        }
-        self.flush_rules()?;
-        Ok(true)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            if !this.compiled.pinned.insert(word_l.clone()) {
+                return Ok(false);
+            }
+            if !this.doc.contains_key("pinned") {
+                this.doc["pinned"] = Item::Value(Value::Array(Array::new()));
+            }
+            if let Some(arr) = this.doc["pinned"].as_array_mut() {
+                arr.push(word_l.as_str());
+            }
+            this.flush_rules()?;
+            Ok(true)
+        })
     }
 
     /// Removes `word` from `pinned`.
@@ -3221,21 +3361,23 @@ impl RuleStore {
                 "pinned entry must be non-empty",
             ));
         }
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let removed = self.compiled.pinned.remove(&word_l);
-        if let Some(arr) = self.doc.get_mut("pinned").and_then(Item::as_array_mut) {
-            arr.retain(|v| {
-                !v.as_str()
-                    .is_some_and(|s| s.trim().to_lowercase() == word_l)
-            });
-        }
-        if removed {
-            self.flush_rules()?;
-        }
-        Ok(removed)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let removed = this.compiled.pinned.remove(&word_l);
+            if let Some(arr) = this.doc.get_mut("pinned").and_then(Item::as_array_mut) {
+                arr.retain(|v| {
+                    !v.as_str()
+                        .is_some_and(|s| s.trim().to_lowercase() == word_l)
+                });
+            }
+            if removed {
+                this.flush_rules()?;
+            }
+            Ok(removed)
+        })
     }
 
     /// Adds an ASCII word to `telex_passthrough`, propagating write errors.
@@ -3247,18 +3389,20 @@ impl RuleStore {
                 "telex_passthrough entry must be a non-empty ASCII word",
             ));
         }
-        self.sync_external_edits_before_write();
-        self.sync_external_state_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let is_new = !self.compiled.telex_passthrough.contains(&word_l);
-        self.add_telex_passthrough_with_origin(&word_l, RuleOrigin::Manual);
-        if is_new {
-            self.flush_rules()?;
-        }
-        self.flush_state()?;
-        Ok(is_new)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            this.sync_external_state_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let is_new = !this.compiled.telex_passthrough.contains(&word_l);
+            this.add_telex_passthrough_with_origin(&word_l, RuleOrigin::Manual);
+            if is_new {
+                this.flush_rules()?;
+            }
+            this.flush_state()?;
+            Ok(is_new)
+        })
     }
 
     fn remove_telex_passthrough_entry(&mut self, word_l: &str) -> bool {
@@ -3282,18 +3426,20 @@ impl RuleStore {
                 "telex_passthrough entry must be non-empty",
             ));
         }
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-        let removed = self.remove_telex_passthrough_entry(&word_l);
-        if removed {
-            self.sync_external_state_before_write();
-            self.state.rule_stats.remove(&Self::stat_key_pt(&word_l));
-            self.flush_rules()?;
-            self.flush_state()?;
-        }
-        Ok(removed)
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
+            let removed = this.remove_telex_passthrough_entry(&word_l);
+            if removed {
+                this.sync_external_state_before_write();
+                this.state.rule_stats.remove(&Self::stat_key_pt(&word_l));
+                this.flush_rules()?;
+                this.flush_state()?;
+            }
+            Ok(removed)
+        })
     }
 
     fn remove_app_from_doc_bucket(
@@ -3328,81 +3474,83 @@ impl RuleStore {
             ));
         }
 
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-
-        const ALL_PROFILES: [AppProfile; 4] = [
-            AppProfile::Bypass,
-            AppProfile::Browser,
-            AppProfile::Chat,
-            AppProfile::Prose,
-        ];
-        let in_target = self
-            .compiled
-            .app_profiles
-            .bucket(profile)
-            .contains(&app_norm);
-        let in_other = ALL_PROFILES
-            .iter()
-            .any(|&p| p != profile && self.compiled.app_profiles.bucket(p).contains(&app_norm));
-        if in_target && !in_other {
-            return Ok(false);
-        }
-
-        if let Some(existing) = self.doc.get("app_profiles") {
-            if !existing.is_table() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "[app_profiles] in rules.toml is not a table",
-                ));
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
             }
-        }
 
-        let apps_tbl = self
-            .doc
-            .entry("app_profiles")
-            .or_insert(Item::Table(Table::new()))
-            .as_table_mut()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "[app_profiles] in rules.toml is not a table",
-                )
-            })?;
-
-        for &other in &ALL_PROFILES {
-            Self::remove_app_from_doc_bucket(apps_tbl, other, &app_norm);
-            if other != profile {
-                self.compiled
-                    .app_profiles
-                    .bucket_mut(other)
-                    .remove(&app_norm);
+            const ALL_PROFILES: [AppProfile; 4] = [
+                AppProfile::Bypass,
+                AppProfile::Browser,
+                AppProfile::Chat,
+                AppProfile::Prose,
+            ];
+            let in_target = this
+                .compiled
+                .app_profiles
+                .bucket(profile)
+                .contains(&app_norm);
+            let in_other = ALL_PROFILES
+                .iter()
+                .any(|&p| p != profile && this.compiled.app_profiles.bucket(p).contains(&app_norm));
+            if in_target && !in_other {
+                return Ok(false);
             }
-        }
 
-        let target_key = app_profile_key(profile);
-        if !apps_tbl.contains_key(target_key) {
-            apps_tbl.insert(target_key, Item::Value(Value::Array(Array::new())));
-        }
-        let arr = apps_tbl
-            .get_mut(target_key)
-            .and_then(Item::as_array_mut)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("[app_profiles].{target_key} in rules.toml is not an array"),
-                )
-            })?;
-        arr.push(app_norm.as_str());
-        self.compiled
-            .app_profiles
-            .bucket_mut(profile)
-            .insert(app_norm);
+            if let Some(existing) = this.doc.get("app_profiles") {
+                if !existing.is_table() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "[app_profiles] in rules.toml is not a table",
+                    ));
+                }
+            }
 
-        self.flush_rules()?;
-        Ok(true)
+            let apps_tbl = this
+                .doc
+                .entry("app_profiles")
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "[app_profiles] in rules.toml is not a table",
+                    )
+                })?;
+
+            for &other in &ALL_PROFILES {
+                Self::remove_app_from_doc_bucket(apps_tbl, other, &app_norm);
+                if other != profile {
+                    this.compiled
+                        .app_profiles
+                        .bucket_mut(other)
+                        .remove(&app_norm);
+                }
+            }
+
+            let target_key = app_profile_key(profile);
+            if !apps_tbl.contains_key(target_key) {
+                apps_tbl.insert(target_key, Item::Value(Value::Array(Array::new())));
+            }
+            let arr = apps_tbl
+                .get_mut(target_key)
+                .and_then(Item::as_array_mut)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("[app_profiles].{target_key} in rules.toml is not an array"),
+                    )
+                })?;
+            arr.push(app_norm.as_str());
+            this.compiled
+                .app_profiles
+                .bucket_mut(profile)
+                .insert(app_norm);
+
+            this.flush_rules()?;
+            Ok(true)
+        })
     }
 
     /// Removes a program ID override from `[app_profiles]` (either a specific bucket or all buckets
@@ -3420,47 +3568,49 @@ impl RuleStore {
             ));
         }
 
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
-
-        let targets: Vec<AppProfile> = match profile {
-            Some(p) => vec![p],
-            None => vec![
-                AppProfile::Bypass,
-                AppProfile::Browser,
-                AppProfile::Chat,
-                AppProfile::Prose,
-            ],
-        };
-
-        let mut removed = false;
-        for &target in &targets {
-            if self
-                .compiled
-                .app_profiles
-                .bucket_mut(target)
-                .remove(&app_norm)
-            {
-                removed = true;
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
             }
-        }
-        if let Some(apps_tbl) = self
-            .doc
-            .get_mut("app_profiles")
-            .and_then(Item::as_table_mut)
-        {
+
+            let targets: Vec<AppProfile> = match profile {
+                Some(p) => vec![p],
+                None => vec![
+                    AppProfile::Bypass,
+                    AppProfile::Browser,
+                    AppProfile::Chat,
+                    AppProfile::Prose,
+                ],
+            };
+
+            let mut removed = false;
             for &target in &targets {
-                if Self::remove_app_from_doc_bucket(apps_tbl, target, &app_norm) {
+                if this
+                    .compiled
+                    .app_profiles
+                    .bucket_mut(target)
+                    .remove(&app_norm)
+                {
                     removed = true;
                 }
             }
-        }
-        if removed {
-            self.flush_rules()?;
-        }
-        Ok(removed)
+            if let Some(apps_tbl) = this
+                .doc
+                .get_mut("app_profiles")
+                .and_then(Item::as_table_mut)
+            {
+                for &target in &targets {
+                    if Self::remove_app_from_doc_bucket(apps_tbl, target, &app_norm) {
+                        removed = true;
+                    }
+                }
+            }
+            if removed {
+                this.flush_rules()?;
+            }
+            Ok(removed)
+        })
     }
 
     /// Inspects or removes stale rules matching age, hit count, kind, and origin filters.
@@ -3474,191 +3624,193 @@ impl RuleStore {
             Passthrough(String),
         }
 
-        self.sync_external_edits_before_write();
-        self.sync_external_state_before_write();
-        if !opts.dry_run && self.parse_locked {
-            self.flush_rules()?;
-        }
-
-        let mut pool: Vec<(PruneTarget, String, &'static str, String)> = Vec::new();
-        if opts.kinds.fix {
-            for (typed, fixed) in &self.compiled.corrections {
-                pool.push((
-                    PruneTarget::Correction {
-                        lang: "en".to_string(),
-                        typed: typed.clone(),
-                    },
-                    Self::stat_key_fix("en", typed),
-                    "fix",
-                    format!("{typed} -> {fixed}"),
-                ));
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            this.sync_external_state_before_write();
+            if !opts.dry_run && this.parse_locked {
+                this.flush_rules()?;
             }
-            for (lang, map) in &self.compiled.lang_corrections {
-                for (typed, fixed) in map {
-                    let display = if lang == "en" {
-                        format!("{typed} -> {fixed}")
-                    } else {
-                        format!("[{lang}] {typed} -> {fixed}")
-                    };
+
+            let mut pool: Vec<(PruneTarget, String, &'static str, String)> = Vec::new();
+            if opts.kinds.fix {
+                for (typed, fixed) in &this.compiled.corrections {
                     pool.push((
                         PruneTarget::Correction {
-                            lang: lang.clone(),
+                            lang: "en".to_string(),
                             typed: typed.clone(),
                         },
-                        Self::stat_key_fix(lang, typed),
+                        Self::stat_key_fix("en", typed),
                         "fix",
-                        display,
+                        format!("{typed} -> {fixed}"),
+                    ));
+                }
+                for (lang, map) in &this.compiled.lang_corrections {
+                    for (typed, fixed) in map {
+                        let display = if lang == "en" {
+                            format!("{typed} -> {fixed}")
+                        } else {
+                            format!("[{lang}] {typed} -> {fixed}")
+                        };
+                        pool.push((
+                            PruneTarget::Correction {
+                                lang: lang.clone(),
+                                typed: typed.clone(),
+                            },
+                            Self::stat_key_fix(lang, typed),
+                            "fix",
+                            display,
+                        ));
+                    }
+                }
+            }
+            if opts.kinds.context {
+                for ((prev, typed), fixed) in &this.compiled.context_corrections {
+                    pool.push((
+                        PruneTarget::Context {
+                            prev: prev.clone(),
+                            typed: typed.clone(),
+                        },
+                        Self::stat_key_ctx(prev, typed),
+                        "context",
+                        format!("{prev} {typed} -> {fixed}"),
                     ));
                 }
             }
-        }
-        if opts.kinds.context {
-            for ((prev, typed), fixed) in &self.compiled.context_corrections {
-                pool.push((
-                    PruneTarget::Context {
-                        prev: prev.clone(),
-                        typed: typed.clone(),
-                    },
-                    Self::stat_key_ctx(prev, typed),
-                    "context",
-                    format!("{prev} {typed} -> {fixed}"),
-                ));
-            }
-        }
-        if opts.kinds.word {
-            for w in &self.compiled.personal_dict {
-                if self.compiled.pinned.contains(w) {
-                    continue;
-                }
-                let canon = self
-                    .compiled
-                    .personal_dict_canonical
-                    .get(w)
-                    .map(String::as_str)
-                    .unwrap_or(w);
-                pool.push((
-                    PruneTarget::Word {
-                        lang: "en".to_string(),
-                        word: w.clone(),
-                    },
-                    Self::stat_key_word("en", w),
-                    "word",
-                    canon.to_string(),
-                ));
-            }
-            for (lang, set) in &self.compiled.lang_personal_dict {
-                if lang == "en" {
-                    continue;
-                }
-                let canon_map = self.compiled.lang_personal_dict_canonical.get(lang);
-                for w in set {
-                    let canon = canon_map
-                        .and_then(|m| m.get(w))
+            if opts.kinds.word {
+                for w in &this.compiled.personal_dict {
+                    if this.compiled.pinned.contains(w) {
+                        continue;
+                    }
+                    let canon = this
+                        .compiled
+                        .personal_dict_canonical
+                        .get(w)
                         .map(String::as_str)
                         .unwrap_or(w);
                     pool.push((
                         PruneTarget::Word {
-                            lang: lang.clone(),
+                            lang: "en".to_string(),
                             word: w.clone(),
                         },
-                        Self::stat_key_word(lang, w),
+                        Self::stat_key_word("en", w),
                         "word",
-                        format!("[{lang}] {canon}"),
+                        canon.to_string(),
+                    ));
+                }
+                for (lang, set) in &this.compiled.lang_personal_dict {
+                    if lang == "en" {
+                        continue;
+                    }
+                    let canon_map = this.compiled.lang_personal_dict_canonical.get(lang);
+                    for w in set {
+                        let canon = canon_map
+                            .and_then(|m| m.get(w))
+                            .map(String::as_str)
+                            .unwrap_or(w);
+                        pool.push((
+                            PruneTarget::Word {
+                                lang: lang.clone(),
+                                word: w.clone(),
+                            },
+                            Self::stat_key_word(lang, w),
+                            "word",
+                            format!("[{lang}] {canon}"),
+                        ));
+                    }
+                }
+            }
+            if opts.kinds.block {
+                for (typed, rejected) in &this.compiled.blocklist {
+                    pool.push((
+                        PruneTarget::Block {
+                            typed: typed.clone(),
+                            rejected: rejected.clone(),
+                        },
+                        Self::stat_key_block(typed, rejected),
+                        "block",
+                        format!("{typed} !-> {rejected}"),
                     ));
                 }
             }
-        }
-        if opts.kinds.block {
-            for (typed, rejected) in &self.compiled.blocklist {
-                pool.push((
-                    PruneTarget::Block {
-                        typed: typed.clone(),
-                        rejected: rejected.clone(),
-                    },
-                    Self::stat_key_block(typed, rejected),
-                    "block",
-                    format!("{typed} !-> {rejected}"),
-                ));
-            }
-        }
-        if opts.kinds.passthrough {
-            for w in &self.compiled.telex_passthrough {
-                pool.push((
-                    PruneTarget::Passthrough(w.clone()),
-                    Self::stat_key_pt(w),
-                    "passthrough",
-                    w.clone(),
-                ));
-            }
-        }
-
-        let mut skipped_untracked = 0usize;
-        let mut matched = Vec::new();
-        let mut to_remove: Vec<(PruneTarget, String)> = Vec::new();
-
-        for (target, key, kind_label, display) in pool {
-            let (tier, stat, effective_hits, _strikes) = self.classify_rule_confidence(&key);
-            let Some(s) = stat else {
-                skipped_untracked += 1;
-                continue;
-            };
-            if !opts.include_manual && s.origin == RuleOrigin::Manual {
-                continue;
-            }
-            let ref_ms = s.last_hit_epoch_ms.unwrap_or(s.created_epoch_ms);
-            if effective_hits <= opts.max_hits
-                && now_ms.saturating_sub(ref_ms) >= opts.older_than_ms
-            {
-                matched.push(PruneCandidate {
-                    kind: kind_label.to_string(),
-                    key: key.clone(),
-                    display,
-                    tier,
-                    origin: s.origin,
-                    created_epoch_ms: s.created_epoch_ms,
-                    last_hit_epoch_ms: s.last_hit_epoch_ms,
-                    hits: effective_hits,
-                });
-                to_remove.push((target, key));
-            }
-        }
-
-        let mut removed_count = 0usize;
-        if !opts.dry_run && !to_remove.is_empty() {
-            for (target, key) in to_remove {
-                let did_remove = match target {
-                    PruneTarget::Correction { lang, typed } => {
-                        self.remove_correction_entry(&lang, &typed)
-                    }
-                    PruneTarget::Context { prev, typed } => {
-                        self.remove_context_correction_entry(&prev, &typed)
-                    }
-                    PruneTarget::Word { lang, word } => {
-                        self.clear_undo_shield(&LangId(lang.clone()), &word);
-                        self.remove_personal_word_entry(&lang, &word)
-                    }
-                    PruneTarget::Block { typed, rejected } => {
-                        self.remove_blocklist_pair_entry(&typed, &rejected)
-                    }
-                    PruneTarget::Passthrough(w) => self.remove_telex_passthrough_entry(&w),
-                };
-                if did_remove {
-                    removed_count += 1;
+            if opts.kinds.passthrough {
+                for w in &this.compiled.telex_passthrough {
+                    pool.push((
+                        PruneTarget::Passthrough(w.clone()),
+                        Self::stat_key_pt(w),
+                        "passthrough",
+                        w.clone(),
+                    ));
                 }
-                self.state.rule_stats.remove(&key);
-                self.pending_personal_hits.remove(&key);
             }
-            if removed_count > 0 {
-                self.flush_rules()?;
-            }
-            self.flush_state()?;
-        }
 
-        Ok(PruneReport {
-            matched,
-            removed_count,
-            skipped_untracked,
-            dry_run: opts.dry_run,
+            let mut skipped_untracked = 0usize;
+            let mut matched = Vec::new();
+            let mut to_remove: Vec<(PruneTarget, String)> = Vec::new();
+
+            for (target, key, kind_label, display) in pool {
+                let (tier, stat, effective_hits, _strikes) = this.classify_rule_confidence(&key);
+                let Some(s) = stat else {
+                    skipped_untracked += 1;
+                    continue;
+                };
+                if !opts.include_manual && s.origin == RuleOrigin::Manual {
+                    continue;
+                }
+                let ref_ms = s.last_hit_epoch_ms.unwrap_or(s.created_epoch_ms);
+                if effective_hits <= opts.max_hits
+                    && now_ms.saturating_sub(ref_ms) >= opts.older_than_ms
+                {
+                    matched.push(PruneCandidate {
+                        kind: kind_label.to_string(),
+                        key: key.clone(),
+                        display,
+                        tier,
+                        origin: s.origin,
+                        created_epoch_ms: s.created_epoch_ms,
+                        last_hit_epoch_ms: s.last_hit_epoch_ms,
+                        hits: effective_hits,
+                    });
+                    to_remove.push((target, key));
+                }
+            }
+
+            let mut removed_count = 0usize;
+            if !opts.dry_run && !to_remove.is_empty() {
+                for (target, key) in to_remove {
+                    let did_remove = match target {
+                        PruneTarget::Correction { lang, typed } => {
+                            this.remove_correction_entry(&lang, &typed)
+                        }
+                        PruneTarget::Context { prev, typed } => {
+                            this.remove_context_correction_entry(&prev, &typed)
+                        }
+                        PruneTarget::Word { lang, word } => {
+                            this.clear_undo_shield(&LangId(lang.clone()), &word);
+                            this.remove_personal_word_entry(&lang, &word)
+                        }
+                        PruneTarget::Block { typed, rejected } => {
+                            this.remove_blocklist_pair_entry(&typed, &rejected)
+                        }
+                        PruneTarget::Passthrough(w) => this.remove_telex_passthrough_entry(&w),
+                    };
+                    if did_remove {
+                        removed_count += 1;
+                    }
+                    this.state.rule_stats.remove(&key);
+                    this.pending_personal_hits.remove(&key);
+                }
+                if removed_count > 0 {
+                    this.flush_rules()?;
+                }
+                this.flush_state()?;
+            }
+
+            Ok(PruneReport {
+                matched,
+                removed_count,
+                skipped_untracked,
+                dry_run: opts.dry_run,
+            })
         })
     }
 
@@ -3994,65 +4146,67 @@ impl RuleStore {
             _ => unreachable!(),
         };
 
-        self.sync_external_edits_before_write();
-        if self.parse_locked {
-            self.flush_rules()?;
-        }
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            if this.parse_locked {
+                this.flush_rules()?;
+            }
 
-        match patch {
-            TomlPatch::Bool(sec, k, b) => {
-                let tbl = self
-                    .doc
-                    .entry(sec)
-                    .or_insert(Item::Table(Table::new()))
-                    .as_table_mut()
-                    .unwrap();
-                if sec == "settings" && k == "fix_shift_slips" {
-                    tbl.remove("fix_double_cap");
+            match patch {
+                TomlPatch::Bool(sec, k, b) => {
+                    let tbl = this
+                        .doc
+                        .entry(sec)
+                        .or_insert(Item::Table(Table::new()))
+                        .as_table_mut()
+                        .unwrap();
+                    if sec == "settings" && k == "fix_shift_slips" {
+                        tbl.remove("fix_double_cap");
+                    }
+                    if sec == "plugins" && k == "vi_lotus" {
+                        tbl.remove("vi-lotus");
+                    }
+                    tbl[k] = toml_edit::value(b);
                 }
-                if sec == "plugins" && k == "vi_lotus" {
-                    tbl.remove("vi-lotus");
+                TomlPatch::Int(sec, k, n) => {
+                    let tbl = this
+                        .doc
+                        .entry(sec)
+                        .or_insert(Item::Table(Table::new()))
+                        .as_table_mut()
+                        .unwrap();
+                    tbl[k] = toml_edit::value(n);
                 }
-                tbl[k] = toml_edit::value(b);
-            }
-            TomlPatch::Int(sec, k, n) => {
-                let tbl = self
-                    .doc
-                    .entry(sec)
-                    .or_insert(Item::Table(Table::new()))
-                    .as_table_mut()
-                    .unwrap();
-                tbl[k] = toml_edit::value(n);
-            }
-            TomlPatch::Float(sec, k, f) => {
-                let tbl = self
-                    .doc
-                    .entry(sec)
-                    .or_insert(Item::Table(Table::new()))
-                    .as_table_mut()
-                    .unwrap();
-                tbl[k] = toml_edit::value(f);
-            }
-            TomlPatch::Str(sec, k, s) => {
-                let tbl = self
-                    .doc
-                    .entry(sec)
-                    .or_insert(Item::Table(Table::new()))
-                    .as_table_mut()
-                    .unwrap();
-                tbl[k] = toml_edit::value(s);
-            }
-            TomlPatch::RemoveKey(sec, k) => {
-                if let Some(tbl) = self.doc.get_mut(sec).and_then(Item::as_table_mut) {
-                    tbl.remove(k);
+                TomlPatch::Float(sec, k, f) => {
+                    let tbl = this
+                        .doc
+                        .entry(sec)
+                        .or_insert(Item::Table(Table::new()))
+                        .as_table_mut()
+                        .unwrap();
+                    tbl[k] = toml_edit::value(f);
+                }
+                TomlPatch::Str(sec, k, s) => {
+                    let tbl = this
+                        .doc
+                        .entry(sec)
+                        .or_insert(Item::Table(Table::new()))
+                        .as_table_mut()
+                        .unwrap();
+                    tbl[k] = toml_edit::value(s);
+                }
+                TomlPatch::RemoveKey(sec, k) => {
+                    if let Some(tbl) = this.doc.get_mut(sec).and_then(Item::as_table_mut) {
+                        tbl.remove(k);
+                    }
                 }
             }
-        }
 
-        self.compiled = Self::extract_compiled(&self.doc);
-        self.flush_rules()?;
-        let effective = self.get_setting(canon).unwrap_or_default();
-        Ok((canon, effective))
+            this.compiled = Self::extract_compiled(&this.doc);
+            this.flush_rules()?;
+            let effective = this.get_setting(canon).unwrap_or_default();
+            Ok((canon, effective))
+        })
     }
 
     fn extract_compiled(doc: &DocumentMut) -> CompiledRules {
@@ -4916,6 +5070,124 @@ fomr = \"from\"
             RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
                 .unwrap();
         assert_eq!(reloaded.compiled().undo_mode, UndoMode::Off);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_store_writers_preserve_all_updates_under_file_lock() {
+        let dir = temp_store_dir("concurrent_file_lock");
+        let rules_path = dir.join("rules.toml");
+        let state_path = dir.join("learner_state.json");
+
+        let mut handles = Vec::new();
+        for tid in 0..2 {
+            let rp = rules_path.clone();
+            let sp = state_path.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut store = RuleStore::load_or_init(rp, sp, Preset::Balanced).unwrap();
+                for i in 0..15 {
+                    let word = format!("CustomWord{tid}_{i}");
+                    store.add_user_personal_word(&LangId::en(), &word).unwrap();
+                    let typed = format!("t{tid}_{i}");
+                    let fixed = format!("f{tid}_{i}");
+                    store
+                        .set_user_correction(&LangId::en(), &typed, &fixed)
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let reloaded =
+            RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
+                .unwrap();
+        for tid in 0..2 {
+            for i in 0..15 {
+                let word = format!("customword{tid}_{i}");
+                assert!(
+                    reloaded.compiled().personal_dict.contains(&word),
+                    "missing concurrent personal word {word}"
+                );
+                let typed = format!("t{tid}_{i}");
+                assert_eq!(
+                    reloaded.compiled().corrections.get(&typed).map(String::as_str),
+                    Some(format!("f{tid}_{i}").as_str()),
+                    "missing concurrent correction {typed}"
+                );
+                assert!(
+                    reloaded
+                        .state()
+                        .rule_stats
+                        .contains_key(&RuleStore::stat_key_fix("en", &typed)),
+                    "missing concurrent rule_stats for {typed}"
+                );
+            }
+        }
+
+        for entry in fs::read_dir(&dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(!name.contains(".tmp."), "leftover tmp file: {name}");
+            assert!(!name.contains(".corrupt-"), "unexpected corrupt file: {name}");
+        }
+        assert!(dir.join(".smartkey.lock").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dismiss_staged_entry_removes_each_queue_and_persists() {
+        let dir = temp_store_dir("dismiss_staged");
+        let rules_path = dir.join("rules.toml");
+        let state_path = dir.join("learner_state.json");
+
+        {
+            let mut store =
+                RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
+                    .unwrap();
+            let st = store.state_mut();
+            st.staged_corrections
+                .insert("en:teh->the".to_string(), 1);
+            st.staged_corrections
+                .insert("case:en:github".to_string(), 1);
+            st.staged_context
+                .insert("over|ther->there".to_string(), 1);
+            st.untouched_unknowns
+                .insert("en:hyprland".to_string(), 2);
+            st.staged_personal_canonical
+                .insert("en:hyprland".to_string(), "Hyprland".to_string());
+            st.staged_telex_passthrough.insert("aur".to_string(), 1);
+            store.flush_state().unwrap();
+
+            assert!(store.dismiss_staged_entry("fix", "en:teh->the").unwrap());
+            assert!(store
+                .dismiss_staged_entry("case_fix", "case:en:github")
+                .unwrap());
+            assert!(store
+                .dismiss_staged_entry("context", "over|ther->there")
+                .unwrap());
+            assert!(store
+                .dismiss_staged_entry("untouched_word", "en:hyprland")
+                .unwrap());
+            assert!(store
+                .dismiss_staged_entry("telex_passthrough", "aur")
+                .unwrap());
+            assert!(!store.dismiss_staged_entry("fix", "missing").unwrap());
+            assert!(!store.dismiss_staged_entry("unknown_queue", "k").unwrap());
+        }
+
+        let reloaded =
+            RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
+                .unwrap();
+        let st = reloaded.state();
+        assert!(st.staged_corrections.is_empty());
+        assert!(st.staged_context.is_empty());
+        assert!(st.untouched_unknowns.is_empty());
+        assert!(st.staged_personal_canonical.is_empty());
+        assert!(st.staged_telex_passthrough.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
