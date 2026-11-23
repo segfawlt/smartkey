@@ -1369,6 +1369,7 @@ impl SmartKeySession {
         events
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_restored_non_snippet(
         engine: &mut SmartKeyEngine,
         lang: &LangId,
