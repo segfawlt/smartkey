@@ -68,7 +68,7 @@ if [ "${USE_CONTAINER}" -eq 1 ]; then
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq
             apt-get install -y -qq --no-install-recommends \
-                build-essential cmake pkg-config libfcitx5core-dev libfcitx5utils-dev \
+                build-essential cmake pkg-config libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev \
                 curl ca-certificates git zstd file binutils
             if ! command -v cargo >/dev/null 2>&1; then
                 curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -161,10 +161,13 @@ Library=\${LIB_DIR}/libsmartkey
 Category=Module
 Version=${PKGVER}
 OnDemand=False
-Configurable=False
+Configurable=True
 
 [Addon/Dependencies]
 0=core:5.0.20
+
+[Addon/OptionalDependencies]
+0=notifications
 CONF_EOF
 
 echo "Installed fcitx5-smartkey ${PKGVER} (portable):"

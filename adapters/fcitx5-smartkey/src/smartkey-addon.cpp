@@ -240,6 +240,8 @@ struct ScopedSelfCommit {
 SmartKeyAddon::SmartKeyAddon(Instance *instance)
     : instance_(instance),
       factory_([](InputContext &) { return new SmartKeyState(); }) {
+    readAsIni(config_, "conf/smartkey.conf");
+
     const auto cfgDir = resolveConfigDir();
     const auto rulesPath = (cfgDir / "rules.toml").string();
     const auto statePath = (cfgDir / "learner_state.json").string();
@@ -336,7 +338,13 @@ SmartKeyAddon::~SmartKeyAddon() {
     }
 }
 
+void SmartKeyAddon::setConfig(const RawConfig &config) {
+    config_.load(config, true);
+    safeSaveAsIni(config_, "conf/smartkey.conf");
+}
+
 void SmartKeyAddon::reloadConfig() {
+    readAsIni(config_, "conf/smartkey.conf");
     trace_.closeIfOpen();
     if (engine_ == nullptr || instance_ == nullptr) {
         return;
@@ -361,7 +369,27 @@ void SmartKeyAddon::reloadConfig() {
     }
 }
 
-void SmartKeyAddon::save() { reloadConfig(); }
+void SmartKeyAddon::save() {}
+
+void SmartKeyAddon::showToggleTip(bool enabled, bool ok) {
+    if (instance_ == nullptr) {
+        return;
+    }
+    auto *notif = instance_->addonManager().addon("notifications", true);
+    if (notif == nullptr) {
+        return;
+    }
+    const std::string body = !ok
+        ? "Cannot toggle SmartKey (rules.toml has syntax errors)"
+        : (enabled ? "SmartKey Autocorrect: Enabled"
+                   : "SmartKey Autocorrect: Disabled");
+    notif->callWithSignature<void(const std::string &, const std::string &,
+                                  const std::string &, const std::string &,
+                                  const std::string &, int32_t)>(
+        "Notifications::showTip", std::string("smartkey-toggle"),
+        std::string("SmartKey"), std::string("input-keyboard"),
+        std::string("SmartKey"), body, 1500);
+}
 
 bool SmartKeyAddon::isTraceActive() {
     const bool active =
@@ -926,6 +954,25 @@ void SmartKeyAddon::applyReplaceAction(InputContext *ic, SmartKeyState *state,
 
 void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
     if (engine_ == nullptr || keyEvent.isRelease()) {
+        return;
+    }
+
+    if (!config_.toggleKey->empty() &&
+        keyEvent.key().checkKeyList(*config_.toggleKey)) {
+        keyEvent.filterAndAccept();
+        bool newEnabled = false;
+        const bool ok = smartkey_engine_toggle_enabled(engine_, &newEnabled);
+        if (ok && instance_ != nullptr) {
+            instance_->inputContextManager().foreach([this](InputContext *ctx) {
+                resetContext(ctx);
+                return true;
+            });
+        }
+        if (!ok) {
+            FCITX_WARN() << "SmartKey toggle hotkey failed (rules.toml may be "
+                            "write-locked)";
+        }
+        showToggleTip(newEnabled, ok);
         return;
     }
 

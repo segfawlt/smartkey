@@ -269,6 +269,44 @@ pub unsafe extern "C" fn smartkey_engine_reload_dicts(engine: *mut SmartKeyEngin
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_is_enabled(engine: *const SmartKeyEngineHandle) -> bool {
+    with_engine_ref(engine, false, |eng| eng.store().compiled().enabled)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_set_enabled(
+    engine: *mut SmartKeyEngineHandle,
+    enabled: bool,
+) -> bool {
+    with_engine_mut(engine, false, |eng| eng.store_mut().set_enabled(enabled).is_ok())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_toggle_enabled(
+    engine: *mut SmartKeyEngineHandle,
+    out_enabled: *mut bool,
+) -> bool {
+    with_engine_mut(engine, false, |eng| {
+        eng.store_mut().reload_if_modified();
+        let target = !eng.store().compiled().enabled;
+        match eng.store_mut().set_enabled(target) {
+            Ok(()) => {
+                if !out_enabled.is_null() {
+                    *out_enabled = target;
+                }
+                true
+            }
+            Err(_) => {
+                if !out_enabled.is_null() {
+                    *out_enabled = eng.store().compiled().enabled;
+                }
+                false
+            }
+        }
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn smartkey_engine_new_with_lexicon_bytes(
     skdict_bytes: *const u8,
     skdict_len: usize,
@@ -978,6 +1016,51 @@ mod tests {
             smartkey_session_free(sess);
             smartkey_engine_free(eng);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ffi_engine_enabled_set_toggle_syncs_external_edits_and_respects_parse_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "smartkey_ffi_toggle_{}_{}",
+            std::process::id(),
+            smartkey_core::event_log::current_epoch_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rules = dir.join("rules.toml");
+        let state = dir.join("state.json");
+        let c_rules = CString::new(rules.to_str().unwrap()).unwrap();
+        let c_state = CString::new(state.to_str().unwrap()).unwrap();
+        let eng = unsafe {
+            smartkey_engine_new(c_rules.as_ptr(), c_state.as_ptr(), SMARTKEY_PRESET_BALANCED)
+        };
+        assert!(!eng.is_null());
+
+        assert!(unsafe { smartkey_engine_is_enabled(eng) });
+        assert!(unsafe { smartkey_engine_set_enabled(eng, false) });
+        assert!(!unsafe { smartkey_engine_is_enabled(eng) });
+        assert!(std::fs::read_to_string(&rules).unwrap().contains("enabled = false"));
+
+        // External edit (e.g. `smartkey enable`) flips enabled = true; toggle should reload first
+        // and flip true -> false instead of oscillating on stale in-memory state.
+        let updated = std::fs::read_to_string(&rules)
+            .unwrap()
+            .replace("enabled = false", "enabled = true");
+        std::fs::write(&rules, updated).unwrap();
+        let mut new_enabled = true;
+        assert!(unsafe { smartkey_engine_toggle_enabled(eng, &mut new_enabled) });
+        assert!(!new_enabled);
+        assert!(!unsafe { smartkey_engine_is_enabled(eng) });
+
+        // Corrupt rules.toml write-locks the store; toggle returns false cleanly without panic.
+        std::fs::write(&rules, "[settings\nbroken = [1, 2\n").unwrap();
+        let mut lock_state = true;
+        assert!(!unsafe { smartkey_engine_toggle_enabled(eng, &mut lock_state) });
+        assert!(!unsafe { smartkey_engine_set_enabled(eng, true) });
+        assert!(!lock_state);
+
+        unsafe { smartkey_engine_free(eng) };
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -690,7 +690,9 @@ int main(int argc, char *argv[]) {
              << "Category=Module\n"
              << "Version=0.1.1\n"
              << "OnDemand=False\n"
-             << "Configurable=False\n";
+             << "Configurable=True\n\n"
+             << "[Addon/OptionalDependencies]\n"
+             << "0=notifications\n";
     }
 
     ::setenv("XDG_CONFIG_HOME", cfgHome.c_str(), 1);
@@ -705,6 +707,20 @@ int main(int argc, char *argv[]) {
 
         auto *addon = mgr.addon("smartkey", true);
         assert(addon != nullptr && "Fcitx5 AddonManager failed to load smartkey");
+        assert(addon->getConfig() != nullptr &&
+               "SmartKeyAddon::getConfig() must expose SmartKeyConfig");
+
+        fcitx::RawConfig raw;
+        raw.setValueByPath("ToggleKey/0", "Control+Alt+d");
+        addon->setConfig(raw);
+        assert(fs::exists(cfgHome / "fcitx5" / "conf" / "smartkey.conf") &&
+               "SmartKeyAddon::setConfig() did not write conf/smartkey.conf");
+
+        fcitx::smartkey::SmartKeyConfig reloaded{};
+        fcitx::readAsIni(reloaded, "conf/smartkey.conf");
+        assert(!reloaded.toggleKey->empty() &&
+               "Reloaded SmartKeyConfig lost ToggleKey");
+
         addon->reloadConfig();
         addon->save();
         mgr.unload();

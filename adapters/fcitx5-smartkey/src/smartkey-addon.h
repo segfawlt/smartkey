@@ -23,6 +23,10 @@
 #include <utility>
 #include <vector>
 
+#include <fcitx-config/configuration.h>
+#include <fcitx-config/iniparser.h>
+#include <fcitx-config/option.h>
+#include <fcitx-config/rawconfig.h>
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/eventloopinterface.h>
@@ -1195,11 +1199,19 @@ private:
     std::string lastLoggedReason_;
 };
 
+FCITX_CONFIGURATION(
+    SmartKeyConfig,
+    KeyListOption toggleKey{this, "ToggleKey",
+                            "Toggle SmartKey Autocorrect",
+                            {}, KeyListConstrain()};);
+
 class SmartKeyAddon final : public AddonInstance {
 public:
     explicit SmartKeyAddon(Instance *instance);
     ~SmartKeyAddon() override;
 
+    const Configuration *getConfig() const override { return &config_; }
+    void setConfig(const RawConfig &config) override;
     void reloadConfig() override;
     void save() override;
 
@@ -1226,9 +1238,11 @@ private:
     void applyReplaceAction(InputContext *ic, SmartKeyState *state,
                             KeyEvent &keyEvent,
                             const SmartKeyAction &act);
+    void showToggleTip(bool enabled, bool ok);
 
     Instance *instance_ = nullptr;
     SmartKeyEngineHandle *engine_ = nullptr;
+    SmartKeyConfig config_{};
     FactoryFor<SmartKeyState> factory_;
     TraceLogger trace_{};
     std::vector<std::unique_ptr<HandlerTableEntry<EventHandler>>> eventWatchers_;

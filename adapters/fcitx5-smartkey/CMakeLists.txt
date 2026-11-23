@@ -16,6 +16,7 @@ endif()
 
 find_package(Fcitx5Core 5.0.20 REQUIRED)
 find_package(Fcitx5Utils 5.0.20 REQUIRED)
+find_package(Fcitx5Config 5.0.20 REQUIRED)
 
 get_filename_component(SMARTKEY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(SMARTKEY_CARGO_FLAGS "--locked" CACHE STRING "Extra flags passed to cargo build (e.g. --locked or --frozen)")
@@ -66,6 +67,7 @@ target_compile_options(smartkey PRIVATE
 target_link_libraries(smartkey PRIVATE
     Fcitx5::Core
     Fcitx5::Utils
+    Fcitx5::Config
     "${SMARTKEY_FFI_LIB}"
     pthread
     dl
@@ -101,7 +103,7 @@ target_include_directories(addon_load_smoke PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${SMARTKEY_ROOT}/crates/smartkey-ffi/include"
 )
-target_link_libraries(addon_load_smoke PRIVATE Fcitx5::Core Fcitx5::Utils)
+target_link_libraries(addon_load_smoke PRIVATE Fcitx5::Core Fcitx5::Utils Fcitx5::Config)
 add_dependencies(addon_load_smoke smartkey)
 add_test(
     NAME addon_load_smoke

@@ -84,6 +84,9 @@ SmartKeyEngineHandle* smartkey_engine_new_with_lexicon_bytes(
 
 void smartkey_engine_free(SmartKeyEngineHandle* engine);
 bool smartkey_engine_reload_dicts(SmartKeyEngineHandle* engine);
+bool smartkey_engine_is_enabled(const SmartKeyEngineHandle* engine);
+bool smartkey_engine_set_enabled(SmartKeyEngineHandle* engine, bool enabled);
+bool smartkey_engine_toggle_enabled(SmartKeyEngineHandle* engine, bool* out_enabled);
 
 /* Session lifecycle & context */
 SmartKeySessionHandle* smartkey_session_new(void);
