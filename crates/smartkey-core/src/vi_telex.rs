@@ -1706,6 +1706,99 @@ fn is_telex_functional_key(b: u8) -> bool {
     TELEX_FUNCTIONAL_KEYS.contains(&b)
 }
 
+fn is_strict_tone_key(b: u8) -> bool {
+    matches!(b, b's' | b'f' | b'r' | b'x' | b'j')
+}
+
+/// Strategy 5a: rescues restore-class `ie`/`ye` + coda words whose circumflex key (`e`) was
+/// omitted (`tienf -> tieenf -> tiền`, `vietj -> vieetj -> việt`, `nguyenx -> nguyeenx -> nguyễn`).
+fn try_ie_ye_circumflex_rescue(
+    lower: &str,
+    raw_keys: &str,
+    screen_chars: usize,
+    opts: LotusOptions,
+    dict: &[Box<str>],
+) -> Option<TelexRescue> {
+    let bytes = lower.as_bytes();
+    let n = bytes.len();
+    if n < 4 || !is_strict_tone_key(bytes[n - 1]) || lower.contains("ee") {
+        return None;
+    }
+    let stem = &lower[..n - 1];
+    let tone = bytes[n - 1] as char;
+
+    for (pos, pat) in stem.match_indices("ie").chain(stem.match_indices("ye")) {
+        if pat == "ye" && pos > 0 && !matches!(stem.as_bytes()[pos - 1], b'u' | b'q') {
+            continue;
+        }
+        let coda = &stem[pos + 2..];
+        if !matches!(coda, "c" | "m" | "n" | "ng" | "p" | "t" | "u") {
+            continue;
+        }
+        let cand = format!("{}e{coda}{tone}", &stem[..pos + 2]);
+        if let Some(rescued) = try_candidate_repair(&cand, raw_keys, screen_chars, opts, dict) {
+            return Some(rescued);
+        }
+    }
+    None
+}
+
+/// Strategy 6: rescues restore-class words missing a single Telex mark (`a/e/o/d` double or `w`)
+/// only when exactly one distinct dictionary-valid candidate exists (`tuans -> tuấn`, while
+/// ambiguous `nuocs -> nuốc|nước` and `nguoif -> nguồi|người` stay untouched).
+fn try_unique_single_mark_rescue(
+    lower: &str,
+    raw_keys: &str,
+    screen_chars: usize,
+    opts: LotusOptions,
+    dict: &[Box<str>],
+) -> Option<TelexRescue> {
+    let bytes = lower.as_bytes();
+    let n = bytes.len();
+    if n < 3 || !is_strict_tone_key(bytes[n - 1]) {
+        return None;
+    }
+    let stem = &lower[..n - 1];
+    let sb = stem.as_bytes();
+    let tone = bytes[n - 1] as char;
+
+    let mut cands = Vec::new();
+    if sb[0] == b'd' && sb.get(1) != Some(&b'd') {
+        cands.push(format!("d{stem}{tone}"));
+    }
+    for i in 0..sb.len() {
+        if matches!(sb[i], b'a' | b'e' | b'o')
+            && (i == 0 || sb[i - 1] != sb[i])
+            && sb.get(i + 1) != Some(&sb[i])
+        {
+            cands.push(format!(
+                "{}{}{}{}",
+                &stem[..=i],
+                sb[i] as char,
+                &stem[i + 1..],
+                tone
+            ));
+        }
+        if matches!(sb[i], b'a' | b'o' | b'u') && sb.get(i + 1) != Some(&b'w') {
+            cands.push(format!("{}w{}{}", &stem[..=i], &stem[i + 1..], tone));
+        }
+    }
+
+    let mut found: Option<TelexRescue> = None;
+    for cand in cands {
+        if let Some(rescued) = try_candidate_repair(&cand, raw_keys, screen_chars, opts, dict) {
+            match &found {
+                Some(prev) if !prev.replacement.eq_ignore_ascii_case(&rescued.replacement) => {
+                    return None;
+                }
+                None => found = Some(rescued),
+                Some(_) => {}
+            }
+        }
+    }
+    found
+}
+
 /// Collapses all 3x mark keys (`eee -> ee`, `ddd -> dd`, `ooo -> oo`, `aaa -> aa`) and
 /// 2x non-mark keys (`tt -> t`, `ss -> s`, `ww -> w`, `nn -> n`, etc.) in a single pass.
 fn collapse_telex_chatter(lower: &str) -> String {
@@ -1850,6 +1943,20 @@ pub fn rescue_telex_typo_with_dict(
         }
     }
 
+    let has_midword_vi_rune =
+        orig_sim.needs_uinput_restore_on_break || orig_sim.is_composed_vietnamese;
+
+    // 5a. Omitted circumflex on restore-class (or `ddFreeStyle`) `ie`/`ye` + coda words
+    //     (`tienf -> tiền`, `vietj -> việt`, `nguyenx -> nguyễn`, `ddiems -> điếm`).
+    //     Runs BEFORE Strategy 5 so `tienf` is never mis-rescued to `tiẻn`.
+    if has_midword_vi_rune {
+        if let Some(rescued) =
+            try_ie_ye_circumflex_rescue(&lower, raw_keys, screen_chars, opts, dict)
+        {
+            return Some(rescued);
+        }
+    }
+
     // 5. Final tone/mark key substitution (`duongx -> duongw -> dương`, `duongj -> duongw -> dương`):
     //    only when Lotus itself composed runes mid-word and `mustFallbackToEnglish()` restored the
     //    raw keys (`needs_uinput_restore_on_break`) — a strong prior that the user WAS typing
@@ -1878,6 +1985,31 @@ pub fn rescue_telex_typo_with_dict(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // 6. Unambiguous single mark insertion on restore-class (or `ddFreeStyle`) words ending in a
+    //    tone key (`buocs -> bước`, `dduocj -> được`, while `nuocs -> nuốc|nước` stays untouched).
+    if has_midword_vi_rune {
+        if let Some(rescued) =
+            try_unique_single_mark_rescue(&lower, raw_keys, screen_chars, opts, dict)
+        {
+            return Some(rescued);
+        }
+    }
+
+    // 7. Dropped `n` before trailing `g` (`nhuwg -> nhưng`, `nhuwxg -> những`, `duowg -> dương`,
+    //    `hoafg -> hoàng`): require the prefix to compose Vietnamese runes mid-word (either via
+    //    `is_composed_vietnamese` or `needs_uinput_restore_on_break` for incomplete diphthong stems
+    //    like `duow` -> `dươ`) so English `-g` words (`bag`, `thing`, `config`, `frog`) never enter.
+    if n >= 3 && bytes[n - 1] == b'g' && bytes[n - 2] != b'n' {
+        let prefix = &lower[..n - 1];
+        let prefix_sim = simulate_lotus_word_with_dict(prefix, opts, dict);
+        if prefix_sim.is_composed_vietnamese || prefix_sim.needs_uinput_restore_on_break {
+            let cand = format!("{prefix}ng");
+            if let Some(rescued) = try_candidate_repair(&cand, raw_keys, screen_chars, opts, dict) {
+                return Some(rescued);
             }
         }
     }
@@ -2058,5 +2190,74 @@ mod tests {
         // `j` tone key, never by rewriting the `g`), and no substitution may reach a dict word
         // from a non-restore token:
         assert_eq!(rescue_telex_typo("heloj"), None);
+    }
+
+    #[test]
+    fn test_rescue_omitted_ie_ye_circumflex_and_unique_mark_without_bare_ascii_fp() {
+        // Strategy 5a: `tienf` previously hit Strategy 5 and mis-rescued to `tiẻn`; must rescue
+        // to `tiền` (along with other omitted `ie`/`ye`+coda words) with casing preserved:
+        assert_eq!(rescue_telex_typo("tienf").unwrap().replacement, "tiền");
+        assert_eq!(rescue_telex_typo("Tienf").unwrap().replacement, "Tiền");
+        assert_eq!(rescue_telex_typo("TIENF").unwrap().replacement, "TIỀN");
+        assert_eq!(rescue_telex_typo("tiens").unwrap().replacement, "tiến");
+        assert_eq!(rescue_telex_typo("tienj").unwrap().replacement, "tiện");
+        assert_eq!(rescue_telex_typo("tienx").unwrap().replacement, "tiễn");
+        assert_eq!(rescue_telex_typo("vietj").unwrap().replacement, "việt");
+        assert_eq!(rescue_telex_typo("Vietj").unwrap().replacement, "Việt");
+        assert_eq!(rescue_telex_typo("viets").unwrap().replacement, "viết");
+        assert_eq!(rescue_telex_typo("chuyenf").unwrap().replacement, "chuyền");
+        assert_eq!(rescue_telex_typo("nguyenx").unwrap().replacement, "nguyễn");
+        assert_eq!(rescue_telex_typo("ddiems").unwrap().replacement, "điếm");
+
+        // Strategy 6: unambiguous 1-mark checked-coda & `ddFreeStyle` words rescue cleanly:
+        assert_eq!(rescue_telex_typo("buocs").unwrap().replacement, "bước");
+        assert_eq!(rescue_telex_typo("buocj").unwrap().replacement, "buộc");
+        assert_eq!(rescue_telex_typo("dduocj").unwrap().replacement, "được");
+        assert_eq!(rescue_telex_typo("cuops").unwrap().replacement, "cướp");
+
+        // Ambiguous 1-mark checked-coda words stay untouched (neither is level-tone):
+        for ambig in ["nuocs", "thuocs", "duocj", "luots", "truotj"] {
+            assert_eq!(
+                rescue_telex_typo(ambig),
+                None,
+                "ambiguous 1-mark word {ambig:?} must stay untouched"
+            );
+        }
+
+        // Bare toneless ASCII (names/unaccented words) and invalid `duonxg` stay untouched:
+        for bare in [
+            "duong", "Duong", "tien", "Tien", "nguyen", "Nguyen", "tuan", "moi", "duonxg",
+        ] {
+            assert_eq!(
+                rescue_telex_typo(bare),
+                None,
+                "bare/non-restore word {bare:?} must stay untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rescue_dropped_n_before_trailing_g() {
+        let r1 = rescue_telex_typo("nhuwg").expect("should rescue nhuwg -> nhưng");
+        assert_eq!(r1.replacement, "nhưng");
+        assert_eq!(r1.screen_chars, 5);
+        assert_eq!(rescue_telex_typo("Nhuwg").unwrap().replacement, "Nhưng");
+
+        let r2 = rescue_telex_typo("nhuwxg").expect("should rescue nhuwxg -> những");
+        assert_eq!(r2.replacement, "những");
+        assert_eq!(r2.screen_chars, 6);
+
+        assert_eq!(rescue_telex_typo("duowg").unwrap().replacement, "dương");
+        assert_eq!(rescue_telex_typo("hoafg").unwrap().replacement, "hoàng");
+        assert_eq!(rescue_telex_typo("khoog").unwrap().replacement, "không");
+
+        // Plain English `-g` words must never rescue:
+        for eng in ["bag", "thing", "config", "frog", "dug", "blog"] {
+            assert_eq!(
+                rescue_telex_typo(eng),
+                None,
+                "English word {eng:?} must not rescue as dropped -ng"
+            );
+        }
     }
 }

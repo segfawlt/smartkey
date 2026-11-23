@@ -585,3 +585,63 @@ fn test_vi_lotus_english_corrections_isolated_while_vi_corrections_and_snippets_
         "123 Lê Lợi "
     );
 }
+
+#[test]
+fn test_vi_lotus_omitted_mark_and_dropped_ng_with_undo_and_corpus_shield() {
+    let (mut engine, mut session) = make_vi_engine_and_session();
+
+    // 1. Omitted `ie`/`ye` circumflex + unique 1-mark + dropped `-n` before `-g` end-to-end
+    //    across filtered restore breaks (`tienf`, `vietj`, `buocs`), `ddFreeStyle` (`dduocj`),
+    //    and plain-ASCII breaks (`nhuwg`, `nhuwxg`, `hoafg`), while ambiguous `nuocs` stays untouched:
+    let (buf, _) = type_sequence(
+        &mut session,
+        &mut engine,
+        "tienf vietj dduocj buocs nhuwg nhuwxg hoafg nuocs ",
+    );
+    assert_eq!(buf, "tiền việt được bước nhưng những hoàng nuocs ");
+
+    // 2. Stepwise `2x BackSpace` undo + `Space` on `nhuwg -> nhưng` reverts and blocks pair:
+    let _ = session.reset(&mut engine);
+    let (mut undo_buf, _) = type_sequence(&mut session, &mut engine, "nhuwg ");
+    assert_eq!(undo_buf, "nhưng ");
+    let bs1 = session.process_key(&mut engine, KeyInput::BackSpace, 2_000);
+    assert_eq!(bs1.action, SessionAction::PassThrough);
+    apply_key_to_buffer(&mut undo_buf, KeyInput::BackSpace, &bs1.action);
+    let bs2 = session.process_key(&mut engine, KeyInput::BackSpace, 2_050);
+    apply_key_to_buffer(&mut undo_buf, KeyInput::BackSpace, &bs2.action);
+    assert_eq!(undo_buf, "nhuwg");
+    let sp = session.process_key(&mut engine, KeyInput::Char(' '), 2_100);
+    apply_key_to_buffer(&mut undo_buf, KeyInput::Char(' '), &sp.action);
+    assert_eq!(undo_buf, "nhuwg ");
+    assert!(engine.store().is_pair_blocked("nhuwg", "nhưng"));
+
+    // 3. Bare toneless Vietnamese names stay untouched:
+    let _ = session.reset(&mut engine);
+    let (names_buf, _) = type_sequence(&mut session, &mut engine, "Nguyen Duong ");
+    assert_eq!(names_buf, "Nguyen Duong ");
+
+    // 4. Every ASCII alphabetic entry in `tests/corpus/must_not_touch.txt` must never trigger
+    //    `VietnameseTelexRescue` through `SmartKeyEngine::evaluate_token` in `vi` mode:
+    let corpus = include_str!("../../../tests/corpus/must_not_touch.txt");
+    for line in corpus.lines() {
+        let word = line.trim();
+        if word.is_empty()
+            || word.starts_with('#')
+            || !word.is_ascii()
+            || !word.chars().all(|c| c.is_ascii_alphabetic())
+        {
+            continue;
+        }
+        let outcome = engine.evaluate_token(word, &EvalContext::default());
+        assert!(
+            !matches!(
+                outcome,
+                EvalOutcome::Autocorrect {
+                    kind: MatchKind::VietnameseTelexRescue,
+                    ..
+                }
+            ),
+            "must_not_touch entry {word:?} falsely triggered VietnameseTelexRescue: {outcome:?}"
+        );
+    }
+}
