@@ -9,6 +9,10 @@ tags before non-trivial work.
 - [Unified App Profile Classification and `unknown_app_policy` Ordering](./architecture-patterns/unified-app-profile-classification-and-unknown-policy.md) — Keep capability flags and the DBus `KeyEventOrderFix`/no-`SurroundingText` guard ahead of `unknown_app_policy`, parse `"default"` as `None`, and delegate classification to `smartkey-core` via FFI. `#app-profiles #fcitx5 #ffi #security`
 - [RuleStore Sidecar Lockfile and Atomic Rename Invariants](./architecture-patterns/rule-store-sidecar-lockfile-and-atomic-renames.md) — Serialize concurrent writes on sibling `.smartkey.lock` (`truncate(false)`) instead of target files replaced via `atomic_write_bytes` inode renames, use re-entrant `with_file_lock`, and keep read-only constructors lock-free. `#store #concurrency #locking #atomic-write #fcitx5`
 
+## design-patterns/
+
+- [Verifying ratatui screens: hidden tab bars and tmux capture](./design-patterns/ratatui-tui-verification-and-hidden-tabs.md) — `Tabs` in a titled, bordered 2-row `Block` renders no labels; assert real buffer text, and drive the release binary in tmux against copied config before calling a TUI change done (send `Escape` separately, or crossterm reads Alt+key). `#tui #ratatui #testing #tmux`
+
 ## integration-issues/
 
 - [SurroundingText Unicode-Scalar Cursor Indexing vs UTF-8 Slicing](./integration-issues/surrounding-text-utf8-scalar-cursor-slicing.md) — Index `SurroundingText::text()` by stepping UTF-8 codepoint boundaries because `cursor()`/`anchor()` count Unicode scalars, not bytes, and bound huge editors (`>16384` chars). `#fcitx5 #surrounding-text #utf8 #vietnamese #wayland`
