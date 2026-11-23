@@ -144,7 +144,7 @@ fn detect_installed_addon() -> Option<PathBuf> {
 }
 
 /// Validates desktop input-method routing environment variables without printing raw env values.
-fn inspect_im_environment() -> (bool, Vec<String>) {
+pub(crate) fn inspect_im_environment() -> (bool, Vec<String>) {
     let mut warnings = Vec::new();
     let is_wayland = env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
         || env::var("XDG_SESSION_TYPE")

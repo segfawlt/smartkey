@@ -1,105 +1,484 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
-    Tabs, Wrap,
+    Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    Wrap,
 };
 use ratatui::Frame;
-use smartkey_core::event_log::{current_epoch_ms, date_string};
+use smartkey_core::event_log::current_epoch_ms;
 use smartkey_core::{
-    AppProfile, ConfidenceTier, DiagnosticEvent, EvalContext, EvalOutcome, EventLog, LangId,
-    Preset, PruneKinds, PruneOptions, RuleStore, SmartKeyEngine,
+    normalize_program_id, AppProfile, ConfidenceTier, DiagnosticEvent, EvalContext, EvalOutcome,
+    EventLog, LangId, LatinScorer, MatchKind, Preset, RuleOrigin, RuleStore, SmartKeyEngine,
+    UndoResolution,
 };
 
 use crate::{
-    app_profile_label, collect_staged_entries, default_config_dir, detect_fcitx5_module_so,
-    detect_fcitx5_running, format_diagnostic_event_line, load_rule_store_mut,
-    load_rule_store_readonly, match_kind_slug, CliError, CliResult, ConfidenceCountsJson,
-    LogFilter, StagedEntryJson,
+    collect_staged_entries, default_config_dir, detect_fcitx5_module_so, detect_fcitx5_running,
+    format_age_ago, inspect_im_environment, load_rule_store_mut, load_rule_store_readonly,
+    CliError, CliResult,
 };
 
-const TAB_TITLES: [&str; 5] = [
-    "1 Overview",
-    "2 Rules & Staged",
-    "3 Settings",
-    "4 Apps",
-    "5 Logs & Explain",
-];
+const ACCENT: Color = Color::Cyan;
+const MUTED: Color = Color::Gray;
+const RULE: Color = Color::DarkGray;
 
-const BOOLEAN_SETTINGS: &[&str] = &[
-    "settings.enabled",
-    "settings.auto_capitalize_i",
-    "settings.auto_capitalize_sentence",
-    "settings.fix_shift_slips",
-    "settings.fix_proper_nouns",
-    "settings.enable_contractions",
-    "settings.enable_missed_space_split",
-    "settings.expand_shorthand",
-    "plugins.vi_lotus",
-    "diagnostics.event_log",
-    "diagnostics.trace_log",
-    "diagnostics.annotate_rules",
-];
+const ACTIVITY_WINDOW_MS: u64 = 3 * 86_400_000;
+const ACTIVITY_MAX_ROWS: usize = 400;
+const MAX_SEEN_APPS: usize = 15;
+const MAX_ALMOST: usize = 20;
+const AUTO_REFRESH: Duration = Duration::from_secs(4);
 
-const DIALECT_OPTIONS: &[&str] = &["mixed", "en_US", "en_GB"];
-const AGGR_OPTIONS: &[&str] = &["conservative", "balanced", "aggressive"];
-const UNDO_MODE_OPTIONS: &[&str] = &["step", "immediate", "off"];
-const LOG_LEVEL_OPTIONS: &[&str] = &["interesting", "all"];
-const UNKNOWN_POLICY_OPTIONS: &[&str] = &["default", "prose", "bypass", "browser", "chat"];
+// ---------------------------------------------------------------------------
+// Screens and small enums
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Overview,
-    Rules,
+enum Screen {
+    Activity,
+    Review,
+    Dictionary,
     Settings,
-    Apps,
-    Logs,
 }
 
-impl Tab {
+impl Screen {
+    const ALL: [Screen; 4] = [
+        Screen::Activity,
+        Screen::Review,
+        Screen::Dictionary,
+        Screen::Settings,
+    ];
+
     fn index(self) -> usize {
         match self {
-            Self::Overview => 0,
-            Self::Rules => 1,
-            Self::Settings => 2,
-            Self::Apps => 3,
-            Self::Logs => 4,
+            Self::Activity => 0,
+            Self::Review => 1,
+            Self::Dictionary => 2,
+            Self::Settings => 3,
         }
     }
 
-    fn from_index(idx: usize) -> Self {
-        match idx % 5 {
-            0 => Self::Overview,
-            1 => Self::Rules,
-            2 => Self::Settings,
-            3 => Self::Apps,
-            _ => Self::Logs,
-        }
+    fn from_index(i: usize) -> Self {
+        Self::ALL[i % 4]
     }
 
+    fn label(self, short: bool) -> &'static str {
+        match (self, short) {
+            (Self::Activity, false) => "Activity",
+            (Self::Review, false) => "Review",
+            (Self::Dictionary, false) => "Dictionary",
+            (Self::Settings, false) => "Settings",
+            (Self::Activity, true) => "Act",
+            (Self::Review, true) => "Rev",
+            (Self::Dictionary, true) => "Dict",
+            (Self::Settings, true) => "Set",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityFilter {
+    All,
+    Fixes,
+    ByHand,
+    Missed,
+}
+
+impl ActivityFilter {
     fn next(self) -> Self {
-        Self::from_index(self.index() + 1)
+        match self {
+            Self::All => Self::Fixes,
+            Self::Fixes => Self::ByHand,
+            Self::ByHand => Self::Missed,
+            Self::Missed => Self::All,
+        }
     }
 
-    fn prev(self) -> Self {
-        Self::from_index(self.index() + 4)
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "everything",
+            Self::Fixes => "fixes",
+            Self::ByHand => "undos and hand fixes",
+            Self::Missed => "missed words",
+        }
+    }
+
+    fn matches(self, ev: &DiagnosticEvent) -> bool {
+        match self {
+            Self::All => true,
+            Self::Fixes => matches!(ev, DiagnosticEvent::AutocorrectApplied { .. }),
+            Self::ByHand => matches!(
+                ev,
+                DiagnosticEvent::BackspaceUndo { .. } | DiagnosticEvent::ManualBackspaceFix { .. }
+            ),
+            Self::Missed => matches!(
+                ev,
+                DiagnosticEvent::UnfixedUnknown { .. } | DiagnosticEvent::RealWordDeclined { .. }
+            ),
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RulesSubView {
-    Active,
-    Staged,
+enum DictSection {
+    Words,
+    Fixes,
+    Snippets,
+    NeverFix,
+    TelexKeep,
+}
+
+impl DictSection {
+    const ALL: [DictSection; 5] = [
+        DictSection::Words,
+        DictSection::Fixes,
+        DictSection::Snippets,
+        DictSection::NeverFix,
+        DictSection::TelexKeep,
+    ];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|s| *s == self).unwrap_or(0)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Words => "Words",
+            Self::Fixes => "Fixes",
+            Self::Snippets => "Snippets",
+            Self::NeverFix => "Never fix",
+            Self::TelexKeep => "Telex keep",
+        }
+    }
+
+    fn headers(self) -> &'static [&'static str] {
+        match self {
+            Self::Words => &["Word", "Language", "Added by", "Used", "Last used"],
+            Self::Fixes => &[
+                "Typed",
+                "Becomes",
+                "Only after",
+                "Language",
+                "Added by",
+                "Used",
+            ],
+            Self::Snippets => &["Trigger", "Expands to"],
+            Self::NeverFix => &["Typed", "Never change to", "Added by"],
+            Self::TelexKeep => &["Keys typed", "Added by"],
+        }
+    }
+
+    fn widths(self) -> Vec<Constraint> {
+        match self {
+            Self::Words => vec![
+                Constraint::Fill(3),
+                Constraint::Length(9),
+                Constraint::Fill(2),
+                Constraint::Length(6),
+                Constraint::Length(10),
+            ],
+            Self::Fixes => vec![
+                Constraint::Fill(2),
+                Constraint::Fill(2),
+                Constraint::Length(11),
+                Constraint::Length(9),
+                Constraint::Fill(2),
+                Constraint::Length(6),
+            ],
+            Self::Snippets => vec![Constraint::Fill(1), Constraint::Fill(3)],
+            Self::NeverFix => vec![
+                Constraint::Fill(2),
+                Constraint::Fill(2),
+                Constraint::Fill(2),
+            ],
+            Self::TelexKeep => vec![Constraint::Fill(1), Constraint::Fill(2)],
+        }
+    }
+
+    fn empty_text(self) -> &'static str {
+        match self {
+            Self::Words => "No words yet. Press n to add a word SmartKey should never correct.",
+            Self::Fixes => "No fixes yet. Press n to teach SmartKey a correction.",
+            Self::Snippets => "No snippets yet. Press n to add a trigger that expands into text.",
+            Self::NeverFix => "Nothing blocked. Fixes you undo twice show up here.",
+            Self::TelexKeep => "No Telex exceptions. These keep English words like \"aur\" as typed in Vietnamese mode.",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Store operations with computed inverses (undo)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum StoreOp {
+    AddWord {
+        lang: LangId,
+        word: String,
+    },
+    RemoveWord {
+        lang: LangId,
+        word: String,
+        canonical: String,
+    },
+    SetFix {
+        lang: LangId,
+        typed: String,
+        fixed: String,
+    },
+    RemoveFix {
+        lang: LangId,
+        typed: String,
+        fixed: String,
+    },
+    SetContext {
+        prev: String,
+        typed: String,
+        fixed: String,
+    },
+    RemoveContext {
+        prev: String,
+        typed: String,
+        fixed: String,
+    },
+    SetSnippet {
+        trigger: String,
+        expansion: String,
+    },
+    RemoveSnippet {
+        trigger: String,
+        expansion: String,
+    },
+    AddBlock {
+        typed: String,
+        rejected: String,
+    },
+    RemoveBlock {
+        typed: String,
+        rejected: String,
+    },
+    AddPassthrough {
+        raw: String,
+    },
+    RemovePassthrough {
+        raw: String,
+    },
+    SetSetting {
+        key: String,
+        value: String,
+    },
+    SetAppProfile {
+        app: String,
+        profile: Option<AppProfile>,
+    },
+    PromoteStaged {
+        queue: String,
+        key: String,
+        canonical: Option<String>,
+    },
+    DismissStaged {
+        queue: String,
+        key: String,
+    },
+}
+
+impl StoreOp {
+    /// Applies the op and returns the op that reverses it, when the change can be undone.
+    fn apply(&self, store: &mut RuleStore) -> Result<Option<StoreOp>, String> {
+        let e = |err: io::Error| err.to_string();
+        Ok(match self {
+            Self::AddWord { lang, word } => store
+                .add_user_personal_word(lang, word)
+                .map_err(e)?
+                .then(|| Self::RemoveWord {
+                    lang: lang.clone(),
+                    word: word.to_lowercase(),
+                    canonical: word.clone(),
+                }),
+            Self::RemoveWord {
+                lang,
+                word,
+                canonical,
+            } => store
+                .remove_user_personal_word(lang, word)
+                .map_err(e)?
+                .then(|| Self::AddWord {
+                    lang: lang.clone(),
+                    word: canonical.clone(),
+                }),
+            Self::SetFix { lang, typed, fixed } => {
+                match store.set_user_correction(lang, typed, fixed).map_err(e)? {
+                    Some(prev) if prev == *fixed => None,
+                    Some(prev) => Some(Self::SetFix {
+                        lang: lang.clone(),
+                        typed: typed.clone(),
+                        fixed: prev,
+                    }),
+                    None => Some(Self::RemoveFix {
+                        lang: lang.clone(),
+                        typed: typed.clone(),
+                        fixed: fixed.clone(),
+                    }),
+                }
+            }
+            Self::RemoveFix { lang, typed, fixed } => store
+                .remove_correction(lang, typed)
+                .map_err(e)?
+                .then(|| Self::SetFix {
+                    lang: lang.clone(),
+                    typed: typed.clone(),
+                    fixed: fixed.clone(),
+                }),
+            Self::SetContext { prev, typed, fixed } => {
+                match store
+                    .set_user_context_correction(prev, typed, fixed)
+                    .map_err(e)?
+                {
+                    Some(old) if old == *fixed => None,
+                    Some(old) => Some(Self::SetContext {
+                        prev: prev.clone(),
+                        typed: typed.clone(),
+                        fixed: old,
+                    }),
+                    None => Some(Self::RemoveContext {
+                        prev: prev.clone(),
+                        typed: typed.clone(),
+                        fixed: fixed.clone(),
+                    }),
+                }
+            }
+            Self::RemoveContext { prev, typed, fixed } => store
+                .remove_context_correction(prev, typed)
+                .map_err(e)?
+                .then(|| Self::SetContext {
+                    prev: prev.clone(),
+                    typed: typed.clone(),
+                    fixed: fixed.clone(),
+                }),
+            Self::SetSnippet { trigger, expansion } => {
+                match store.set_snippet(trigger, expansion).map_err(e)? {
+                    Some(old) if old == *expansion => None,
+                    Some(old) => Some(Self::SetSnippet {
+                        trigger: trigger.clone(),
+                        expansion: old,
+                    }),
+                    None => Some(Self::RemoveSnippet {
+                        trigger: trigger.clone(),
+                        expansion: expansion.clone(),
+                    }),
+                }
+            }
+            Self::RemoveSnippet { trigger, expansion } => store
+                .remove_snippet(trigger)
+                .map_err(e)?
+                .then(|| Self::SetSnippet {
+                    trigger: trigger.clone(),
+                    expansion: expansion.clone(),
+                }),
+            Self::AddBlock { typed, rejected } => store
+                .add_user_blocklist_pair(typed, rejected)
+                .map_err(e)?
+                .then(|| Self::RemoveBlock {
+                    typed: typed.to_lowercase(),
+                    rejected: rejected.to_lowercase(),
+                }),
+            Self::RemoveBlock { typed, rejected } => store
+                .remove_blocklist_pair(typed, rejected)
+                .map_err(e)?
+                .then(|| Self::AddBlock {
+                    typed: typed.clone(),
+                    rejected: rejected.clone(),
+                }),
+            Self::AddPassthrough { raw } => {
+                store
+                    .add_user_telex_passthrough(raw)
+                    .map_err(e)?
+                    .then(|| Self::RemovePassthrough {
+                        raw: raw.to_lowercase(),
+                    })
+            }
+            Self::RemovePassthrough { raw } => store
+                .remove_telex_passthrough(raw)
+                .map_err(e)?
+                .then(|| Self::AddPassthrough { raw: raw.clone() }),
+            Self::SetSetting { key, value } => {
+                let before = store.get_setting(key);
+                let (canon, saved) = store.set_setting(key, value).map_err(e)?;
+                match before {
+                    Some(old) if old != saved => Some(Self::SetSetting {
+                        key: canon.to_string(),
+                        value: old,
+                    }),
+                    _ => None,
+                }
+            }
+            Self::SetAppProfile { app, profile } => {
+                let before = store
+                    .compiled()
+                    .app_profiles
+                    .classify_explicit_override(app);
+                if before == *profile {
+                    return Ok(None);
+                }
+                store.remove_app_profile_override(None, app).map_err(e)?;
+                if let Some(p) = profile {
+                    store.add_app_profile_override(*p, app).map_err(e)?;
+                }
+                Some(Self::SetAppProfile {
+                    app: app.clone(),
+                    profile: before,
+                })
+            }
+            Self::PromoteStaged {
+                queue,
+                key,
+                canonical,
+            } => {
+                promote_staged_entry(store, queue, key, canonical.as_deref())?;
+                store.dismiss_staged_entry(queue, key).map_err(e)?;
+                None
+            }
+            Self::DismissStaged { queue, key } => {
+                store.dismiss_staged_entry(queue, key).map_err(e)?;
+                None
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot rows
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    Normal,
+    Warn,
+    Muted,
+}
+
+#[derive(Debug, Clone)]
+struct ActivityRow {
+    ts_ms: u64,
+    app: Option<String>,
+    lang: String,
+    change: String,
+    why: String,
+    note: String,
+    tone: Tone,
+    repeat: u32,
+    event: DiagnosticEvent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddRuleKind {
+enum RuleKind {
     Fix,
     Context,
     Snippet,
@@ -108,177 +487,606 @@ enum AddRuleKind {
     Passthrough,
 }
 
-impl AddRuleKind {
-    fn next(self) -> Self {
-        match self {
-            Self::Fix => Self::Context,
-            Self::Context => Self::Snippet,
-            Self::Snippet => Self::Word,
-            Self::Word => Self::Block,
-            Self::Block => Self::Passthrough,
-            Self::Passthrough => Self::Fix,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Fix => "Fix (typed=fixed or vi:typed=fixed)",
-            Self::Context => "Context (prev typed=fixed)",
-            Self::Snippet => "Snippet (trigger=expansion)",
-            Self::Word => "Word (word or vi:word)",
-            Self::Block => "Block (typed=rejected)",
-            Self::Passthrough => "Telex passthrough (raw_ascii)",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RuleDeleteTarget {
-    Fix { lang: LangId, typed: String },
-    Context { prev: String, typed: String },
-    Snippet { trigger: String },
-    Word { lang: LangId, word: String },
-    Block { typed: String, rejected: String },
-    Passthrough { raw: String },
-}
-
 #[derive(Debug, Clone)]
-struct ActiveRuleRow {
-    kind: &'static str,
-    display: String,
+struct RuleEntry {
+    kind: RuleKind,
+    lang: LangId,
+    a: String,
+    b: String,
+    prev: String,
     tier: ConfidenceTier,
-    origin: String,
+    origin: Option<RuleOrigin>,
+    pinned: bool,
     hits: u32,
     strikes: u32,
-    delete_target: RuleDeleteTarget,
+    last_hit_ms: Option<u64>,
+}
+
+impl RuleEntry {
+    fn delete_op(&self) -> StoreOp {
+        match self.kind {
+            RuleKind::Fix => StoreOp::RemoveFix {
+                lang: self.lang.clone(),
+                typed: self.a.clone(),
+                fixed: self.b.clone(),
+            },
+            RuleKind::Context => StoreOp::RemoveContext {
+                prev: self.prev.clone(),
+                typed: self.a.clone(),
+                fixed: self.b.clone(),
+            },
+            RuleKind::Snippet => StoreOp::RemoveSnippet {
+                trigger: self.a.clone(),
+                expansion: self.b.clone(),
+            },
+            RuleKind::Word => StoreOp::RemoveWord {
+                lang: self.lang.clone(),
+                word: self.a.clone(),
+                canonical: self.b.clone(),
+            },
+            RuleKind::Block => StoreOp::RemoveBlock {
+                typed: self.a.clone(),
+                rejected: self.b.clone(),
+            },
+            RuleKind::Passthrough => StoreOp::RemovePassthrough {
+                raw: self.a.clone(),
+            },
+        }
+    }
+
+    /// Re-saves the rule as a user rule so its origin becomes manual.
+    fn keep_op(&self) -> StoreOp {
+        match self.kind {
+            RuleKind::Fix => StoreOp::SetFix {
+                lang: self.lang.clone(),
+                typed: self.a.clone(),
+                fixed: self.b.clone(),
+            },
+            RuleKind::Context => StoreOp::SetContext {
+                prev: self.prev.clone(),
+                typed: self.a.clone(),
+                fixed: self.b.clone(),
+            },
+            RuleKind::Snippet => StoreOp::SetSnippet {
+                trigger: self.a.clone(),
+                expansion: self.b.clone(),
+            },
+            RuleKind::Word => StoreOp::AddWord {
+                lang: self.lang.clone(),
+                word: self.b.clone(),
+            },
+            RuleKind::Block => StoreOp::AddBlock {
+                typed: self.a.clone(),
+                rejected: self.b.clone(),
+            },
+            RuleKind::Passthrough => StoreOp::AddPassthrough {
+                raw: self.a.clone(),
+            },
+        }
+    }
+
+    fn title(&self) -> String {
+        let base = match self.kind {
+            RuleKind::Fix | RuleKind::Block | RuleKind::Snippet => {
+                format!("{} → {}", self.a, self.b)
+            }
+            RuleKind::Context => format!("{} {} → {}", self.prev, self.a, self.b),
+            RuleKind::Word => self.b.clone(),
+            RuleKind::Passthrough => self.a.clone(),
+        };
+        if self.lang.as_str() != "en" && matches!(self.kind, RuleKind::Fix | RuleKind::Word) {
+            format!("{base}  ({})", self.lang.as_str())
+        } else {
+            base
+        }
+    }
+
+    fn added_by(&self) -> &'static str {
+        if self.pinned {
+            return "you (pinned)";
+        }
+        match self.origin {
+            None => "rules.toml",
+            Some(RuleOrigin::Manual) => "you",
+            Some(RuleOrigin::ManualFix2x) => "learned: fixed 2×",
+            Some(RuleOrigin::UndoReject) => "learned: undo",
+            Some(RuleOrigin::Untouched3x) => "learned: typed 3×",
+        }
+    }
+
+    fn learned_detail(&self) -> String {
+        let how = match self.origin {
+            Some(RuleOrigin::ManualFix2x) => "learned from your edits",
+            Some(RuleOrigin::UndoReject) => "added when you undid a fix",
+            Some(RuleOrigin::Untouched3x) => "you typed it 3× without fixing",
+            _ => "edited by hand in rules.toml",
+        };
+        let mut parts = vec![how.to_string()];
+        if self.kind != RuleKind::Block {
+            parts.push(if self.hits == 0 {
+                "never used since".to_string()
+            } else {
+                format!("used {}×", self.hits)
+            });
+        }
+        if self.strikes > 0 {
+            parts.push(format!("undone {}×", self.strikes));
+        }
+        parts.join(" · ")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewSection {
+    Learned,
+    Blocked,
+    Almost,
+}
+
+impl ReviewSection {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Learned => "Learned rules to check",
+            Self::Blocked => "Fixes blocked after you undid them",
+            Self::Almost => "Almost learned (most repeated first)",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
-struct AppOverrideRow {
-    profile: AppProfile,
-    app_id: String,
+struct ReviewItem {
+    id: String,
+    section: ReviewSection,
+    title: String,
+    detail: String,
+    warning: Option<&'static str>,
+    keep_op: StoreOp,
+    remove_op: StoreOp,
 }
 
 #[derive(Debug, Clone)]
-struct LogRow {
-    timestamp: String,
-    app: Option<String>,
-    lang: String,
-    summary: String,
-    event: DiagnosticEvent,
+struct DictRow {
+    section: DictSection,
+    cols: Vec<String>,
+    haystack: String,
+    label: String,
+    delete_op: StoreOp,
 }
 
-#[derive(Debug, Clone)]
-enum ConfirmAction {
-    DeleteActiveRule {
-        display: String,
-        target: RuleDeleteTarget,
+#[derive(Debug, Clone, Copy)]
+enum Control {
+    Toggle,
+    Choice(&'static [(&'static str, &'static str)]),
+    Number {
+        step: f64,
+        min: f64,
+        max: f64,
+        decimals: usize,
+        unit: &'static str,
     },
-    DismissStaged {
-        queue: String,
-        key: String,
-        display: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SettingSpec {
+    key: &'static str,
+    label: &'static str,
+    help: &'static str,
+    control: Control,
+}
+
+const STRENGTH: &[(&str, &str)] = &[
+    ("conservative", "careful"),
+    ("balanced", "balanced"),
+    ("aggressive", "eager"),
+];
+const SPELLING: &[(&str, &str)] = &[("mixed", "US + UK"), ("en_US", "US"), ("en_GB", "UK")];
+const UNDO_MODE: &[(&str, &str)] = &[
+    ("step", "stepwise"),
+    ("immediate", "instant"),
+    ("off", "off"),
+];
+const LOG_DETAIL: &[(&str, &str)] = &[("interesting", "important only"), ("all", "every word")];
+const UNLISTED: &[(&str, &str)] = &[
+    ("default", "built-in"),
+    ("prose", "prose"),
+    ("bypass", "off"),
+    ("browser", "browser"),
+    ("chat", "chat"),
+];
+
+const CORRECTION_SPECS: &[SettingSpec] = &[
+    SettingSpec {
+        key: "settings.aggressiveness",
+        label: "Strength",
+        help: "How sure SmartKey must be before it changes a word. Careful fixes fewer words but almost never guesses wrong; eager fixes more and guesses more.",
+        control: Control::Choice(STRENGTH),
     },
-    PruneRules,
-    DeleteAppOverride {
+    SettingSpec {
+        key: "settings.dialect",
+        label: "Spelling",
+        help: "US + UK leaves both colour and color alone. US or UK also rewrites valid words into that spelling.",
+        control: Control::Choice(SPELLING),
+    },
+    SettingSpec {
+        key: "settings.enable_missed_space_split",
+        label: "Fix missed spaces",
+        help: "Splits run-together words such as \"ofthe\" into \"of the\" when both halves are common words.",
+        control: Control::Toggle,
+    },
+    SettingSpec {
+        key: "settings.enable_contractions",
+        label: "Add apostrophes",
+        help: "Turns dont into don't, doesnt into doesn't, and similar contractions.",
+        control: Control::Toggle,
+    },
+    SettingSpec {
+        key: "settings.fix_shift_slips",
+        label: "Fix Shift slips",
+        help: "Repairs capitals from holding Shift a beat too long, such as THe → The.",
+        control: Control::Toggle,
+    },
+    SettingSpec {
+        key: "settings.fix_proper_nouns",
+        label: "Capitalise names",
+        help: "Capitalises known names and places from the language pack.",
+        control: Control::Toggle,
+    },
+    SettingSpec {
+        key: "settings.expand_shorthand",
+        label: "Expand shorthand",
+        help: "Expands common shorthand listed in the language pack.",
+        control: Control::Toggle,
+    },
+    SettingSpec {
+        key: "settings.auto_capitalize_i",
+        label: "Capitalise \"i\"",
+        help: "Changes a lone i into I.",
+        control: Control::Toggle,
+    },
+    SettingSpec {
+        key: "settings.auto_capitalize_sentence",
+        label: "Capitalise sentences",
+        help: "Capitalises the first word after a full stop, question mark, or exclamation mark.",
+        control: Control::Toggle,
+    },
+];
+
+const UNDO_SPECS: &[SettingSpec] = &[
+    SettingSpec {
+        key: "settings.undo_mode",
+        label: "Backspace undo",
+        help: "Stepwise: the first Backspace removes the space, the second restores what you typed. Instant: one Backspace restores it. Off: Backspace only deletes.",
+        control: Control::Choice(UNDO_MODE),
+    },
+    SettingSpec {
+        key: "settings.undo_window_ms",
+        label: "Undo window",
+        help: "How long after a fix Backspace can still restore what you typed.",
+        control: Control::Number {
+            step: 500.0,
+            min: 500.0,
+            max: 60_000.0,
+            decimals: 0,
+            unit: "ms",
+        },
+    },
+];
+
+const VIETNAMESE_SPECS: &[SettingSpec] = &[SettingSpec {
+    key: "plugins.vi_lotus",
+    label: "Work with fcitx5-lotus",
+    help: "Lets SmartKey run alongside the fcitx5-lotus Vietnamese input method and repair Telex typos.",
+    control: Control::Toggle,
+}];
+
+const UNLISTED_SPEC: SettingSpec = SettingSpec {
+    key: "app_profiles.unknown_app_policy",
+    label: "Unlisted apps",
+    help: "How to treat apps that are not in the built-in lists or your choices above. Built-in treats them as prose.",
+    control: Control::Choice(UNLISTED),
+};
+
+const DIAGNOSTIC_SPECS: &[SettingSpec] = &[
+    SettingSpec {
+        key: "diagnostics.event_log",
+        label: "Activity log",
+        help: "Records fixes, undos, and missed words so they appear on the Activity screen.",
+        control: Control::Toggle,
+    },
+    SettingSpec {
+        key: "diagnostics.log_level",
+        label: "Log detail",
+        help: "Every word also records words left unchanged. Useful for debugging, but the log grows quickly.",
+        control: Control::Choice(LOG_DETAIL),
+    },
+    SettingSpec {
+        key: "diagnostics.keep_days",
+        label: "Keep logs",
+        help: "Days of activity log to keep on disk.",
+        control: Control::Number {
+            step: 1.0,
+            min: 1.0,
+            max: 365.0,
+            decimals: 0,
+            unit: "days",
+        },
+    },
+    SettingSpec {
+        key: "diagnostics.near_miss_band",
+        label: "Near-miss range",
+        help: "How close a skipped word must come to the fix threshold to be logged as a missed word. 0 logs every miss.",
+        control: Control::Number {
+            step: 0.05,
+            min: 0.0,
+            max: 1.0,
+            decimals: 2,
+            unit: "",
+        },
+    },
+    SettingSpec {
+        key: "diagnostics.trace_log",
+        label: "Key trace",
+        help: "Records raw key events for bug reports. Leave off unless you are debugging.",
+        control: Control::Toggle,
+    },
+    SettingSpec {
+        key: "diagnostics.annotate_rules",
+        label: "Comment learned rules",
+        help: "Writes a comment next to each learned rule in rules.toml saying where it came from.",
+        control: Control::Toggle,
+    },
+];
+
+#[derive(Debug, Clone)]
+enum SettingsRow {
+    Header(&'static str),
+    Setting(SettingSpec),
+    App {
+        app: String,
         profile: AppProfile,
-        app_id: String,
+        reason: &'static str,
+        chosen: Option<AppProfile>,
     },
-    ClearLogs,
 }
+
+// ---------------------------------------------------------------------------
+// Modals
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum RowAction {
+    Ops {
+        ops: Vec<StoreOp>,
+        msg: String,
+    },
+    Explain {
+        lang: LangId,
+        prev: Option<String>,
+        token: String,
+    },
+    PickApp {
+        app: String,
+    },
+    GoReview,
+}
+
+#[derive(Debug, Clone)]
+struct ActionItem {
+    key: char,
+    label: String,
+    hint: String,
+    action: RowAction,
+}
+
+#[derive(Debug, Clone)]
+struct FormField {
+    label: &'static str,
+    value: String,
+    required: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Form {
+    section: DictSection,
+    fields: Vec<FormField>,
+    focus: usize,
+}
+
+impl Form {
+    fn new(section: DictSection) -> Self {
+        let f = |label: &'static str, value: &str, required: bool| FormField {
+            label,
+            value: value.to_string(),
+            required,
+        };
+        let fields = match section {
+            DictSection::Words => vec![f("Word", "", true), f("Language", "en", true)],
+            DictSection::Fixes => vec![
+                f("Typed", "", true),
+                f("Becomes", "", true),
+                f("Only after word", "", false),
+                f("Language", "en", true),
+            ],
+            DictSection::Snippets => vec![f("Trigger", "", true), f("Expands to", "", true)],
+            DictSection::NeverFix => vec![f("Typed", "", true), f("Never change to", "", true)],
+            DictSection::TelexKeep => vec![f("Keys typed", "", true)],
+        };
+        Self {
+            section,
+            fields,
+            focus: 0,
+        }
+    }
+
+    fn value(&self, i: usize) -> &str {
+        self.fields[i].value.trim()
+    }
+
+    fn first_missing(&self) -> Option<usize> {
+        self.fields
+            .iter()
+            .position(|f| f.required && f.value.trim().is_empty())
+    }
+
+    fn to_ops(&self) -> (Vec<StoreOp>, String) {
+        match self.section {
+            DictSection::Words => (
+                vec![StoreOp::AddWord {
+                    lang: LangId(self.value(1).to_lowercase()),
+                    word: self.value(0).to_string(),
+                }],
+                format!("Added word \"{}\"", self.value(0)),
+            ),
+            DictSection::Fixes => {
+                let (typed, fixed, after) = (self.value(0), self.value(1), self.value(2));
+                if after.is_empty() {
+                    (
+                        vec![StoreOp::SetFix {
+                            lang: LangId(self.value(3).to_lowercase()),
+                            typed: typed.to_string(),
+                            fixed: fixed.to_string(),
+                        }],
+                        format!("Saved fix {typed} → {fixed}"),
+                    )
+                } else {
+                    (
+                        vec![StoreOp::SetContext {
+                            prev: after.to_string(),
+                            typed: typed.to_string(),
+                            fixed: fixed.to_string(),
+                        }],
+                        format!("Saved fix {typed} → {fixed} after \"{after}\""),
+                    )
+                }
+            }
+            DictSection::Snippets => (
+                vec![StoreOp::SetSnippet {
+                    trigger: self.value(0).to_string(),
+                    expansion: self.value(1).to_string(),
+                }],
+                format!("Saved snippet {}", self.value(0)),
+            ),
+            DictSection::NeverFix => (
+                vec![StoreOp::AddBlock {
+                    typed: self.value(0).to_string(),
+                    rejected: self.value(1).to_string(),
+                }],
+                format!(
+                    "SmartKey will never change {} → {}",
+                    self.value(0),
+                    self.value(1)
+                ),
+            ),
+            DictSection::TelexKeep => (
+                vec![StoreOp::AddPassthrough {
+                    raw: self.value(0).to_string(),
+                }],
+                format!("Telex will keep \"{}\" as typed", self.value(0)),
+            ),
+        }
+    }
+}
+
+const APP_CHOICES: [(Option<AppProfile>, &str, &str); 5] = [
+    (None, "Built-in", "use SmartKey's own list"),
+    (
+        Some(AppProfile::Bypass),
+        "Off",
+        "never touch typing in this app",
+    ),
+    (
+        Some(AppProfile::Browser),
+        "Browser",
+        "fix text, skip URL and password fields",
+    ),
+    (Some(AppProfile::Chat), "Chat", "casual messaging"),
+    (Some(AppProfile::Prose), "Prose", "documents, notes, email"),
+];
 
 #[derive(Debug, Clone)]
 enum Modal {
     Help,
-    Confirm {
-        prompt: String,
-        action: ConfirmAction,
+    Actions {
+        title: String,
+        items: Vec<ActionItem>,
+        selected: usize,
     },
-    FilterInput {
-        input: String,
-    },
-    AddRule {
-        kind: AddRuleKind,
-        input: String,
-    },
-    EditSetting {
-        key: String,
-        input: String,
-    },
-    AddApp {
-        profile: AppProfile,
-        input: String,
+    Info {
+        title: String,
+        lines: Vec<String>,
     },
     ExplainInput {
         input: String,
     },
+    EditNumber {
+        spec: SettingSpec,
+        current: String,
+        input: String,
+    },
+    AppPicker {
+        app: String,
+        selected: usize,
+    },
+    Form(Form),
+    Confirm {
+        prompt: String,
+        ops: Vec<StoreOp>,
+        msg: String,
+    },
 }
 
-struct OverviewSnapshot {
-    enabled: bool,
-    vi_lotus_enabled: bool,
-    fcitx5_running: bool,
-    lotus_so_path: Option<PathBuf>,
-    counts: ConfidenceCountsJson,
-    active_total: usize,
-    staged_total: usize,
-    applied_total: u64,
-    undo_total: u64,
-    manual_total: u64,
-    recent_events: Vec<String>,
+#[derive(Debug, Clone)]
+struct Toast {
+    text: String,
+    error: bool,
 }
 
-impl Default for OverviewSnapshot {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            vi_lotus_enabled: false,
-            fcitx5_running: false,
-            lotus_so_path: None,
-            counts: ConfidenceCountsJson {
-                manual: 0,
-                confirmed: 0,
-                provisional: 0,
-                suspect: 0,
-            },
-            active_total: 0,
-            staged_total: 0,
-            applied_total: 0,
-            undo_total: 0,
-            manual_total: 0,
-            recent_events: Vec::new(),
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
 
 pub(crate) struct App {
     config_dir: PathBuf,
     log_dir: PathBuf,
     notify_reload: fn() -> bool,
-    active_tab: Tab,
-    rules_view: RulesSubView,
+    screen: Screen,
+    modal: Option<Modal>,
+    filter_editing: bool,
+    toast: Option<Toast>,
+    undo: Option<(String, Vec<StoreOp>)>,
+
     parse_locked: bool,
     parse_error: Option<String>,
-    status_msg: String,
-    status_is_error: bool,
-    modal: Option<Modal>,
-    overview: OverviewSnapshot,
-    active_rules: Vec<ActiveRuleRow>,
-    filtered_rule_indices: Vec<usize>,
-    rules_filter: String,
-    active_rule_idx: usize,
-    staged_entries: Vec<StagedEntryJson>,
-    staged_idx: usize,
-    settings: Vec<(&'static str, String)>,
-    setting_idx: usize,
-    unknown_app_policy: String,
-    app_overrides: Vec<AppOverrideRow>,
-    app_idx: usize,
-    logs: Vec<LogRow>,
-    filtered_log_indices: Vec<usize>,
-    log_filter: LogFilter,
-    log_idx: usize,
-    explain_lines: Vec<String>,
+    env_warnings: Vec<String>,
+    enabled: bool,
+    vi_lotus: bool,
+    lotus_installed: bool,
+    fcitx5_running: bool,
+
+    activity: Vec<ActivityRow>,
+    activity_view: Vec<usize>,
+    activity_idx: usize,
+    activity_filter: ActivityFilter,
+    activity_search: String,
+    day_fixes: usize,
+    day_undone: usize,
+    day_by_hand: usize,
+
+    review: Vec<ReviewItem>,
+    review_idx: usize,
+    review_marked: BTreeSet<String>,
+    review_hidden: usize,
+
+    dict: Vec<DictRow>,
+    dict_counts: [usize; 5],
+    dict_section: DictSection,
+    dict_view: Vec<usize>,
+    dict_idx: usize,
+    dict_filter: String,
+
+    settings_rows: Vec<SettingsRow>,
+    settings_values: BTreeMap<String, String>,
+    settings_idx: usize,
 }
 
 struct TerminalGuard;
@@ -335,6 +1143,7 @@ pub(crate) fn cmd_tui(args: &[String]) -> CliResult {
 
     let _guard = TerminalGuard;
     let mut terminal = ratatui::init();
+    let mut last_refresh = Instant::now();
     loop {
         terminal
             .draw(|f| app.render(f))
@@ -343,13 +1152,16 @@ pub(crate) fn cmd_tui(args: &[String]) -> CliResult {
         if event::poll(Duration::from_millis(250))
             .map_err(|e| CliError::Runtime(format!("event poll failed: {e}")))?
         {
-            if let Event::Key(key) = event::read()
-                .map_err(|e| CliError::Runtime(format!("event read failed: {e}")))?
+            if let Event::Key(key) =
+                event::read().map_err(|e| CliError::Runtime(format!("event read failed: {e}")))?
             {
                 if key.kind == KeyEventKind::Press && app.handle_key(key) {
                     break;
                 }
             }
+        } else if last_refresh.elapsed() >= AUTO_REFRESH && app.is_idle() {
+            app.refresh();
+            last_refresh = Instant::now();
         }
     }
 
@@ -359,21 +1171,27 @@ pub(crate) fn cmd_tui(args: &[String]) -> CliResult {
 fn print_tui_help() {
     println!(
         "\
-SmartKey Interactive TUI (`smartkey tui`)
+SmartKey settings and activity (`smartkey tui`)
 
 USAGE:
   smartkey tui [--dir <PATH>] [--log-dir <PATH>]
 
 OPTIONS:
-  --dir <PATH>       Override config directory (default: ~/.config/smartkey)
-  --log-dir <PATH>   Override event log directory (default: ~/.local/state/smartkey/logs)
+  --dir <PATH>       Config directory (default: ~/.config/smartkey)
+  --log-dir <PATH>   Activity log directory (default: ~/.local/state/smartkey/logs)
   -h, --help         Show this help text
 
-KEYBINDS:
-  1..5 / Tab         Switch tabs (Overview, Rules & Staged, Settings, Apps, Logs & Explain)
-  r                  Reload snapshot from disk
-  ?                  Toggle keybind help modal
-  q / Ctrl+C         Quit"
+SCREENS:
+  1 Activity     Recent fixes; press Enter on one to block it, keep it, or explain it
+  2 Review       Learned rules and almost-learned fixes that need a yes or no
+  3 Dictionary   Your words, fixes, snippets, blocked fixes, and Telex exceptions
+  4 Settings     Correction, undo, Vietnamese, per-app, and logging options
+
+KEYS:
+  1-4 / Tab      Switch screen
+  u              Undo the last change
+  ?              Keys for the current screen
+  q / Ctrl+C     Quit"
     );
 }
 
@@ -383,167 +1201,531 @@ impl App {
             config_dir,
             log_dir,
             notify_reload,
-            active_tab: Tab::Overview,
-            rules_view: RulesSubView::Active,
+            screen: Screen::Activity,
+            modal: None,
+            filter_editing: false,
+            toast: None,
+            undo: None,
             parse_locked: false,
             parse_error: None,
-            status_msg: "Ready (? for help)".to_string(),
-            status_is_error: false,
-            modal: None,
-            overview: OverviewSnapshot::default(),
-            active_rules: Vec::new(),
-            filtered_rule_indices: Vec::new(),
-            rules_filter: String::new(),
-            active_rule_idx: 0,
-            staged_entries: Vec::new(),
-            staged_idx: 0,
-            settings: Vec::new(),
-            setting_idx: 0,
-            unknown_app_policy: "default".to_string(),
-            app_overrides: Vec::new(),
-            app_idx: 0,
-            logs: Vec::new(),
-            filtered_log_indices: Vec::new(),
-            log_filter: LogFilter::All,
-            log_idx: 0,
-            explain_lines: vec!["Press 'x' to run live explain on a token.".to_string()],
+            env_warnings: inspect_im_environment().1,
+            enabled: true,
+            vi_lotus: false,
+            lotus_installed: false,
+            fcitx5_running: false,
+            activity: Vec::new(),
+            activity_view: Vec::new(),
+            activity_idx: 0,
+            activity_filter: ActivityFilter::All,
+            activity_search: String::new(),
+            day_fixes: 0,
+            day_undone: 0,
+            day_by_hand: 0,
+            review: Vec::new(),
+            review_idx: 0,
+            review_marked: BTreeSet::new(),
+            review_hidden: 0,
+            dict: Vec::new(),
+            dict_counts: [0; 5],
+            dict_section: DictSection::Words,
+            dict_view: Vec::new(),
+            dict_idx: 0,
+            dict_filter: String::new(),
+            settings_rows: Vec::new(),
+            settings_values: BTreeMap::new(),
+            settings_idx: 0,
         };
         app.refresh();
         app
     }
 
+    fn is_idle(&self) -> bool {
+        self.modal.is_none() && !self.filter_editing
+    }
+
     pub(crate) fn refresh(&mut self) {
         let store = match load_rule_store_readonly(&self.config_dir, Preset::Balanced) {
-            Ok((s, _exists)) => s,
+            Ok((s, _)) => s,
             Err(err) => {
-                self.set_error(format!("Failed to load rules: {}", format_cli_error(&err)));
+                self.set_error(format!("Could not read settings: {}", cli_error_text(&err)));
                 return;
             }
         };
-
         self.parse_locked = store.is_parse_locked();
         self.parse_error = store.parse_error().map(str::to_string);
 
         let c = store.compiled();
-        let st = store.state();
-        let (counts, active_rules) = collect_active_rule_rows(&store);
-        let staged_entries = collect_staged_entries(st);
+        self.enabled = c.enabled;
+        self.vi_lotus = c.vi_lotus_enabled;
+        self.lotus_installed = detect_fcitx5_module_so("liblotus.so").is_some();
+        self.fcitx5_running = detect_fcitx5_running();
 
-        self.overview = OverviewSnapshot {
-            enabled: c.enabled,
-            vi_lotus_enabled: c.vi_lotus_enabled,
-            fcitx5_running: detect_fcitx5_running(),
-            lotus_so_path: detect_fcitx5_module_so("liblotus.so"),
-            counts,
-            active_total: active_rules.len(),
-            staged_total: staged_entries.len(),
-            applied_total: st.applied_counts.values().map(|&v| u64::from(v)).sum(),
-            undo_total: st.undo_counts.values().map(|&v| u64::from(v)).sum(),
-            manual_total: st.manual_fix_counts.values().map(|&v| u64::from(v)).sum(),
-            recent_events: st
-                .recent_events
-                .iter()
-                .rev()
-                .take(5)
-                .map(format_diagnostic_event_line)
-                .collect(),
-        };
+        let now = current_epoch_ms();
+        let records = EventLog::read_records_in_range(
+            &self.log_dir,
+            Some(now.saturating_sub(ACTIVITY_WINDOW_MS)),
+            None,
+        )
+        .unwrap_or_default();
 
-        self.active_rules = active_rules;
-        self.rebuild_rule_filter();
-        self.staged_entries = staged_entries;
-        clamp_index(&mut self.staged_idx, self.staged_entries.len());
-
-        self.settings = store.list_settings();
-        clamp_index(&mut self.setting_idx, self.settings.len());
-
-        self.unknown_app_policy = store
-            .get_setting("app_profiles.unknown_app_policy")
-            .unwrap_or_else(|| "default".to_string());
-        self.app_overrides = collect_app_overrides(c);
-        clamp_index(&mut self.app_idx, self.app_overrides.len());
-
-        self.logs = load_logs(&self.log_dir, &st.recent_events);
-        self.rebuild_log_filter();
+        self.build_activity(&records, &store, now);
+        let rules = collect_rules(&store);
+        self.build_review(&rules, &store);
+        self.build_dictionary(&rules);
+        self.build_settings(&store, &records);
     }
 
-    fn set_status(&mut self, msg: impl Into<String>) {
-        self.status_msg = msg.into();
-        self.status_is_error = false;
+    fn build_activity(
+        &mut self,
+        records: &[smartkey_core::LoggedDiagnosticRecord],
+        store: &RuleStore,
+        now: u64,
+    ) {
+        let day_start = now.saturating_sub(86_400_000);
+        self.day_fixes = 0;
+        self.day_undone = 0;
+        self.day_by_hand = 0;
+        for r in records.iter().filter(|r| r.ts_ms >= day_start) {
+            match r.event {
+                DiagnosticEvent::AutocorrectApplied { .. } => self.day_fixes += 1,
+                DiagnosticEvent::BackspaceUndo { .. } => self.day_undone += 1,
+                DiagnosticEvent::ManualBackspaceFix { .. } => self.day_by_hand += 1,
+                _ => {}
+            }
+        }
+
+        fn push(
+            rows: &mut Vec<ActivityRow>,
+            ts_ms: u64,
+            app: Option<String>,
+            lang: String,
+            ev: &DiagnosticEvent,
+        ) {
+            if let (Some(last), DiagnosticEvent::AppBypass { app: a, .. }) = (rows.last_mut(), ev) {
+                if let DiagnosticEvent::AppBypass { app: b, .. } = &last.event {
+                    if a == b {
+                        last.repeat += 1;
+                        return;
+                    }
+                }
+            }
+            let (change, why, note, tone) = describe_event(ev);
+            rows.push(ActivityRow {
+                ts_ms,
+                app,
+                lang,
+                change,
+                why,
+                note,
+                tone,
+                repeat: 1,
+                event: ev.clone(),
+            });
+        }
+        let mut rows: Vec<ActivityRow> = Vec::new();
+        if records.is_empty() {
+            for ev in store.state().recent_events.iter().rev() {
+                push(&mut rows, 0, None, "en".to_string(), ev);
+            }
+        } else {
+            for r in records.iter().rev() {
+                push(&mut rows, r.ts_ms, r.app.clone(), r.lang.clone(), &r.event);
+                if rows.len() >= ACTIVITY_MAX_ROWS {
+                    break;
+                }
+            }
+        }
+        self.activity = rows;
+        self.rebuild_activity_view();
     }
 
-    fn set_error(&mut self, msg: impl Into<String>) {
-        self.status_msg = msg.into();
-        self.status_is_error = true;
-    }
-
-    fn rebuild_rule_filter(&mut self) {
-        let needle = self.rules_filter.trim().to_ascii_lowercase();
-        self.filtered_rule_indices = self
-            .active_rules
+    fn rebuild_activity_view(&mut self) {
+        let needle = self.activity_search.trim().to_lowercase();
+        self.activity_view = self
+            .activity
             .iter()
             .enumerate()
-            .filter(|(_, row)| {
+            .filter(|(_, r)| self.activity_filter.matches(&r.event))
+            .filter(|(_, r)| {
                 needle.is_empty()
-                    || row.kind.to_ascii_lowercase().contains(&needle)
-                    || row.display.to_ascii_lowercase().contains(&needle)
-                    || row.tier.as_str().contains(&needle)
+                    || r.change.to_lowercase().contains(&needle)
+                    || r.why.to_lowercase().contains(&needle)
+                    || r.app
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&needle)
             })
             .map(|(i, _)| i)
             .collect();
-        clamp_index(&mut self.active_rule_idx, self.filtered_rule_indices.len());
+        clamp(&mut self.activity_idx, self.activity_view.len());
     }
 
-    fn rebuild_log_filter(&mut self) {
-        self.filtered_log_indices = self
-            .logs
+    fn build_review(&mut self, rules: &[RuleEntry], store: &RuleStore) {
+        let mut items = Vec::new();
+        let mut learned: Vec<&RuleEntry> = rules
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.tier,
+                    ConfidenceTier::Suspect | ConfidenceTier::Provisional
+                )
+            })
+            .collect();
+        learned.sort_by_key(|r| {
+            (
+                r.tier != ConfidenceTier::Suspect,
+                std::cmp::Reverse(r.strikes),
+            )
+        });
+        for r in learned {
+            let section = if r.kind == RuleKind::Block {
+                ReviewSection::Blocked
+            } else {
+                ReviewSection::Learned
+            };
+            let warning = (r.strikes >= 2).then_some("often undone");
+            items.push(ReviewItem {
+                id: format!(
+                    "rule:{:?}:{}:{}:{}:{}",
+                    r.kind,
+                    r.lang.as_str(),
+                    r.prev,
+                    r.a,
+                    r.b
+                ),
+                section,
+                title: r.title(),
+                detail: r.learned_detail(),
+                warning,
+                keep_op: r.keep_op(),
+                remove_op: r.delete_op(),
+            });
+        }
+
+        let active: BTreeSet<String> = rules
+            .iter()
+            .map(|r| match r.kind {
+                RuleKind::Fix => format!("fix:{}:{}", r.lang.as_str(), r.a),
+                RuleKind::Context => format!("ctx:{}|{}", r.prev, r.a),
+                RuleKind::Word => format!("word:{}:{}", r.lang.as_str(), r.a),
+                RuleKind::Passthrough => format!("pt:{}", r.a),
+                _ => String::new(),
+            })
+            .collect();
+        let staged = collect_staged_entries(store.state());
+        let mut almost: Vec<(u32, ReviewItem)> = Vec::new();
+        let mut already = 0usize;
+        for s in &staged {
+            if staged_already_active(s.queue, &s.key, &active) {
+                already += 1;
+                continue;
+            }
+            if s.count < 2 {
+                continue;
+            }
+            let Some((title, detail)) = describe_staged(
+                s.queue,
+                &s.key,
+                s.canonical.as_deref(),
+                s.count,
+                s.threshold,
+            ) else {
+                continue;
+            };
+            almost.push((
+                s.count,
+                ReviewItem {
+                    id: format!("staged:{}:{}", s.queue, s.key),
+                    section: ReviewSection::Almost,
+                    title,
+                    detail,
+                    warning: None,
+                    keep_op: StoreOp::PromoteStaged {
+                        queue: s.queue.to_string(),
+                        key: s.key.clone(),
+                        canonical: s.canonical.clone(),
+                    },
+                    remove_op: StoreOp::DismissStaged {
+                        queue: s.queue.to_string(),
+                        key: s.key.clone(),
+                    },
+                },
+            ));
+        }
+        almost.sort_by_key(|(count, _)| std::cmp::Reverse(*count));
+        almost.truncate(MAX_ALMOST);
+        let shown = almost.len();
+        items.extend(almost.into_iter().map(|(_, item)| item));
+        self.review_hidden = staged.len().saturating_sub(shown + already);
+        items.sort_by_key(|i| match i.section {
+            ReviewSection::Learned => 0,
+            ReviewSection::Blocked => 1,
+            ReviewSection::Almost => 2,
+        });
+        let ids: BTreeSet<String> = items.iter().map(|i| i.id.clone()).collect();
+        self.review_marked.retain(|id| ids.contains(id));
+        self.review = items;
+        clamp(&mut self.review_idx, self.review.len());
+    }
+
+    fn build_dictionary(&mut self, rules: &[RuleEntry]) {
+        let mut rows = Vec::new();
+        let now = current_epoch_ms();
+        for r in rules {
+            let last = r
+                .last_hit_ms
+                .map(|t| format!("{} ago", format_age_ago(now, t)))
+                .unwrap_or_else(|| "never".to_string());
+            let (section, cols, label) = match r.kind {
+                RuleKind::Word => (
+                    DictSection::Words,
+                    vec![
+                        r.b.clone(),
+                        r.lang.as_str().to_string(),
+                        r.added_by().to_string(),
+                        r.hits.to_string(),
+                        last,
+                    ],
+                    format!("word \"{}\"", r.b),
+                ),
+                RuleKind::Fix => (
+                    DictSection::Fixes,
+                    vec![
+                        r.a.clone(),
+                        r.b.clone(),
+                        String::new(),
+                        r.lang.as_str().to_string(),
+                        r.added_by().to_string(),
+                        r.hits.to_string(),
+                    ],
+                    format!("fix {} → {}", r.a, r.b),
+                ),
+                RuleKind::Context => (
+                    DictSection::Fixes,
+                    vec![
+                        r.a.clone(),
+                        r.b.clone(),
+                        r.prev.clone(),
+                        "en".to_string(),
+                        r.added_by().to_string(),
+                        r.hits.to_string(),
+                    ],
+                    format!("fix {} {} → {}", r.prev, r.a, r.b),
+                ),
+                RuleKind::Snippet => (
+                    DictSection::Snippets,
+                    vec![r.a.clone(), r.b.clone()],
+                    format!("snippet {}", r.a),
+                ),
+                RuleKind::Block => (
+                    DictSection::NeverFix,
+                    vec![r.a.clone(), r.b.clone(), r.added_by().to_string()],
+                    format!("block {} → {}", r.a, r.b),
+                ),
+                RuleKind::Passthrough => (
+                    DictSection::TelexKeep,
+                    vec![r.a.clone(), r.added_by().to_string()],
+                    format!("Telex exception \"{}\"", r.a),
+                ),
+            };
+            let haystack = cols.join(" ").to_lowercase();
+            rows.push(DictRow {
+                section,
+                cols,
+                haystack,
+                label,
+                delete_op: r.delete_op(),
+            });
+        }
+        rows.sort_by(|a, b| a.cols[0].to_lowercase().cmp(&b.cols[0].to_lowercase()));
+        let mut counts = [0usize; 5];
+        for r in &rows {
+            counts[r.section.index()] += 1;
+        }
+        self.dict_counts = counts;
+        self.dict = rows;
+        self.rebuild_dict_view();
+    }
+
+    fn rebuild_dict_view(&mut self) {
+        let needle = self.dict_filter.trim().to_lowercase();
+        self.dict_view = self
+            .dict
             .iter()
             .enumerate()
-            .filter(|(_, row)| self.log_filter.matches(&row.event))
+            .filter(|(_, r)| r.section == self.dict_section)
+            .filter(|(_, r)| needle.is_empty() || r.haystack.contains(&needle))
             .map(|(i, _)| i)
             .collect();
-        clamp_index(&mut self.log_idx, self.filtered_log_indices.len());
+        clamp(&mut self.dict_idx, self.dict_view.len());
     }
 
-    fn mutate_store<F>(&mut self, op: F)
-    where
-        F: FnOnce(&mut RuleStore) -> Result<String, String>,
-    {
+    fn build_settings(
+        &mut self,
+        store: &RuleStore,
+        records: &[smartkey_core::LoggedDiagnosticRecord],
+    ) {
+        self.settings_values = store
+            .list_settings()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+
+        let ap = &store.compiled().app_profiles;
+        let mut seen: Vec<(String, u64)> = Vec::new();
+        for r in records.iter().rev() {
+            let mut names: Vec<&str> = Vec::new();
+            if let Some(a) = r.app.as_deref() {
+                names.push(a);
+            }
+            if let DiagnosticEvent::AppBypass { app, .. } = &r.event {
+                names.push(app.as_str());
+            }
+            for n in names {
+                let norm = normalize_program_id(n);
+                if !norm.is_empty() && !seen.iter().any(|(s, _)| *s == norm) {
+                    seen.push((norm, r.ts_ms));
+                }
+            }
+        }
+        seen.truncate(MAX_SEEN_APPS);
+        for set in [&ap.bypass, &ap.browser, &ap.chat, &ap.prose] {
+            for a in set {
+                if !seen.iter().any(|(s, _)| s == a) {
+                    seen.push((a.clone(), 0));
+                }
+            }
+        }
+
+        let mut rows = vec![SettingsRow::Header("Correction")];
+        rows.extend(CORRECTION_SPECS.iter().copied().map(SettingsRow::Setting));
+        rows.push(SettingsRow::Header("Undo"));
+        rows.extend(UNDO_SPECS.iter().copied().map(SettingsRow::Setting));
+        rows.push(SettingsRow::Header("Vietnamese"));
+        rows.extend(VIETNAMESE_SPECS.iter().copied().map(SettingsRow::Setting));
+        rows.push(SettingsRow::Header("Apps you typed in recently"));
+        for (app, _) in seen {
+            let (profile, reason) = ap.classify_app(&app);
+            rows.push(SettingsRow::App {
+                chosen: ap.classify_explicit_override(&app),
+                app,
+                profile,
+                reason,
+            });
+        }
+        rows.push(SettingsRow::Setting(UNLISTED_SPEC));
+        rows.push(SettingsRow::Header("Logs and diagnostics"));
+        rows.extend(DIAGNOSTIC_SPECS.iter().copied().map(SettingsRow::Setting));
+        self.settings_rows = rows;
+        clamp(&mut self.settings_idx, self.settings_rows.len());
+        if matches!(
+            self.settings_rows.get(self.settings_idx),
+            Some(SettingsRow::Header(_))
+        ) {
+            self.move_settings(1);
+        }
+    }
+
+    // -- status ----------------------------------------------------------------
+
+    fn set_status(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            error: false,
+        });
+    }
+
+    fn set_error(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            error: true,
+        });
+    }
+
+    // -- mutations ---------------------------------------------------------------
+
+    fn apply_ops(&mut self, ops: &[StoreOp]) -> Result<Vec<StoreOp>, (String, Vec<StoreOp>)> {
         if self.parse_locked {
-            self.set_error("rules.toml has syntax errors; fix it before modifying settings");
-            return;
+            return Err((
+                "rules.toml has a syntax error, so changes are blocked until it is fixed"
+                    .to_string(),
+                Vec::new(),
+            ));
         }
         let mut store = match load_rule_store_mut(&self.config_dir, Preset::Balanced) {
             Ok(s) => s,
-            Err(err) => {
-                self.set_error(format!("Load failed: {}", format_cli_error(&err)));
-                return;
-            }
+            Err(err) => return Err((cli_error_text(&err).to_string(), Vec::new())),
         };
         if store.is_parse_locked() {
-            self.parse_locked = true;
-            self.parse_error = store.parse_error().map(str::to_string);
-            self.set_error("rules.toml has syntax errors; fix it before modifying settings");
-            return;
+            return Err((
+                "rules.toml has a syntax error, so changes are blocked until it is fixed"
+                    .to_string(),
+                Vec::new(),
+            ));
         }
-        match op(&mut store) {
-            Ok(msg) => {
-                let reloaded = (self.notify_reload)();
-                self.refresh();
-                if reloaded {
-                    self.set_status(format!("{msg} (Fcitx5 reloaded)"));
-                } else {
-                    self.set_status(format!("{msg} (saved; Fcitx5 not signaled)"));
+        let mut inverses = Vec::new();
+        for op in ops {
+            match op.apply(&mut store) {
+                Ok(Some(inv)) => inverses.push(inv),
+                Ok(None) => {}
+                Err(e) => {
+                    inverses.reverse();
+                    return Err((e, inverses));
                 }
             }
-            Err(err) => {
-                self.refresh();
+        }
+        inverses.reverse();
+        Ok(inverses)
+    }
+
+    fn mutate(&mut self, ops: Vec<StoreOp>, msg: String, undoable: bool) {
+        if ops.is_empty() {
+            return;
+        }
+        let result = self.apply_ops(&ops);
+        let signaled = (self.notify_reload)();
+        self.refresh();
+        let suffix = if signaled {
+            ""
+        } else {
+            " (saved; Fcitx5 is not running)"
+        };
+        match result {
+            Ok(inverses) => {
+                if undoable && !inverses.is_empty() {
+                    self.undo = Some((msg.clone(), inverses));
+                    self.set_status(format!("{msg}{suffix} · u undo"));
+                } else {
+                    self.set_status(format!("{msg}{suffix}"));
+                }
+            }
+            Err((err, partial)) => {
+                if undoable && !partial.is_empty() {
+                    self.undo = Some((msg, partial));
+                }
                 self.set_error(err);
             }
         }
     }
 
-    /// Processes a single key press. Returns `true` when the event loop should exit.
+    fn undo_last(&mut self) {
+        let Some((label, ops)) = self.undo.take() else {
+            self.set_status("Nothing to undo");
+            return;
+        };
+        let result = self.apply_ops(&ops);
+        (self.notify_reload)();
+        self.refresh();
+        match result {
+            Ok(_) => self.set_status(format!("Undid: {label}")),
+            Err((err, _)) => self.set_error(format!("Undo failed: {err}")),
+        }
+    }
+
+    // -- keys ------------------------------------------------------------------
+
+    /// Handles one key press. Returns `true` when the app should exit.
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
@@ -552,335 +1734,361 @@ impl App {
             self.handle_modal_key(key);
             return false;
         }
-        if self.handle_global_key(key) {
-            return matches!(key.code, KeyCode::Char('q'));
+        if self.filter_editing {
+            self.handle_filter_key(key);
+            return false;
         }
-        match self.active_tab {
-            Tab::Overview => self.handle_overview_key(key),
-            Tab::Rules => self.handle_rules_key(key),
-            Tab::Settings => self.handle_settings_key(key),
-            Tab::Apps => self.handle_apps_key(key),
-            Tab::Logs => self.handle_logs_key(key),
+        match key.code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char(c @ '1'..='4') => {
+                self.screen = Screen::from_index((c as u8 - b'1') as usize);
+                return false;
+            }
+            KeyCode::Tab => {
+                self.screen = Screen::from_index(self.screen.index() + 1);
+                return false;
+            }
+            KeyCode::BackTab => {
+                self.screen = Screen::from_index(self.screen.index() + 3);
+                return false;
+            }
+            KeyCode::Char('?') => {
+                self.modal = Some(Modal::Help);
+                return false;
+            }
+            KeyCode::Char('r') => {
+                self.refresh();
+                self.set_status("Reloaded from disk");
+                return false;
+            }
+            KeyCode::Char('u') => {
+                self.undo_last();
+                return false;
+            }
+            _ => {}
+        }
+        match self.screen {
+            Screen::Activity => self.handle_activity_key(key),
+            Screen::Review => self.handle_review_key(key),
+            Screen::Dictionary => self.handle_dictionary_key(key),
+            Screen::Settings => self.handle_settings_key(key),
         }
         false
     }
 
-    fn handle_global_key(&mut self, key: KeyEvent) -> bool {
+    fn handle_filter_key(&mut self, key: KeyEvent) {
+        let on_activity = self.screen == Screen::Activity;
         match key.code {
-            KeyCode::Char('q') => true,
-            KeyCode::Char('1') => {
-                self.active_tab = Tab::Overview;
-                true
+            KeyCode::Enter => self.filter_editing = false,
+            KeyCode::Esc => {
+                self.filter_editing = false;
+                if on_activity {
+                    self.activity_search.clear();
+                } else {
+                    self.dict_filter.clear();
+                }
             }
-            KeyCode::Char('2') => {
-                self.active_tab = Tab::Rules;
-                true
+            KeyCode::Backspace => {
+                if on_activity {
+                    self.activity_search.pop();
+                } else {
+                    self.dict_filter.pop();
+                }
             }
-            KeyCode::Char('3') => {
-                self.active_tab = Tab::Settings;
-                true
+            KeyCode::Char(c) => {
+                if on_activity {
+                    self.activity_search.push(c);
+                } else {
+                    self.dict_filter.push(c);
+                }
             }
-            KeyCode::Char('4') => {
-                self.active_tab = Tab::Apps;
-                true
-            }
-            KeyCode::Char('5') => {
-                self.active_tab = Tab::Logs;
-                true
-            }
-            KeyCode::Tab => {
-                self.active_tab = self.active_tab.next();
-                true
-            }
-            KeyCode::BackTab => {
-                self.active_tab = self.active_tab.prev();
-                true
-            }
-            KeyCode::Char('r') => {
-                self.refresh();
-                self.set_status("Refreshed from disk");
-                true
-            }
-            KeyCode::Char('?') => {
-                self.modal = Some(Modal::Help);
-                true
-            }
-            _ => false,
+            _ => {}
+        }
+        if on_activity {
+            self.rebuild_activity_view();
+        } else {
+            self.rebuild_dict_view();
         }
     }
 
-    fn handle_overview_key(&mut self, key: KeyEvent) {
+    fn selected_activity(&self) -> Option<&ActivityRow> {
+        self.activity_view
+            .get(self.activity_idx)
+            .and_then(|&i| self.activity.get(i))
+    }
+
+    fn handle_activity_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                step(&mut self.activity_idx, 1, self.activity_view.len())
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                step(&mut self.activity_idx, -1, self.activity_view.len())
+            }
+            KeyCode::PageDown => step(&mut self.activity_idx, 10, self.activity_view.len()),
+            KeyCode::PageUp => step(&mut self.activity_idx, -10, self.activity_view.len()),
+            KeyCode::Char('/') => self.filter_editing = true,
+            KeyCode::Esc if !self.activity_search.is_empty() => {
+                self.activity_search.clear();
+                self.rebuild_activity_view();
+            }
+            KeyCode::Char('f') => {
+                self.activity_filter = self.activity_filter.next();
+                self.rebuild_activity_view();
+                self.set_status(format!("Showing {}", self.activity_filter.label()));
+            }
             KeyCode::Char('e') => {
-                let next = !self.overview.enabled;
-                self.mutate_store(|store| {
-                    store
-                        .set_enabled(next)
-                        .map_err(|e| format!("Toggle enabled failed: {e}"))?;
-                    Ok(format!(
-                        "SmartKey {}",
-                        if next { "enabled" } else { "disabled" }
-                    ))
-                });
+                let next = !self.enabled;
+                self.mutate(
+                    vec![StoreOp::SetSetting {
+                        key: "settings.enabled".to_string(),
+                        value: next.to_string(),
+                    }],
+                    if next {
+                        "SmartKey on".to_string()
+                    } else {
+                        "SmartKey off".to_string()
+                    },
+                    true,
+                );
             }
-            KeyCode::Char('l') => {
-                let next = !self.overview.vi_lotus_enabled;
-                self.mutate_store(|store| {
-                    store
-                        .set_plugin_enabled("vi-lotus", next)
-                        .map_err(|e| format!("Toggle vi-lotus failed: {e}"))?;
-                    Ok(format!(
-                        "vi-lotus {}",
-                        if next { "enabled" } else { "disabled" }
-                    ))
-                });
+            KeyCode::Char('x') => {
+                let input = self
+                    .selected_activity()
+                    .and_then(|r| explain_target(&r.event))
+                    .map(|(prev, tok)| match prev {
+                        Some(p) => format!("{p} {tok}"),
+                        None => tok,
+                    })
+                    .unwrap_or_default();
+                self.modal = Some(Modal::ExplainInput { input });
             }
-            KeyCode::Char('R') => {
-                if (self.notify_reload)() {
-                    self.set_status("Signaled Fcitx5 addon reload");
-                } else {
-                    self.set_error("Fcitx5 reload signal not acknowledged (daemon offline?)");
+            KeyCode::Enter => {
+                if let Some(row) = self.selected_activity() {
+                    let items = activity_actions(row);
+                    let title = if row.change.is_empty() {
+                        row.why.clone()
+                    } else {
+                        row.change.clone()
+                    };
+                    self.modal = Some(Modal::Actions {
+                        title,
+                        items,
+                        selected: 0,
+                    });
                 }
             }
             _ => {}
         }
     }
 
-    fn handle_rules_key(&mut self, key: KeyEvent) {
+    fn handle_review_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('v') | KeyCode::Left | KeyCode::Right => {
-                self.rules_view = match self.rules_view {
-                    RulesSubView::Active => RulesSubView::Staged,
-                    RulesSubView::Staged => RulesSubView::Active,
-                };
+            KeyCode::Down | KeyCode::Char('j') => step(&mut self.review_idx, 1, self.review.len()),
+            KeyCode::Up | KeyCode::Char('k') => step(&mut self.review_idx, -1, self.review.len()),
+            KeyCode::Char(' ') => {
+                if let Some(item) = self.review.get(self.review_idx) {
+                    let id = item.id.clone();
+                    if !self.review_marked.remove(&id) {
+                        self.review_marked.insert(id);
+                    }
+                    step(&mut self.review_idx, 1, self.review.len());
+                }
             }
-            KeyCode::Down | KeyCode::Char('j') => match self.rules_view {
-                RulesSubView::Active => {
-                    move_selection(&mut self.active_rule_idx, 1, self.filtered_rule_indices.len());
+            KeyCode::Char('a') => {
+                if let Some(item) = self.review.get(self.review_idx).cloned() {
+                    self.mutate(vec![item.keep_op], format!("Kept {}", item.title), false);
                 }
-                RulesSubView::Staged => {
-                    move_selection(&mut self.staged_idx, 1, self.staged_entries.len());
-                }
-            },
-            KeyCode::Up | KeyCode::Char('k') => match self.rules_view {
-                RulesSubView::Active => {
-                    move_selection(
-                        &mut self.active_rule_idx,
-                        -1,
-                        self.filtered_rule_indices.len(),
+            }
+            KeyCode::Char('d') => {
+                if let Some(item) = self.review.get(self.review_idx).cloned() {
+                    self.mutate(
+                        vec![item.remove_op],
+                        format!("Removed {}", item.title),
+                        true,
                     );
                 }
-                RulesSubView::Staged => {
-                    move_selection(&mut self.staged_idx, -1, self.staged_entries.len());
+            }
+            KeyCode::Char('A') => {
+                let ops: Vec<StoreOp> = self.marked_review().map(|i| i.keep_op.clone()).collect();
+                if ops.is_empty() {
+                    self.set_status("Mark items with Space first");
+                } else {
+                    let n = ops.len();
+                    self.review_marked.clear();
+                    self.mutate(ops, format!("Kept {n} items"), false);
                 }
-            },
-            KeyCode::Char('/') if self.rules_view == RulesSubView::Active => {
-                self.modal = Some(Modal::FilterInput {
-                    input: self.rules_filter.clone(),
-                });
             }
-            KeyCode::Esc if self.rules_view == RulesSubView::Active && !self.rules_filter.is_empty() =>
-            {
-                self.rules_filter.clear();
-                self.rebuild_rule_filter();
-                self.set_status("Cleared rule filter");
-            }
-            KeyCode::Char('a') if self.rules_view == RulesSubView::Active => {
-                self.modal = Some(Modal::AddRule {
-                    kind: AddRuleKind::Fix,
-                    input: String::new(),
-                });
-            }
-            KeyCode::Char('P') if self.rules_view == RulesSubView::Active => {
-                self.modal = Some(Modal::Confirm {
-                    prompt: "Prune unused auto-learned fixes older than 14 days (0 hits)?".to_string(),
-                    action: ConfirmAction::PruneRules,
-                });
-            }
-            KeyCode::Char('p') if self.rules_view == RulesSubView::Staged => {
-                self.promote_selected_staged();
-            }
-            KeyCode::Char('d') | KeyCode::Delete => match self.rules_view {
-                RulesSubView::Active => {
-                    if let Some(&row_idx) = self.filtered_rule_indices.get(self.active_rule_idx) {
-                        let row = &self.active_rules[row_idx];
-                        self.modal = Some(Modal::Confirm {
-                            prompt: format!("Delete {} rule '{}'?", row.kind, row.display),
-                            action: ConfirmAction::DeleteActiveRule {
-                                display: row.display.clone(),
-                                target: row.delete_target.clone(),
-                            },
-                        });
-                    }
+            KeyCode::Char('D') => {
+                let ops: Vec<StoreOp> = self.marked_review().map(|i| i.remove_op.clone()).collect();
+                if ops.is_empty() {
+                    self.set_status("Mark items with Space first");
+                } else {
+                    let n = ops.len();
+                    self.modal = Some(Modal::Confirm {
+                        prompt: format!("Remove {n} marked items?"),
+                        ops,
+                        msg: format!("Removed {n} items"),
+                    });
                 }
-                RulesSubView::Staged => {
-                    if let Some(entry) = self.staged_entries.get(self.staged_idx) {
-                        self.modal = Some(Modal::Confirm {
-                            prompt: format!(
-                                "Dismiss staged [{}] '{}'?",
-                                entry.queue, entry.display
-                            ),
-                            action: ConfirmAction::DismissStaged {
-                                queue: entry.queue.to_string(),
-                                key: entry.key.clone(),
-                                display: entry.display.clone(),
-                            },
-                        });
-                    }
-                }
-            },
+            }
             _ => {}
         }
     }
 
-    fn promote_selected_staged(&mut self) {
-        let Some((queue, key, display, canonical)) =
-            self.staged_entries.get(self.staged_idx).map(|entry| {
-                (
-                    entry.queue,
-                    entry.key.clone(),
-                    entry.display.clone(),
-                    entry.canonical.clone(),
-                )
-            })
-        else {
-            return;
-        };
+    fn marked_review(&self) -> impl Iterator<Item = &ReviewItem> {
+        self.review
+            .iter()
+            .filter(|i| self.review_marked.contains(&i.id))
+    }
 
-        if !matches!(
-            queue,
-            "fix" | "case_fix" | "context" | "untouched_word" | "telex_passthrough"
-        ) {
-            self.set_status(format!(
-                "Cannot promote queue '{queue}'; press d to dismiss"
-            ));
+    fn handle_dictionary_key(&mut self, key: KeyEvent) {
+        let switch = |app: &mut Self, delta: isize| {
+            let n = DictSection::ALL.len() as isize;
+            let i = (app.dict_section.index() as isize + delta).rem_euclid(n) as usize;
+            app.dict_section = DictSection::ALL[i];
+            app.dict_idx = 0;
+            app.rebuild_dict_view();
+        };
+        match key.code {
+            KeyCode::Right | KeyCode::Char('l') => switch(self, 1),
+            KeyCode::Left | KeyCode::Char('h') => switch(self, -1),
+            KeyCode::Down | KeyCode::Char('j') => step(&mut self.dict_idx, 1, self.dict_view.len()),
+            KeyCode::Up | KeyCode::Char('k') => step(&mut self.dict_idx, -1, self.dict_view.len()),
+            KeyCode::Char('/') => self.filter_editing = true,
+            KeyCode::Esc if !self.dict_filter.is_empty() => {
+                self.dict_filter.clear();
+                self.rebuild_dict_view();
+            }
+            KeyCode::Char('n') => self.modal = Some(Modal::Form(Form::new(self.dict_section))),
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let Some(row) = self
+                    .dict_view
+                    .get(self.dict_idx)
+                    .and_then(|&i| self.dict.get(i))
+                    .cloned()
+                {
+                    self.mutate(vec![row.delete_op], format!("Removed {}", row.label), true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_settings(&mut self, delta: isize) {
+        let len = self.settings_rows.len();
+        if len == 0 {
             return;
         }
-
-        self.mutate_store(|store| {
-            promote_staged_entry(store, queue, &key, canonical.as_deref())?;
-            store
-                .dismiss_staged_entry(queue, &key)
-                .map_err(|e| format!("Dismiss after promote failed: {e}"))?;
-            Ok(format!("Promoted [{queue}] {display}"))
-        });
+        let mut i = self.settings_idx as isize;
+        loop {
+            let next = i + delta;
+            if next < 0 || next >= len as isize {
+                break;
+            }
+            i = next;
+            if !matches!(self.settings_rows[i as usize], SettingsRow::Header(_)) {
+                self.settings_idx = i as usize;
+                return;
+            }
+        }
+        if matches!(
+            self.settings_rows.get(self.settings_idx),
+            Some(SettingsRow::Header(_))
+        ) && delta != 0
+        {
+            self.move_settings(-delta.signum());
+        }
     }
 
     fn handle_settings_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                move_selection(&mut self.setting_idx, 1, self.settings.len());
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                move_selection(&mut self.setting_idx, -1, self.settings.len());
-            }
-            KeyCode::Char(' ') | KeyCode::Enter => {
-                let Some((setting_key, current_val)) = self.settings.get(self.setting_idx).cloned()
-                else {
-                    return;
-                };
-                if BOOLEAN_SETTINGS.contains(&setting_key) {
-                    let next = if current_val == "true" {
-                        "false"
-                    } else {
-                        "true"
-                    };
-                    self.apply_setting(setting_key, next);
-                } else if let Some(options) = enum_setting_options(setting_key) {
-                    let cur_pos = options.iter().position(|&v| v == current_val).unwrap_or(0);
-                    let next = options[(cur_pos + 1) % options.len()];
-                    self.apply_setting(setting_key, next);
-                } else {
-                    self.modal = Some(Modal::EditSetting {
-                        key: setting_key.to_string(),
-                        input: current_val,
-                    });
+            KeyCode::Down | KeyCode::Char('j') => self.move_settings(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_settings(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.change_setting(1),
+            KeyCode::Left | KeyCode::Char('h') => self.change_setting(-1),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                match self.settings_rows.get(self.settings_idx).cloned() {
+                    Some(SettingsRow::Setting(spec)) => match spec.control {
+                        Control::Number { .. } => {
+                            let current = self
+                                .settings_values
+                                .get(spec.key)
+                                .cloned()
+                                .unwrap_or_default();
+                            self.modal = Some(Modal::EditNumber {
+                                spec,
+                                current,
+                                input: String::new(),
+                            });
+                        }
+                        _ => self.change_setting(1),
+                    },
+                    Some(SettingsRow::App { app, chosen, .. }) => {
+                        let selected = APP_CHOICES
+                            .iter()
+                            .position(|(p, _, _)| *p == chosen)
+                            .unwrap_or(0);
+                        self.modal = Some(Modal::AppPicker { app, selected });
+                    }
+                    _ => {}
                 }
             }
             _ => {}
         }
     }
 
-    fn apply_setting(&mut self, key: &str, value: &str) {
-        let key_owned = key.to_string();
-        let val_owned = value.to_string();
-        self.mutate_store(|store| {
-            let (canon, saved) = store
-                .set_setting(&key_owned, &val_owned)
-                .map_err(|e| format!("Update {key_owned} failed: {e}"))?;
-            Ok(format!("{canon} = {saved}"))
-        });
-    }
-
-    fn handle_apps_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                move_selection(&mut self.app_idx, 1, self.app_overrides.len());
+    fn change_setting(&mut self, delta: i32) {
+        match self.settings_rows.get(self.settings_idx).cloned() {
+            Some(SettingsRow::Setting(spec)) => {
+                let current = self
+                    .settings_values
+                    .get(spec.key)
+                    .cloned()
+                    .unwrap_or_default();
+                let next = match spec.control {
+                    Control::Toggle => (current != "true").to_string(),
+                    Control::Choice(opts) => {
+                        let pos = opts.iter().position(|(v, _)| *v == current).unwrap_or(0) as i32;
+                        let n = opts.len() as i32;
+                        opts[(pos + delta).rem_euclid(n) as usize].0.to_string()
+                    }
+                    Control::Number {
+                        step,
+                        min,
+                        max,
+                        decimals,
+                        ..
+                    } => {
+                        let cur: f64 = current.parse().unwrap_or(min);
+                        let v = (cur + step * f64::from(delta)).clamp(min, max);
+                        format_number(v, decimals)
+                    }
+                };
+                let shown = display_setting(&spec, &next);
+                self.mutate(
+                    vec![StoreOp::SetSetting {
+                        key: spec.key.to_string(),
+                        value: next,
+                    }],
+                    format!("{}: {shown}", spec.label),
+                    true,
+                );
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                move_selection(&mut self.app_idx, -1, self.app_overrides.len());
-            }
-            KeyCode::Char('u') => {
-                let cur_pos = UNKNOWN_POLICY_OPTIONS
+            Some(SettingsRow::App { app, chosen, .. }) => {
+                let pos = APP_CHOICES
                     .iter()
-                    .position(|&v| v == self.unknown_app_policy)
-                    .unwrap_or(0);
-                let next = UNKNOWN_POLICY_OPTIONS[(cur_pos + 1) % UNKNOWN_POLICY_OPTIONS.len()];
-                self.apply_setting("app_profiles.unknown_app_policy", next);
-            }
-            KeyCode::Char('a') => {
-                self.modal = Some(Modal::AddApp {
-                    profile: AppProfile::Bypass,
-                    input: String::new(),
-                });
-            }
-            KeyCode::Char('d') | KeyCode::Delete => {
-                if let Some(row) = self.app_overrides.get(self.app_idx) {
-                    self.modal = Some(Modal::Confirm {
-                        prompt: format!(
-                            "Remove {} override for '{}'?",
-                            app_profile_label(row.profile),
-                            row.app_id
-                        ),
-                        action: ConfirmAction::DeleteAppOverride {
-                            profile: row.profile,
-                            app_id: row.app_id.clone(),
-                        },
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_logs_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                move_selection(&mut self.log_idx, 1, self.filtered_log_indices.len());
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                move_selection(&mut self.log_idx, -1, self.filtered_log_indices.len());
-            }
-            KeyCode::Char('f') => {
-                self.log_filter = match self.log_filter {
-                    LogFilter::All => LogFilter::FixedOnly,
-                    LogFilter::FixedOnly => LogFilter::ManualOnly,
-                    LogFilter::ManualOnly => LogFilter::UnfixedOnly,
-                    LogFilter::UnfixedOnly => LogFilter::All,
-                };
-                self.rebuild_log_filter();
-                self.set_status(format!("Log filter: {}", log_filter_label(self.log_filter)));
-            }
-            KeyCode::Char('x') => {
-                self.modal = Some(Modal::ExplainInput {
-                    input: String::new(),
-                });
-            }
-            KeyCode::Char('c') => {
-                self.modal = Some(Modal::Confirm {
-                    prompt: "Clear all durable event logs and in-memory history?".to_string(),
-                    action: ConfirmAction::ClearLogs,
-                });
+                    .position(|(p, _, _)| *p == chosen)
+                    .unwrap_or(0) as i32;
+                let next = APP_CHOICES[(pos + delta).rem_euclid(APP_CHOICES.len() as i32) as usize];
+                self.mutate(
+                    vec![StoreOp::SetAppProfile {
+                        app: app.clone(),
+                        profile: next.0,
+                    }],
+                    format!("{app}: {}", next.1.to_lowercase()),
+                    true,
+                );
             }
             _ => {}
         }
@@ -891,135 +2099,73 @@ impl App {
             return;
         };
         match modal {
-            Modal::Help => match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q') => {}
-                _ => self.modal = Some(Modal::Help),
-            },
-            Modal::Confirm { prompt, action } => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.execute_confirm(action);
+            Modal::Help | Modal::Info { .. } => {
+                if !matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')
+                ) {
+                    self.modal = Some(modal);
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.set_status("Cancelled");
+            }
+            Modal::Actions {
+                title,
+                items,
+                mut selected,
+            } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {}
+                KeyCode::Down | KeyCode::Char('j') => {
+                    step(&mut selected, 1, items.len());
+                    self.modal = Some(Modal::Actions {
+                        title,
+                        items,
+                        selected,
+                    });
                 }
-                _ => self.modal = Some(Modal::Confirm { prompt, action }),
-            },
-            Modal::FilterInput { mut input } => match key.code {
-                KeyCode::Esc => {}
-                KeyCode::Enter => {
-                    self.rules_filter = input;
-                    self.rebuild_rule_filter();
-                    let note = if self.rules_filter.trim().is_empty() {
-                        "Cleared rule filter".to_string()
-                    } else {
-                        format!(
-                            "Filter '{}' ({} matches)",
-                            self.rules_filter.trim(),
-                            self.filtered_rule_indices.len()
-                        )
-                    };
-                    self.set_status(note);
-                }
-                KeyCode::Backspace => {
-                    input.pop();
-                    self.modal = Some(Modal::FilterInput { input });
-                }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    self.modal = Some(Modal::FilterInput { input });
-                }
-                _ => self.modal = Some(Modal::FilterInput { input }),
-            },
-            Modal::AddRule { kind, mut input } => match key.code {
-                KeyCode::Esc => {}
-                KeyCode::Tab => {
-                    self.modal = Some(Modal::AddRule {
-                        kind: kind.next(),
-                        input,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    step(&mut selected, -1, items.len());
+                    self.modal = Some(Modal::Actions {
+                        title,
+                        items,
+                        selected,
                     });
                 }
                 KeyCode::Enter => {
-                    let trimmed = input.trim().to_string();
-                    if trimmed.is_empty() {
-                        self.set_error("Rule input cannot be empty");
-                    } else {
-                        self.execute_add_rule(kind, &trimmed);
+                    if let Some(item) = items.get(selected).cloned() {
+                        self.run_action(item.action);
                     }
                 }
-                KeyCode::Backspace => {
-                    input.pop();
-                    self.modal = Some(Modal::AddRule { kind, input });
-                }
                 KeyCode::Char(c) => {
-                    input.push(c);
-                    self.modal = Some(Modal::AddRule { kind, input });
-                }
-                _ => self.modal = Some(Modal::AddRule { kind, input }),
-            },
-            Modal::EditSetting { key: skey, mut input } => match key.code {
-                KeyCode::Esc => {}
-                KeyCode::Enter => {
-                    let val = input.trim().to_string();
-                    self.apply_setting(&skey, &val);
-                }
-                KeyCode::Backspace => {
-                    input.pop();
-                    self.modal = Some(Modal::EditSetting { key: skey, input });
-                }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    self.modal = Some(Modal::EditSetting { key: skey, input });
-                }
-                _ => self.modal = Some(Modal::EditSetting { key: skey, input }),
-            },
-            Modal::AddApp {
-                profile,
-                mut input,
-            } => match key.code {
-                KeyCode::Esc => {}
-                KeyCode::Tab => {
-                    self.modal = Some(Modal::AddApp {
-                        profile: next_app_profile(profile),
-                        input,
-                    });
-                }
-                KeyCode::Enter => {
-                    let app_id = input.trim().to_string();
-                    if app_id.is_empty() {
-                        self.set_error("App ID cannot be empty");
+                    if let Some(item) = items.iter().find(|i| i.key == c).cloned() {
+                        self.run_action(item.action);
                     } else {
-                        self.mutate_store(|store| {
-                            let added = store
-                                .add_app_profile_override(profile, &app_id)
-                                .map_err(|e| format!("Add app override failed: {e}"))?;
-                            if added {
-                                Ok(format!(
-                                    "Added {} override '{}'",
-                                    app_profile_label(profile),
-                                    app_id
-                                ))
-                            } else {
-                                Ok(format!("Override '{app_id}' already present"))
-                            }
+                        self.modal = Some(Modal::Actions {
+                            title,
+                            items,
+                            selected,
                         });
                     }
                 }
-                KeyCode::Backspace => {
-                    input.pop();
-                    self.modal = Some(Modal::AddApp { profile, input });
+                _ => {
+                    self.modal = Some(Modal::Actions {
+                        title,
+                        items,
+                        selected,
+                    })
                 }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    self.modal = Some(Modal::AddApp { profile, input });
-                }
-                _ => self.modal = Some(Modal::AddApp { profile, input }),
             },
             Modal::ExplainInput { mut input } => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => {
-                    let query = input.trim().to_string();
-                    if !query.is_empty() {
-                        self.run_explain_query(&query);
+                    let (lang, rest) = split_lang_prefix(input.trim());
+                    let rest = rest.trim();
+                    let (prev, token) = match rest.rsplit_once(char::is_whitespace) {
+                        Some((p, t)) => (Some(p.trim().to_string()), t.trim().to_string()),
+                        None => (None, rest.to_string()),
+                    };
+                    if token.is_empty() {
+                        self.modal = Some(Modal::ExplainInput { input });
+                    } else {
+                        self.run_action(RowAction::Explain { lang, prev, token });
                     }
                 }
                 KeyCode::Backspace => {
@@ -1032,182 +2178,157 @@ impl App {
                 }
                 _ => self.modal = Some(Modal::ExplainInput { input }),
             },
+            Modal::EditNumber {
+                spec,
+                current,
+                mut input,
+            } => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    let value = input.trim().to_string();
+                    if value.is_empty() {
+                        self.modal = Some(Modal::EditNumber {
+                            spec,
+                            current,
+                            input,
+                        });
+                    } else {
+                        let shown = display_setting(&spec, &value);
+                        self.mutate(
+                            vec![StoreOp::SetSetting {
+                                key: spec.key.to_string(),
+                                value,
+                            }],
+                            format!("{}: {shown}", spec.label),
+                            true,
+                        );
+                    }
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.modal = Some(Modal::EditNumber {
+                        spec,
+                        current,
+                        input,
+                    });
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
+                    input.push(c);
+                    self.modal = Some(Modal::EditNumber {
+                        spec,
+                        current,
+                        input,
+                    });
+                }
+                _ => {
+                    self.modal = Some(Modal::EditNumber {
+                        spec,
+                        current,
+                        input,
+                    })
+                }
+            },
+            Modal::AppPicker { app, mut selected } => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Down | KeyCode::Char('j') => {
+                    step(&mut selected, 1, APP_CHOICES.len());
+                    self.modal = Some(Modal::AppPicker { app, selected });
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    step(&mut selected, -1, APP_CHOICES.len());
+                    self.modal = Some(Modal::AppPicker { app, selected });
+                }
+                KeyCode::Enter => {
+                    let (profile, label, _) = APP_CHOICES[selected];
+                    self.mutate(
+                        vec![StoreOp::SetAppProfile {
+                            app: app.clone(),
+                            profile,
+                        }],
+                        format!("{app}: {}", label.to_lowercase()),
+                        true,
+                    );
+                }
+                _ => self.modal = Some(Modal::AppPicker { app, selected }),
+            },
+            Modal::Form(mut form) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Tab | KeyCode::Down => {
+                    form.focus = (form.focus + 1) % form.fields.len();
+                    self.modal = Some(Modal::Form(form));
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    form.focus = (form.focus + form.fields.len() - 1) % form.fields.len();
+                    self.modal = Some(Modal::Form(form));
+                }
+                KeyCode::Enter => match form.first_missing() {
+                    Some(i) => {
+                        form.focus = i;
+                        self.modal = Some(Modal::Form(form));
+                    }
+                    None => {
+                        let (ops, msg) = form.to_ops();
+                        self.mutate(ops, msg, true);
+                    }
+                },
+                KeyCode::Backspace => {
+                    let f = form.focus;
+                    form.fields[f].value.pop();
+                    self.modal = Some(Modal::Form(form));
+                }
+                KeyCode::Char(c) => {
+                    let f = form.focus;
+                    form.fields[f].value.push(c);
+                    self.modal = Some(Modal::Form(form));
+                }
+                _ => self.modal = Some(Modal::Form(form)),
+            },
+            Modal::Confirm { prompt, ops, msg } => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.review_marked.clear();
+                    self.mutate(ops, msg, true);
+                }
+                KeyCode::Char('n') | KeyCode::Esc => self.set_status("Cancelled"),
+                _ => self.modal = Some(Modal::Confirm { prompt, ops, msg }),
+            },
         }
     }
 
-    fn execute_confirm(&mut self, action: ConfirmAction) {
+    fn run_action(&mut self, action: RowAction) {
         match action {
-            ConfirmAction::DeleteActiveRule { display, target } => {
-                self.mutate_store(|store| {
-                    let removed = match &target {
-                        RuleDeleteTarget::Fix { lang, typed } => store.remove_correction(lang, typed),
-                        RuleDeleteTarget::Context { prev, typed } => {
-                            store.remove_context_correction(prev, typed)
+            RowAction::Ops { ops, msg } => self.mutate(ops, msg, true),
+            RowAction::Explain { lang, prev, token } => {
+                let lines = self.explain(&lang, prev.as_deref(), &token);
+                self.modal = Some(Modal::Info {
+                    title: format!(
+                        "Why: {}",
+                        match &prev {
+                            Some(p) => format!("{p} {token}"),
+                            None => token.clone(),
                         }
-                        RuleDeleteTarget::Snippet { trigger } => store.remove_snippet(trigger),
-                        RuleDeleteTarget::Word { lang, word } => {
-                            store.remove_user_personal_word(lang, word)
-                        }
-                        RuleDeleteTarget::Block { typed, rejected } => {
-                            store.remove_blocklist_pair(typed, rejected)
-                        }
-                        RuleDeleteTarget::Passthrough { raw } => {
-                            store.remove_telex_passthrough(raw)
-                        }
-                    }
-                    .map_err(|e| format!("Delete rule failed: {e}"))?;
-                    if removed {
-                        Ok(format!("Deleted '{display}'"))
-                    } else {
-                        Ok(format!("Rule '{display}' was not found"))
-                    }
+                    ),
+                    lines,
                 });
             }
-            ConfirmAction::DismissStaged {
-                queue,
-                key,
-                display,
-            } => {
-                self.mutate_store(|store| {
-                    let removed = store
-                        .dismiss_staged_entry(&queue, &key)
-                        .map_err(|e| format!("Dismiss staged failed: {e}"))?;
-                    if removed {
-                        Ok(format!("Dismissed [{queue}] '{display}'"))
-                    } else {
-                        Ok(format!("Staged entry '{display}' already gone"))
-                    }
-                });
+            RowAction::PickApp { app } => {
+                let app = normalize_program_id(&app);
+                let chosen = load_rule_store_readonly(&self.config_dir, Preset::Balanced)
+                    .ok()
+                    .and_then(|(s, _)| s.compiled().app_profiles.classify_explicit_override(&app));
+                let selected = APP_CHOICES
+                    .iter()
+                    .position(|(p, _, _)| *p == chosen)
+                    .unwrap_or(0);
+                self.modal = Some(Modal::AppPicker { app, selected });
             }
-            ConfirmAction::PruneRules => {
-                let now_ms = current_epoch_ms();
-                let opts = PruneOptions {
-                    older_than_ms: 14 * 86_400_000,
-                    max_hits: 0,
-                    kinds: PruneKinds::default(),
-                    include_manual: false,
-                    dry_run: false,
-                };
-                self.mutate_store(|store| {
-                    let report = store
-                        .prune_rules(now_ms, &opts)
-                        .map_err(|e| format!("Prune failed: {e}"))?;
-                    Ok(format!("Pruned {} stale rule(s)", report.removed_count))
-                });
-            }
-            ConfirmAction::DeleteAppOverride { profile, app_id } => {
-                self.mutate_store(|store| {
-                    let removed = store
-                        .remove_app_profile_override(Some(profile), &app_id)
-                        .map_err(|e| format!("Remove app override failed: {e}"))?;
-                    if removed {
-                        Ok(format!(
-                            "Removed {} override '{app_id}'",
-                            app_profile_label(profile)
-                        ))
-                    } else {
-                        Ok(format!("Override '{app_id}' not found"))
-                    }
-                });
-            }
-            ConfirmAction::ClearLogs => {
-                let log_dir = self.log_dir.clone();
-                self.mutate_store(|store| {
-                    store
-                        .clear_diagnostic_logs()
-                        .map_err(|e| format!("Clear learner logs failed: {e}"))?;
-                    let files = EventLog::clear_all_files(&log_dir)
-                        .map_err(|e| format!("Clear log files failed: {e}"))?;
-                    Ok(format!("Cleared diagnostic logs ({files} file(s))"))
-                });
-            }
+            RowAction::GoReview => self.screen = Screen::Review,
         }
     }
 
-    fn execute_add_rule(&mut self, kind: AddRuleKind, raw: &str) {
-        let input = raw.to_string();
-        self.mutate_store(|store| match kind {
-            AddRuleKind::Fix => {
-                let (lang, rest) = split_optional_lang(&input);
-                let Some((typed, fixed)) = split_pair(rest, &["->", "="]) else {
-                    return Err("Expected typed=fixed or vi:typed=fixed".to_string());
-                };
-                store
-                    .set_user_correction(&lang, typed, fixed)
-                    .map_err(|e| format!("Add fix failed: {e}"))?;
-                Ok(format!("Saved fix [{}] {typed} -> {fixed}", lang.as_str()))
-            }
-            AddRuleKind::Context => {
-                let Some((lhs, fixed)) = split_pair(&input, &["->", "="]) else {
-                    return Err("Expected 'prev typed=fixed'".to_string());
-                };
-                let Some((prev, typed)) = split_context_lhs(lhs) else {
-                    return Err("Expected two words before '=': 'prev typed=fixed'".to_string());
-                };
-                store
-                    .set_user_context_correction(prev, typed, fixed)
-                    .map_err(|e| format!("Add context failed: {e}"))?;
-                Ok(format!("Saved context '{prev} {typed}' -> {fixed}"))
-            }
-            AddRuleKind::Snippet => {
-                let Some((trigger, expansion)) = split_pair(&input, &["->", "="]) else {
-                    return Err("Expected trigger=expansion".to_string());
-                };
-                store
-                    .set_snippet(trigger, expansion)
-                    .map_err(|e| format!("Add snippet failed: {e}"))?;
-                Ok(format!("Saved snippet {trigger} -> {expansion}"))
-            }
-            AddRuleKind::Word => {
-                let (lang, word) = split_optional_lang(&input);
-                let trimmed = word.trim();
-                if trimmed.is_empty() {
-                    return Err("Word cannot be empty".to_string());
-                }
-                store
-                    .add_user_personal_word(&lang, trimmed)
-                    .map_err(|e| format!("Add word failed: {e}"))?;
-                Ok(format!("Added personal word [{}] {trimmed}", lang.as_str()))
-            }
-            AddRuleKind::Block => {
-                let Some((typed, rejected)) = split_pair(&input, &["!->", "!=", "="]) else {
-                    return Err("Expected typed=rejected".to_string());
-                };
-                store
-                    .add_user_blocklist_pair(typed, rejected)
-                    .map_err(|e| format!("Add block failed: {e}"))?;
-                Ok(format!("Blocked {typed} !-> {rejected}"))
-            }
-            AddRuleKind::Passthrough => {
-                let raw_ascii = input.trim();
-                if raw_ascii.is_empty() {
-                    return Err("Passthrough token cannot be empty".to_string());
-                }
-                store
-                    .add_user_telex_passthrough(raw_ascii)
-                    .map_err(|e| format!("Add passthrough failed: {e}"))?;
-                Ok(format!("Added Telex passthrough '{raw_ascii}'"))
-            }
-        });
-    }
-
-    fn run_explain_query(&mut self, query: &str) {
-        let (lang, rest) = split_optional_lang(query);
-        let trimmed = rest.trim();
-        let (prev, token) = match trimmed.rsplit_once(char::is_whitespace) {
-            Some((p, t)) => (Some(p.trim()), t.trim()),
-            None => (None, trimmed),
-        };
-        if token.is_empty() {
-            self.set_error("Explain query token cannot be empty");
-            return;
-        }
+    fn explain(&self, lang: &LangId, prev: Option<&str>, token: &str) -> Vec<String> {
         let (mut store, _) = match load_rule_store_readonly(&self.config_dir, Preset::Balanced) {
             Ok(pair) => pair,
-            Err(err) => {
-                self.set_error(format!("Explain load failed: {}", format_cli_error(&err)));
-                return;
-            }
+            Err(err) => return vec![format!("Could not load settings: {}", cli_error_text(&err))],
         };
         store.set_active_lang(lang.clone());
         let engine = SmartKeyEngine::new_auto(store);
@@ -1216,696 +2337,852 @@ impl App {
             ..EvalContext::default()
         };
         let exp = engine.explain_token(token, &ctx);
+        let aggr = engine.store().scorer_config().aggressiveness;
+        let (min_score, min_margin) = LatinScorer::thresholds(aggr);
 
         let mut lines = Vec::new();
-        let verdict = match &exp.outcome {
+        match &exp.outcome {
             EvalOutcome::Autocorrect {
                 replacement,
                 kind,
                 score,
                 margin,
-            } => format!(
-                "[{lang_s}] {token:?} -> {replacement:?} ({}, score={score:.2}, margin={margin:.2})",
-                match_kind_slug(*kind),
-                lang_s = lang.as_str(),
-            ),
-            EvalOutcome::Unchanged {
-                reason,
-                do_not_learn,
-            } => format!(
-                "[{lang_s}] {token:?} -> UNCHANGED ({}, do_not_learn={do_not_learn})",
-                match_kind_slug(*reason),
-                lang_s = lang.as_str(),
-            ),
-        };
-        lines.push(verdict);
-        if exp.top_candidates.is_empty() {
-            lines.push("No candidates ranked.".to_string());
-        } else {
-            for (idx, c) in exp.top_candidates.iter().take(5).enumerate() {
+            } => {
+                lines.push(format!("SmartKey changes “{token}” → “{replacement}”."));
                 lines.push(format!(
-                    "  #{:<2} {:<16} score={:<6.2} edit={:<5.2} freq={:<3} [{}]",
-                    idx + 1,
-                    c.replacement,
-                    c.score,
-                    c.edit_cost,
-                    c.freq,
-                    match_kind_slug(c.kind)
+                    "Reason: {} · score {score:.2} (needs {min_score:.2}) · lead {margin:.2} (needs {min_margin:.2})",
+                    kind_label(*kind)
+                ));
+            }
+            EvalOutcome::Unchanged { reason, .. } => {
+                lines.push(format!("SmartKey leaves “{token}” as typed."));
+                lines.push(format!(
+                    "Reason: {} · a fix needs score {min_score:.2} and lead {min_margin:.2}",
+                    kind_label(*reason)
                 ));
             }
         }
-        self.explain_lines = lines;
-        self.set_status(format!("Explained '{token}'"));
+        if !exp.top_candidates.is_empty() {
+            lines.push(String::new());
+            lines.push("Best guesses:".to_string());
+            for c in exp.top_candidates.iter().take(5) {
+                lines.push(format!(
+                    "  {:<18} score {:.2}  edits {:.1}  {}",
+                    c.replacement,
+                    c.score,
+                    c.edit_cost,
+                    kind_label(c.kind)
+                ));
+            }
+        }
+        lines
     }
+
+    // -- rendering ---------------------------------------------------------------
 
     pub(crate) fn render(&self, frame: &mut Frame) {
         let area = frame.area();
-        if area.width < 4 || area.height < 4 {
+        if area.width < 24 || area.height < 8 {
+            frame.render_widget(
+                Paragraph::new("Window too small for SmartKey. Make it bigger or press q.")
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
             return;
         }
 
-        let mut constraints = vec![Constraint::Length(2)];
-        if self.parse_locked {
-            constraints.push(Constraint::Length(3));
+        let banners = self.banner_lines();
+        let mut cons = vec![Constraint::Length(1), Constraint::Length(1)];
+        if !banners.is_empty() {
+            cons.push(Constraint::Length(banners.len() as u16));
         }
-        constraints.push(Constraint::Min(3));
-        constraints.push(Constraint::Length(2));
-
+        cons.extend([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(constraints)
+            .constraints(cons)
             .split(area);
 
-        let mut cursor = 0usize;
-        self.render_header(frame, chunks[cursor]);
-        cursor += 1;
-
-        if self.parse_locked {
-            self.render_parse_lock_banner(frame, chunks[cursor]);
-            cursor += 1;
+        self.render_header(frame, chunks[0]);
+        frame.render_widget(
+            Paragraph::new("─".repeat(area.width as usize)).style(Style::default().fg(RULE)),
+            chunks[1],
+        );
+        let mut i = 2;
+        if !banners.is_empty() {
+            frame.render_widget(Paragraph::new(banners), chunks[i]);
+            i += 1;
         }
-
-        let body_area = chunks[cursor];
-        let footer_area = chunks[cursor + 1];
-
-        match self.active_tab {
-            Tab::Overview => self.render_overview(frame, body_area),
-            Tab::Rules => self.render_rules(frame, body_area),
-            Tab::Settings => self.render_settings(frame, body_area),
-            Tab::Apps => self.render_apps(frame, body_area),
-            Tab::Logs => self.render_logs(frame, body_area),
+        let body = chunks[i];
+        match self.screen {
+            Screen::Activity => self.render_activity(frame, body),
+            Screen::Review => self.render_review(frame, body),
+            Screen::Dictionary => self.render_dictionary(frame, body),
+            Screen::Settings => self.render_settings(frame, body),
         }
-
-        self.render_footer(frame, footer_area);
+        self.render_toast(frame, chunks[i + 1]);
+        self.render_hints(frame, chunks[i + 2]);
 
         if let Some(modal) = &self.modal {
             self.render_modal(frame, area, modal);
         }
     }
 
+    fn banner_lines(&self) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        if self.parse_locked {
+            let detail = self
+                .parse_error
+                .clone()
+                .unwrap_or_else(|| "syntax error".to_string());
+            out.push(Line::from(Span::styled(
+                format!(" rules.toml can't be read, so changes are blocked: {detail}"),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+        }
+        if self.screen == Screen::Activity {
+            if !self.fcitx5_running {
+                out.push(warn_line(
+                    "Fcitx5 is not running, so SmartKey is not fixing anything right now",
+                ));
+            } else if self.vi_lotus && !self.lotus_installed {
+                out.push(warn_line(
+                    "Vietnamese support is on, but fcitx5-lotus is not installed",
+                ));
+            }
+            if let Some(w) = self.env_warnings.first() {
+                out.push(warn_line(w));
+            }
+        }
+        out.truncate(2);
+        out
+    }
+
     fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let titles: Vec<Line> = TAB_TITLES.iter().map(|t| Line::from(*t)).collect();
-        let state_badge = if self.overview.enabled {
-            Span::styled(" enabled ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        let short = area.width < 72;
+        let mut spans = vec![Span::styled(
+            if short { " SK " } else { " SmartKey " },
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        spans.push(if self.enabled {
+            Span::styled("● on ", Style::default().fg(Color::Green))
         } else {
-            Span::styled(" disabled ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-        };
-        let title_line = Line::from(vec![
-            Span::styled(" SmartKey ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("| "),
-            state_badge,
-        ]);
-        let tabs = Tabs::new(titles)
-            .block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(Color::DarkGray))
-                    .title(title_line),
-            )
-            .select(self.active_tab.index())
-            .style(Style::default().fg(Color::Gray))
-            .highlight_style(
+            Span::styled("● off ", Style::default().fg(Color::Red))
+        });
+        spans.push(Span::raw("  "));
+        for s in Screen::ALL {
+            let selected = s == self.screen;
+            let style = if selected {
                 Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            );
-        frame.render_widget(tabs, area);
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(MUTED)
+            };
+            spans.push(Span::styled(
+                format!(" {} {}", s.index() + 1, s.label(short)),
+                style,
+            ));
+            if s == Screen::Review && !self.review.is_empty() {
+                spans.push(Span::styled(
+                    format!(" {}", self.review.len()),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            spans.push(Span::raw(" "));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    fn render_parse_lock_banner(&self, frame: &mut Frame, area: Rect) {
-        let detail = self
-            .parse_error
-            .as_deref()
-            .unwrap_or("TOML syntax error in rules.toml");
-        let text = format!(
-            "Parse lock active: edits are blocked until rules.toml is valid.\nError: {detail}"
-        );
-        let banner = Paragraph::new(text)
-            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Red))
-                    .title(" rules.toml Parse Lock "),
-            );
-        frame.render_widget(banner, area);
+    fn render_toast(&self, frame: &mut Frame, area: Rect) {
+        let line = match &self.toast {
+            Some(t) if t.error => Line::from(Span::styled(
+                format!(" {}", t.text),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Some(t) => Line::from(Span::styled(
+                format!(" {}", t.text),
+                Style::default().fg(ACCENT),
+            )),
+            None => Line::default(),
+        };
+        frame.render_widget(Paragraph::new(line), area);
     }
 
-    fn render_overview(&self, frame: &mut Frame, area: Rect) {
-        let cols = if area.width >= 72 {
+    fn hint_pairs(&self) -> Vec<(&'static str, &'static str)> {
+        if let Some(modal) = &self.modal {
+            return match modal {
+                Modal::Help | Modal::Info { .. } => vec![("esc", "close")],
+                Modal::Actions { .. } => {
+                    vec![("letter/⏎", "choose"), ("↑↓", "move"), ("esc", "close")]
+                }
+                Modal::ExplainInput { .. } => vec![("⏎", "explain"), ("esc", "cancel")],
+                Modal::EditNumber { .. } => vec![("⏎", "save"), ("esc", "cancel")],
+                Modal::AppPicker { .. } => vec![("↑↓", "choose"), ("⏎", "save"), ("esc", "cancel")],
+                Modal::Form(_) => vec![("tab", "next field"), ("⏎", "save"), ("esc", "cancel")],
+                Modal::Confirm { .. } => vec![("y", "yes"), ("n/esc", "no")],
+            };
+        }
+        if self.filter_editing {
+            return vec![("type", "to filter"), ("⏎", "done"), ("esc", "clear")];
+        }
+        let mut pairs = match self.screen {
+            Screen::Activity => vec![
+                ("↑↓", "move"),
+                ("⏎", "actions"),
+                ("/", "search"),
+                ("f", "filter"),
+                ("x", "explain"),
+                ("e", if self.enabled { "turn off" } else { "turn on" }),
+            ],
+            Screen::Review => vec![
+                ("↑↓", "move"),
+                ("a", "keep"),
+                ("d", "remove"),
+                ("space", "mark"),
+                ("A", "keep marked"),
+                ("D", "remove marked"),
+            ],
+            Screen::Dictionary => vec![
+                ("←→", "section"),
+                ("↑↓", "move"),
+                ("n", "new"),
+                ("d", "delete"),
+                ("/", "filter"),
+            ],
+            Screen::Settings => vec![("↑↓", "move"), ("←→", "change"), ("⏎", "edit")],
+        };
+        if self.undo.is_some() {
+            pairs.push(("u", "undo"));
+        }
+        pairs.extend([("tab", "screens"), ("?", "help"), ("q", "quit")]);
+        pairs
+    }
+
+    fn render_hints(&self, frame: &mut Frame, area: Rect) {
+        let mut spans = vec![Span::raw(" ")];
+        for (k, label) in self.hint_pairs() {
+            spans.push(Span::styled(
+                k,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" {label}   "),
+                Style::default().fg(MUTED),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    fn render_activity(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(area);
+
+        let mut summary = vec![
+            Span::styled(
+                if self.fcitx5_running {
+                    " Fcitx5 running"
+                } else {
+                    " Fcitx5 stopped"
+                },
+                Style::default().fg(if self.fcitx5_running {
+                    MUTED
+                } else {
+                    Color::Yellow
+                }),
+            ),
+            Span::styled(
+                format!(" · Vietnamese {}", if self.vi_lotus { "on" } else { "off" }),
+                Style::default().fg(MUTED),
+            ),
+            Span::raw("   "),
+            Span::styled("Last 24 h: ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{} fixes", self.day_fixes),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {} undone", self.day_undone),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                format!(" · {} fixed by you", self.day_by_hand),
+                Style::default().fg(MUTED),
+            ),
+        ];
+        if self.activity_filter != ActivityFilter::All {
+            summary.push(Span::styled(
+                format!("   showing {}", self.activity_filter.label()),
+                Style::default().fg(ACCENT),
+            ));
+        }
+        if self.filter_editing || !self.activity_search.is_empty() {
+            summary.push(Span::styled(
+                format!(
+                    "   / {}{}",
+                    self.activity_search,
+                    if self.filter_editing { "▏" } else { "" }
+                ),
+                Style::default().fg(ACCENT),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(summary)), chunks[0]);
+
+        if self.activity_view.is_empty() {
+            let text = if self.activity.is_empty() {
+                "No activity yet. Type in any app with SmartKey on; fixes appear here within a few seconds."
+            } else {
+                "Nothing matches. Press esc to clear the search or f to change the filter."
+            };
+            frame.render_widget(empty_state(text), chunks[1]);
+            return;
+        }
+
+        let narrow = area.width < 80;
+        let now = current_epoch_ms();
+        let rows: Vec<Row> = self
+            .activity_view
+            .iter()
+            .map(|&i| {
+                let r = &self.activity[i];
+                let age = if r.ts_ms == 0 {
+                    "–".to_string()
+                } else {
+                    format_age_ago(now, r.ts_ms)
+                };
+                let main_style = match r.tone {
+                    Tone::Normal => Style::default(),
+                    Tone::Warn => Style::default().fg(Color::Yellow),
+                    Tone::Muted => Style::default().fg(MUTED),
+                };
+                let mut why = r.why.clone();
+                if r.repeat > 1 {
+                    why.push_str(&format!("  ×{}", r.repeat));
+                }
+                let mut cells = vec![
+                    Cell::from(Span::styled(age, Style::default().fg(MUTED))),
+                    Cell::from(Span::styled(r.change.clone(), main_style)),
+                    Cell::from(Span::styled(why, Style::default().fg(MUTED))),
+                ];
+                if !narrow {
+                    let mut app = r.app.clone().unwrap_or_default();
+                    if r.lang != "en" && r.lang != "-" {
+                        app = format!("{app} [{}]", r.lang);
+                    }
+                    cells.push(Cell::from(Span::styled(app, Style::default().fg(MUTED))));
+                    cells.push(Cell::from(Span::styled(
+                        r.note.clone(),
+                        Style::default().fg(MUTED),
+                    )));
+                }
+                Row::new(cells)
+            })
+            .collect();
+        let widths: Vec<Constraint> = if narrow {
+            vec![
+                Constraint::Length(4),
+                Constraint::Fill(3),
+                Constraint::Fill(2),
+            ]
+        } else {
+            vec![
+                Constraint::Length(4),
+                Constraint::Fill(4),
+                Constraint::Fill(3),
+                Constraint::Fill(2),
+                Constraint::Fill(2),
+            ]
+        };
+        let header = if narrow {
+            Row::new(vec!["When", "Change", "Why"])
+        } else {
+            Row::new(vec!["When", "Change", "Why", "App", ""])
+        }
+        .style(Style::default().fg(MUTED));
+        let table = Table::new(rows, widths)
+            .header(header)
+            .row_highlight_style(selected_style())
+            .highlight_symbol("▶ ")
+            .highlight_spacing(HighlightSpacing::Always);
+        let mut state = TableState::default();
+        state.select(Some(self.activity_idx));
+        frame.render_stateful_widget(table, chunks[1], &mut state);
+    }
+
+    fn render_review(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(area);
+        let mut head = vec![Span::styled(
+            match self.review.len() {
+                0 => " Nothing needs a decision".to_string(),
+                1 => " 1 thing SmartKey is unsure about".to_string(),
+                n => format!(" {n} things SmartKey is unsure about"),
+            },
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        if self.review_hidden > 0 {
+            head.push(Span::styled(
+                format!(
+                    "   +{} one-off typos being watched; they only become rules if you repeat them",
+                    self.review_hidden
+                ),
+                Style::default().fg(MUTED),
+            ));
+        }
+        if !self.review_marked.is_empty() {
+            head.push(Span::styled(
+                format!("   {} marked", self.review_marked.len()),
+                Style::default().fg(ACCENT),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(head)), chunks[0]);
+
+        if self.review.is_empty() {
+            frame.render_widget(
+                empty_state("When SmartKey learns a rule, or a rule keeps getting undone, it shows up here for a yes or no."),
+                chunks[1],
+            );
+            return;
+        }
+
+        let mut items = Vec::new();
+        let mut selected_line = 0usize;
+        let mut last: Option<ReviewSection> = None;
+        for (i, item) in self.review.iter().enumerate() {
+            if last != Some(item.section) {
+                if last.is_some() {
+                    items.push(ListItem::new(""));
+                }
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!(" {}", item.section.title()),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))));
+                last = Some(item.section);
+            }
+            if i == self.review_idx {
+                selected_line = items.len();
+            }
+            let mark = if self.review_marked.contains(&item.id) {
+                "[x] "
+            } else {
+                "[ ] "
+            };
+            let mut spans = vec![
+                Span::styled(mark, Style::default().fg(ACCENT)),
+                Span::raw(format!("{:<28} ", item.title)),
+                Span::styled(item.detail.clone(), Style::default().fg(MUTED)),
+            ];
+            if let Some(w) = item.warning {
+                spans.push(Span::styled(
+                    format!("   {w}"),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            items.push(ListItem::new(Line::from(spans)));
+        }
+        let list = List::new(items)
+            .highlight_style(selected_style())
+            .highlight_symbol("▶ ")
+            .highlight_spacing(HighlightSpacing::Always);
+        let mut state = ListState::default();
+        state.select(Some(selected_line));
+        frame.render_stateful_widget(list, chunks[1], &mut state);
+    }
+
+    fn render_dictionary(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(area);
+        let mut spans = vec![Span::raw(" ")];
+        for s in DictSection::ALL {
+            let style = if s == self.dict_section {
+                Style::default()
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(MUTED)
+            };
+            spans.push(Span::styled(
+                format!("{} {}", s.label(), self.dict_counts[s.index()]),
+                style,
+            ));
+            spans.push(Span::raw("   "));
+        }
+        if self.filter_editing || !self.dict_filter.is_empty() {
+            spans.push(Span::styled(
+                format!(
+                    "/ {}{}",
+                    self.dict_filter,
+                    if self.filter_editing { "▏" } else { "" }
+                ),
+                Style::default().fg(ACCENT),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+
+        if self.dict_view.is_empty() {
+            let text = if self.dict_filter.is_empty() {
+                self.dict_section.empty_text()
+            } else {
+                "Nothing matches. Press esc to clear the filter."
+            };
+            frame.render_widget(empty_state(text), chunks[2]);
+            return;
+        }
+        let rows: Vec<Row> = self
+            .dict_view
+            .iter()
+            .map(|&i| {
+                let r = &self.dict[i];
+                let cells: Vec<Cell> = r
+                    .cols
+                    .iter()
+                    .enumerate()
+                    .map(|(ci, v)| {
+                        if ci == 0 {
+                            Cell::from(v.clone())
+                        } else {
+                            Cell::from(Span::styled(v.clone(), Style::default().fg(MUTED)))
+                        }
+                    })
+                    .collect();
+                Row::new(cells)
+            })
+            .collect();
+        let table = Table::new(rows, self.dict_section.widths())
+            .header(
+                Row::new(self.dict_section.headers().to_vec()).style(Style::default().fg(MUTED)),
+            )
+            .row_highlight_style(selected_style())
+            .highlight_symbol("▶ ")
+            .highlight_spacing(HighlightSpacing::Always);
+        let mut state = TableState::default();
+        state.select(Some(self.dict_idx));
+        frame.render_stateful_widget(table, chunks[2], &mut state);
+    }
+
+    fn render_settings(&self, frame: &mut Frame, area: Rect) {
+        let wide = area.width >= 96;
+        let chunks = if wide {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
                 .split(area)
         } else {
             Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(7), Constraint::Min(3)])
+                .constraints([Constraint::Min(3), Constraint::Length(3)])
                 .split(area)
         };
 
-        let left_lines = vec![
-            kv_line(
-                "Autocorrect",
-                if self.overview.enabled { "enabled" } else { "disabled" },
-                if self.overview.enabled { Color::Green } else { Color::Red },
-            ),
-            kv_line(
-                "Fcitx5 daemon",
-                if self.overview.fcitx5_running { "running" } else { "offline" },
-                if self.overview.fcitx5_running { Color::Green } else { Color::Yellow },
-            ),
-            kv_line(
-                "vi-lotus hook",
-                if self.overview.vi_lotus_enabled { "enabled" } else { "disabled" },
-                if self.overview.vi_lotus_enabled { Color::Green } else { Color::Yellow },
-            ),
-            Line::from(vec![
-                Span::styled("Lotus module   : ", Style::default().fg(Color::Gray)),
-                Span::raw(
-                    self.overview
-                        .lotus_so_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "not detected".to_string()),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Config dir     : ", Style::default().fg(Color::Gray)),
-                Span::raw(self.config_dir.display().to_string()),
-            ]),
-            Line::from(vec![
-                Span::styled("Staged queue   : ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format!("{} pending", self.overview.staged_total),
-                    Style::default().fg(if self.overview.staged_total > 0 {
-                        Color::Yellow
-                    } else {
-                        Color::Gray
-                    }),
-                ),
-            ]),
-        ];
-        let left_block = Paragraph::new(left_lines)
-            .wrap(Wrap { trim: true })
-            .block(neutral_block(" Status & Plugins (e: toggle, l: vi-lotus, R: reload) "));
-        frame.render_widget(left_block, cols[0]);
-
-        let c = &self.overview.counts;
-        let mut right_lines = vec![
-            Line::from(vec![
-                Span::styled("Active rules   : ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    self.overview.active_total.to_string(),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  manual       : ", Style::default().fg(Color::Gray)),
-                Span::styled(c.manual.to_string(), Style::default().fg(Color::Green)),
-                Span::raw("   confirmed: "),
-                Span::styled(c.confirmed.to_string(), Style::default().fg(Color::Green)),
-            ]),
-            Line::from(vec![
-                Span::styled("  provisional  : ", Style::default().fg(Color::Gray)),
-                Span::styled(c.provisional.to_string(), Style::default().fg(Color::Yellow)),
-                Span::raw("   suspect  : "),
-                Span::styled(c.suspect.to_string(), Style::default().fg(Color::Red)),
-            ]),
-            Line::from(vec![
-                Span::styled("Counters       : ", Style::default().fg(Color::Gray)),
-                Span::raw(format!(
-                    "applied={}  undo={}  manual={}",
-                    self.overview.applied_total,
-                    self.overview.undo_total,
-                    self.overview.manual_total
-                )),
-            ]),
-            Line::from(Span::styled("Recent events:", Style::default().fg(Color::Cyan))),
-        ];
-        if self.overview.recent_events.is_empty() {
-            right_lines.push(Line::from(Span::styled(
-                "  (no recent events)",
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            for ev in &self.overview.recent_events {
-                right_lines.push(Line::from(format!("  {ev}")));
-            }
-        }
-        let right_block = Paragraph::new(right_lines)
-            .wrap(Wrap { trim: true })
-            .block(neutral_block(" Telemetry & Rules "));
-        frame.render_widget(right_block, cols[1]);
-    }
-
-    fn render_rules(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(3)])
-            .split(area);
-
-        let sub_tabs = Tabs::new(vec![
-            Line::from(format!("Active Rules ({})", self.filtered_rule_indices.len())),
-            Line::from(format!("Staged Queue ({})", self.staged_entries.len())),
-        ])
-        .select(match self.rules_view {
-            RulesSubView::Active => 0,
-            RulesSubView::Staged => 1,
-        })
-        .style(Style::default().fg(Color::Gray))
-        .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-        .block(neutral_block(match self.rules_view {
-            RulesSubView::Active => " Rules & Staged (v: switch, /: filter, a: add, d: delete, P: prune) ",
-            RulesSubView::Staged => " Rules & Staged (v: switch, p: promote, d: dismiss) ",
-        }));
-        frame.render_widget(sub_tabs, chunks[0]);
-
-        match self.rules_view {
-            RulesSubView::Active => self.render_active_rules_table(frame, chunks[1]),
-            RulesSubView::Staged => self.render_staged_table(frame, chunks[1]),
-        }
-    }
-
-    fn render_active_rules_table(&self, frame: &mut Frame, area: Rect) {
-        let header = Row::new(vec!["Kind", "Rule", "Tier", "Origin", "Hits", "Strikes"])
-            .style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD));
-
-        let rows: Vec<Row> = self
-            .filtered_rule_indices
-            .iter()
-            .map(|&idx| {
-                let r = &self.active_rules[idx];
-                Row::new(vec![
-                    Cell::from(r.kind),
-                    Cell::from(r.display.clone()),
-                    Cell::from(Span::styled(r.tier.as_str(), tier_style(r.tier))),
-                    Cell::from(r.origin.clone()),
-                    Cell::from(r.hits.to_string()),
-                    Cell::from(r.strikes.to_string()),
-                ])
-            })
-            .collect();
-
-        let title = if self.rules_filter.trim().is_empty() {
-            " Active Rules ".to_string()
-        } else {
-            format!(" Active Rules [filter: {}] ", self.rules_filter.trim())
-        };
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(11),
-                Constraint::Percentage(46),
-                Constraint::Length(12),
-                Constraint::Length(12),
-                Constraint::Length(6),
-                Constraint::Length(7),
-            ],
-        )
-        .header(header)
-        .block(neutral_block(&title))
-        .row_highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        );
-
-        let mut state = TableState::default();
-        if !self.filtered_rule_indices.is_empty() {
-            state.select(Some(self.active_rule_idx));
-        }
-        frame.render_stateful_widget(table, area, &mut state);
-    }
-
-    fn render_staged_table(&self, frame: &mut Frame, area: Rect) {
-        let header = Row::new(vec!["Queue", "Entry", "Progress", "Canonical"])
-            .style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD));
-        let rows: Vec<Row> = self
-            .staged_entries
-            .iter()
-            .map(|e| {
-                let prog_style = if e.count + 1 >= e.threshold {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                Row::new(vec![
-                    Cell::from(e.queue),
-                    Cell::from(e.display.clone()),
-                    Cell::from(Span::styled(
-                        format!("{}/{}", e.count, e.threshold),
-                        prog_style,
-                    )),
-                    Cell::from(e.canonical.as_deref().unwrap_or("-")),
-                ])
-            })
-            .collect();
-
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(18),
-                Constraint::Percentage(46),
-                Constraint::Length(10),
-                Constraint::Percentage(26),
-            ],
-        )
-        .header(header)
-        .block(neutral_block(" Staged Learning Queue "))
-        .row_highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        );
-
-        let mut state = TableState::default();
-        if !self.staged_entries.is_empty() {
-            state.select(Some(self.staged_idx));
-        }
-        frame.render_stateful_widget(table, area, &mut state);
-    }
-
-    fn render_settings(&self, frame: &mut Frame, area: Rect) {
-        let header = Row::new(vec!["Key", "Value", "Control"])
-            .style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD));
-        let rows: Vec<Row> = self
-            .settings
-            .iter()
-            .map(|(k, v)| {
-                let control = if BOOLEAN_SETTINGS.contains(k) {
-                    "toggle"
-                } else if enum_setting_options(k).is_some() {
-                    "cycle"
-                } else {
-                    "edit"
-                };
-                let val_style = match v.as_str() {
-                    "true" => Style::default().fg(Color::Green),
-                    "false" => Style::default().fg(Color::Yellow),
-                    _ => Style::default().fg(Color::Reset),
-                };
-                Row::new(vec![
-                    Cell::from(*k),
-                    Cell::from(Span::styled(v.clone(), val_style)),
-                    Cell::from(Span::styled(control, Style::default().fg(Color::DarkGray))),
-                ])
-            })
-            .collect();
-
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Percentage(55),
-                Constraint::Percentage(30),
-                Constraint::Length(10),
-            ],
-        )
-        .header(header)
-        .block(neutral_block(" Settings (Space/Enter: toggle, cycle, or edit) "))
-        .row_highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        );
-
-        let mut state = TableState::default();
-        if !self.settings.is_empty() {
-            state.select(Some(self.setting_idx));
-        }
-        frame.render_stateful_widget(table, area, &mut state);
-    }
-
-    fn render_apps(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(3)])
-            .split(area);
-
-        let policy_line = Line::from(vec![
-            Span::styled("Unknown app fallback policy: ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                self.unknown_app_policy.clone(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  (press u to cycle)", Style::default().fg(Color::DarkGray)),
-        ]);
-        let policy_widget = Paragraph::new(policy_line)
-            .block(neutral_block(" App Profile Policy "));
-        frame.render_widget(policy_widget, chunks[0]);
-
-        let header = Row::new(vec!["Profile", "App ID"])
-            .style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD));
-        let rows: Vec<Row> = self
-            .app_overrides
-            .iter()
-            .map(|r| {
-                let pstyle = match r.profile {
-                    AppProfile::Bypass => Style::default().fg(Color::Red),
-                    AppProfile::Browser => Style::default().fg(Color::Yellow),
-                    AppProfile::Chat => Style::default().fg(Color::Cyan),
-                    AppProfile::Prose => Style::default().fg(Color::Green),
-                };
-                Row::new(vec![
-                    Cell::from(Span::styled(app_profile_label(r.profile), pstyle)),
-                    Cell::from(r.app_id.clone()),
-                ])
-            })
-            .collect();
-
-        let table = Table::new(rows, [Constraint::Length(14), Constraint::Min(10)])
-            .header(header)
-            .block(neutral_block(" App Overrides (a: add override, d: delete) "))
-            .row_highlight_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-            );
-        let mut state = TableState::default();
-        if !self.app_overrides.is_empty() {
-            state.select(Some(self.app_idx));
-        }
-        frame.render_stateful_widget(table, chunks[1], &mut state);
-    }
-
-    fn render_logs(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(4), Constraint::Length(8)])
-            .split(area);
-
+        let label_w = 24usize;
         let items: Vec<ListItem> = self
-            .filtered_log_indices
+            .settings_rows
             .iter()
-            .map(|&idx| {
-                let row = &self.logs[idx];
-                let app_tag = row.app.as_deref().unwrap_or("-");
-                ListItem::new(format!(
-                    "[{}] [{}] ({}) {}",
-                    row.timestamp, row.lang, app_tag, row.summary
-                ))
+            .map(|row| match row {
+                SettingsRow::Header(h) => ListItem::new(Line::from(Span::styled(
+                    format!(" {h}"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))),
+                SettingsRow::Setting(spec) => {
+                    let value = self
+                        .settings_values
+                        .get(spec.key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut spans = vec![Span::raw(format!("   {:<label_w$}", spec.label))];
+                    spans.extend(setting_value_spans(spec, &value, wide || area.width >= 70));
+                    ListItem::new(Line::from(spans))
+                }
+                SettingsRow::App {
+                    app,
+                    profile,
+                    reason,
+                    chosen,
+                } => {
+                    let value_style = if *profile == AppProfile::Bypass {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    };
+                    let source = if chosen.is_some() {
+                        "your choice"
+                    } else {
+                        reason_label(reason)
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::raw(format!("   {:<label_w$}", truncate(app, label_w - 1))),
+                        Span::styled(profile_label(*profile), value_style),
+                        Span::styled(format!(" · {source}"), Style::default().fg(MUTED)),
+                    ]))
+                }
             })
             .collect();
-
-        let title = format!(
-            " Diagnostic Logs [filter: {}] (f: filter, x: explain, c: clear) ",
-            log_filter_label(self.log_filter)
-        );
         let list = List::new(items)
-            .block(neutral_block(&title))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-            );
+            .highlight_style(selected_style())
+            .highlight_symbol("▶")
+            .highlight_spacing(HighlightSpacing::Always);
         let mut state = ListState::default();
-        if !self.filtered_log_indices.is_empty() {
-            state.select(Some(self.log_idx));
-        }
+        state.select(Some(self.settings_idx));
         frame.render_stateful_widget(list, chunks[0], &mut state);
 
-        let explain_text: Vec<Line> = self
-            .explain_lines
-            .iter()
-            .map(|l| Line::from(l.as_str()))
-            .collect();
-        let explain_widget = Paragraph::new(explain_text)
-            .wrap(Wrap { trim: true })
-            .block(neutral_block(" Explain Output (x: explain token, e.g. 'teh', 'over ther', 'vi:dduowcj') "));
-        frame.render_widget(explain_widget, chunks[1]);
-    }
-
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let msg_style = if self.status_is_error {
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Cyan)
-        };
-        let line = Line::from(vec![
-            Span::styled(&self.status_msg, msg_style),
-            Span::styled(
-                "   | 1-5 tabs  r refresh  ? help  q quit",
-                Style::default().fg(Color::DarkGray),
+        let (title, body) = match self.settings_rows.get(self.settings_idx) {
+            Some(SettingsRow::Setting(spec)) => (spec.label.to_string(), spec.help.to_string()),
+            Some(SettingsRow::App { app, .. }) => (
+                app.clone(),
+                "Choose how SmartKey treats this app. Off means it never touches your typing there; Browser skips address bars and password fields. Press Enter for the list or ←→ to cycle.".to_string(),
             ),
-        ]);
-        let footer = Paragraph::new(line).block(
+            _ => (String::new(), String::new()),
+        };
+        let help = Paragraph::new(vec![
+            Line::from(Span::styled(
+                title,
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(body, Style::default().fg(MUTED))),
+        ])
+        .wrap(Wrap { trim: true })
+        .block(if wide {
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(RULE))
+                .padding(ratatui::widgets::Padding::horizontal(1))
+        } else {
             Block::default()
                 .borders(Borders::TOP)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
-        frame.render_widget(footer, area);
+                .border_style(Style::default().fg(RULE))
+        });
+        frame.render_widget(help, chunks[1]);
     }
 
     fn render_modal(&self, frame: &mut Frame, area: Rect, modal: &Modal) {
-        let popup = centered_rect(area, 76, 12);
-        frame.render_widget(Clear, popup);
-
-        let (title, lines) = match modal {
-            Modal::Help => (
-                " Keybinds Help (Esc/Enter to close) ",
-                vec![
-                    Line::from("Global  : 1-5 / Tab switch tab | r refresh | q / Ctrl+C quit"),
-                    Line::from("Overview: e toggle SmartKey | l toggle vi-lotus | R signal reload"),
-                    Line::from("Rules   : v switch active/staged | / filter | a add | d delete"),
-                    Line::from("          P prune unused auto fixes (Active) | p promote (Staged)"),
-                    Line::from("Settings: Space/Enter toggle bool, cycle enum, or edit number"),
-                    Line::from("Apps    : u cycle unknown policy | a add override | d delete"),
-                    Line::from("Logs    : f cycle filter | x explain token | c clear logs"),
-                ],
+        let (title, lines): (String, Vec<Line>) = match modal {
+            Modal::Help => ("Keys".to_string(), self.help_lines()),
+            Modal::Info { title, lines } => (
+                title.clone(),
+                lines.iter().map(|l| Line::from(l.clone())).collect(),
             ),
-            Modal::Confirm { prompt, .. } => (
-                " Confirm Action (y/Enter: yes, n/Esc: cancel) ",
-                vec![
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        prompt.clone(),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    )),
-                ],
-            ),
-            Modal::FilterInput { input } => (
-                " Filter Active Rules (Enter: apply, Esc: cancel) ",
-                vec![
-                    Line::from("Case-insensitive substring (empty clears filter):"),
-                    Line::from(Span::styled(format!("> {input}_"), Style::default().fg(Color::Cyan))),
-                ],
-            ),
-            Modal::AddRule { kind, input } => (
-                " Add Rule (Tab: kind, Enter: save, Esc: cancel) ",
-                vec![
-                    Line::from(vec![
-                        Span::styled("Kind : ", Style::default().fg(Color::Gray)),
-                        Span::styled(kind.label(), Style::default().fg(Color::Cyan)),
-                    ]),
-                    Line::from(""),
-                    Line::from(Span::styled(format!("> {input}_"), Style::default().fg(Color::Cyan))),
-                ],
-            ),
-            Modal::EditSetting { key, input } => (
-                " Edit Setting (Enter: save, Esc: cancel) ",
-                vec![
-                    Line::from(vec![
-                        Span::styled("Key  : ", Style::default().fg(Color::Gray)),
-                        Span::raw(key.clone()),
-                    ]),
-                    Line::from(""),
-                    Line::from(Span::styled(format!("> {input}_"), Style::default().fg(Color::Cyan))),
-                ],
-            ),
-            Modal::AddApp { profile, input } => (
-                " Add App Override (Tab: profile, Enter: save, Esc: cancel) ",
-                vec![
-                    Line::from(vec![
-                        Span::styled("Profile: ", Style::default().fg(Color::Gray)),
-                        Span::styled(app_profile_label(*profile), Style::default().fg(Color::Cyan)),
-                    ]),
-                    Line::from("Enter window class or Wayland app_id (e.g. kitty, com.obsproject.Studio):"),
-                    Line::from(Span::styled(format!("> {input}_"), Style::default().fg(Color::Cyan))),
-                ],
-            ),
+            Modal::Actions { title, items, selected } => {
+                let mut out: Vec<Line> = Vec::new();
+                if items.is_empty() {
+                    out.push(Line::from(Span::styled("Nothing to do for this event.", Style::default().fg(MUTED))));
+                }
+                let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap_or(0);
+                for (i, item) in items.iter().enumerate() {
+                    let style = if i == *selected { selected_style() } else { Style::default() };
+                    out.push(Line::from(vec![
+                        Span::styled(format!(" {} ", item.key), style.add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" {:<label_w$}", item.label), style),
+                        Span::styled(format!("   {}", item.hint), Style::default().fg(MUTED)),
+                    ]));
+                }
+                (title.clone(), out)
+            }
             Modal::ExplainInput { input } => (
-                " Explain Token (Enter: run, Esc: cancel) ",
+                "Explain a word".to_string(),
                 vec![
-                    Line::from("Input ('teh', 'over ther', or 'vi:dduowcj'):"),
-                    Line::from(Span::styled(format!("> {input}_"), Style::default().fg(Color::Cyan))),
+                    Line::from(Span::styled(
+                        "Type a word, or two words for context (\"over ther\"). Prefix vi: for Vietnamese.",
+                        Style::default().fg(MUTED),
+                    )),
+                    Line::from(""),
+                    input_line(input),
                 ],
+            ),
+            Modal::EditNumber { spec, current, input } => (
+                spec.label.to_string(),
+                vec![
+                    Line::from(Span::styled(
+                        format!("Now {}. Type a new value{}.", display_setting(spec, current), unit_hint(spec)),
+                        Style::default().fg(MUTED),
+                    )),
+                    Line::from(""),
+                    input_line(input),
+                ],
+            ),
+            Modal::AppPicker { app, selected } => {
+                let mut out = vec![Line::from(Span::styled(
+                    format!("How should SmartKey treat {app}?"),
+                    Style::default().fg(MUTED),
+                ))];
+                out.push(Line::from(""));
+                for (i, (_, label, hint)) in APP_CHOICES.iter().enumerate() {
+                    let style = if i == *selected { selected_style() } else { Style::default() };
+                    out.push(Line::from(vec![
+                        Span::styled(format!(" {label:<9}"), style),
+                        Span::styled(format!(" {hint}"), Style::default().fg(MUTED)),
+                    ]));
+                }
+                ("App".to_string(), out)
+            }
+            Modal::Form(form) => {
+                let mut out = Vec::new();
+                for (i, f) in form.fields.iter().enumerate() {
+                    let focused = i == form.focus;
+                    let label_style = if focused {
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(MUTED)
+                    };
+                    let opt = if f.required { "" } else { " (optional)" };
+                    out.push(Line::from(vec![
+                        Span::styled(format!("{:<18}", format!("{}{opt}", f.label)), label_style),
+                        Span::raw(f.value.clone()),
+                        Span::styled(if focused { "▏" } else { "" }, Style::default().fg(ACCENT)),
+                    ]));
+                }
+                (format!("New {}", form.section.label().to_lowercase()), out)
+            }
+            Modal::Confirm { prompt, .. } => (
+                "Confirm".to_string(),
+                vec![Line::from(Span::styled(
+                    prompt.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))],
             ),
         };
 
-        let box_widget = Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(
+        let width = area.width.saturating_sub(4).clamp(20, 76);
+        let height = (lines.len() as u16 + 2)
+            .min(area.height.saturating_sub(2))
+            .max(3);
+        let popup = Rect::new(
+            area.x + (area.width.saturating_sub(width)) / 2,
+            area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(title),
-            );
-        frame.render_widget(box_widget, popup);
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(Span::styled(
+                        format!(" {title} "),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+            ),
+            popup,
+        );
+    }
+
+    fn help_lines(&self) -> Vec<Line<'static>> {
+        let row = |k: &str, v: &str| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {k:<12}"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(v.to_string(), Style::default().fg(MUTED)),
+            ])
+        };
+        let mut out = vec![
+            row("1-4, tab", "switch screen"),
+            row("u", "undo the last change"),
+            row("r", "reload from disk"),
+            row("q", "quit"),
+            Line::from(""),
+        ];
+        out.extend(match self.screen {
+            Screen::Activity => vec![
+                row(
+                    "⏎",
+                    "act on this fix: block it, keep it, add the word, explain",
+                ),
+                row("/", "search"),
+                row("f", "show everything / fixes / undos / missed words"),
+                row("x", "explain any word"),
+                row("e", "turn SmartKey on or off"),
+            ],
+            Screen::Review => vec![
+                row("a", "keep: make this rule permanent, or learn it now"),
+                row("d", "remove: delete the rule, or forget the staged fix"),
+                row("space", "mark several, then A or D for all marked"),
+            ],
+            Screen::Dictionary => vec![
+                row("←→", "switch section"),
+                row("n", "add an entry"),
+                row("d", "delete (u brings it back)"),
+                row("/", "filter"),
+            ],
+            Screen::Settings => vec![
+                row("←→", "change the value"),
+                row("⏎", "toggle, or type a number, or pick an app mode"),
+            ],
+        });
+        out
     }
 }
 
-fn neutral_block(title: &str) -> Block<'_> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(title, Style::default().fg(Color::Gray)))
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn selected_style() -> Style {
+    Style::default()
+        .fg(ACCENT)
+        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
 }
 
-fn kv_line<'a>(label: &'a str, val: &'a str, color: Color) -> Line<'a> {
+fn warn_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(" ⚠ {text}"),
+        Style::default().fg(Color::Yellow),
+    ))
+}
+
+fn empty_state(text: &str) -> Paragraph<'static> {
+    Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {text}"),
+            Style::default().fg(MUTED),
+        )),
+    ])
+    .wrap(Wrap { trim: false })
+}
+
+fn input_line(input: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<15}: "), Style::default().fg(Color::Gray)),
-        Span::styled(val, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled("> ", Style::default().fg(ACCENT)),
+        Span::raw(input.to_string()),
+        Span::styled("▏", Style::default().fg(ACCENT)),
     ])
 }
 
-fn tier_style(tier: ConfidenceTier) -> Style {
-    match tier {
-        ConfidenceTier::Manual | ConfidenceTier::Confirmed => Style::default().fg(Color::Green),
-        ConfidenceTier::Provisional => Style::default().fg(Color::Yellow),
-        ConfidenceTier::Suspect => Style::default().fg(Color::Red),
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 }
 
-fn enum_setting_options(key: &str) -> Option<&'static [&'static str]> {
-    match key {
-        "settings.dialect" => Some(DIALECT_OPTIONS),
-        "settings.aggressiveness" => Some(AGGR_OPTIONS),
-        "settings.undo_mode" => Some(UNDO_MODE_OPTIONS),
-        "diagnostics.log_level" => Some(LOG_LEVEL_OPTIONS),
-        "app_profiles.unknown_app_policy" => Some(UNKNOWN_POLICY_OPTIONS),
-        _ => None,
-    }
-}
-
-fn next_app_profile(profile: AppProfile) -> AppProfile {
-    match profile {
-        AppProfile::Bypass => AppProfile::Browser,
-        AppProfile::Browser => AppProfile::Chat,
-        AppProfile::Chat => AppProfile::Prose,
-        AppProfile::Prose => AppProfile::Bypass,
-    }
-}
-
-fn log_filter_label(filter: LogFilter) -> &'static str {
-    match filter {
-        LogFilter::All => "all",
-        LogFilter::FixedOnly => "fixed",
-        LogFilter::ManualOnly => "manual",
-        LogFilter::UnfixedOnly => "unfixed",
-    }
-}
-
-fn move_selection(index: &mut usize, delta: isize, len: usize) {
+fn step(index: &mut usize, delta: isize, len: usize) {
     if len == 0 {
         *index = 0;
         return;
     }
     let cur = (*index).min(len - 1) as isize;
-    *index = (cur + delta).clamp(0, (len - 1) as isize) as usize;
+    *index = (cur + delta).clamp(0, len as isize - 1) as usize;
 }
 
-fn clamp_index(index: &mut usize, len: usize) {
+fn clamp(index: &mut usize, len: usize) {
     if len == 0 {
         *index = 0;
     } else if *index >= len {
@@ -1913,139 +3190,670 @@ fn clamp_index(index: &mut usize, len: usize) {
     }
 }
 
-fn format_cli_error(err: &CliError) -> &str {
+fn cli_error_text(err: &CliError) -> &str {
     match err {
-        CliError::Usage(msg) | CliError::Runtime(msg) => msg.as_str(),
+        CliError::Usage(m) | CliError::Runtime(m) => m,
     }
 }
 
-fn centered_rect(area: Rect, max_pct_w: u16, target_h: u16) -> Rect {
-    let w = area
-        .width
-        .min((area.width as u32 * max_pct_w as u32 / 100).max(20) as u16)
-        .max(1);
-    let h = area.height.min(target_h).max(1);
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    Rect::new(x, y, w, h)
-}
-
-fn split_optional_lang(input: &str) -> (LangId, &str) {
+fn split_lang_prefix(input: &str) -> (LangId, &str) {
     if let Some((prefix, rest)) = input.split_once(':') {
-        let lang = prefix.trim();
-        if !lang.is_empty() && lang.len() <= 8 && lang.chars().all(|c| c.is_ascii_alphabetic()) {
-            return (LangId(lang.to_ascii_lowercase()), rest);
+        let p = prefix.trim();
+        if (2..=3).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphabetic()) {
+            return (LangId(p.to_ascii_lowercase()), rest);
         }
     }
     (LangId::en(), input)
 }
 
-fn split_pair<'a>(input: &'a str, seps: &[&str]) -> Option<(&'a str, &'a str)> {
-    for sep in seps {
-        if let Some((a, b)) = input.split_once(sep) {
-            let lhs = a.trim();
-            let rhs = b.trim();
-            if !lhs.is_empty() && !rhs.is_empty() {
-                return Some((lhs, rhs));
+fn format_number(v: f64, decimals: usize) -> String {
+    if decimals == 0 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.decimals$}")
+    }
+}
+
+fn unit_hint(spec: &SettingSpec) -> &'static str {
+    match spec.control {
+        Control::Number { unit: "ms", .. } => " in milliseconds",
+        Control::Number { unit: "days", .. } => " in days",
+        _ => "",
+    }
+}
+
+fn display_setting(spec: &SettingSpec, value: &str) -> String {
+    match spec.control {
+        Control::Toggle => if value == "true" { "on" } else { "off" }.to_string(),
+        Control::Choice(opts) => opts
+            .iter()
+            .find(|(v, _)| *v == value)
+            .map(|(_, l)| l.to_string())
+            .unwrap_or_else(|| value.to_string()),
+        Control::Number { unit, .. } => match unit {
+            "ms" => value
+                .parse::<f64>()
+                .map(|ms| format!("{:.1} s", ms / 1000.0))
+                .unwrap_or_else(|_| value.to_string()),
+            "days" => format!("{value} days"),
+            _ => value.to_string(),
+        },
+    }
+}
+
+fn setting_value_spans(spec: &SettingSpec, value: &str, show_all: bool) -> Vec<Span<'static>> {
+    match spec.control {
+        Control::Toggle => {
+            if value == "true" {
+                vec![Span::styled("on", Style::default().fg(Color::Green))]
+            } else {
+                vec![Span::styled("off", Style::default().fg(MUTED))]
             }
         }
-    }
-    None
-}
-
-fn split_context_lhs(lhs: &str) -> Option<(&str, &str)> {
-    let trimmed = lhs.trim();
-    if let Some((prev, typed)) = trimmed.split_once('|') {
-        let p = prev.trim();
-        let t = typed.trim();
-        if !p.is_empty() && !t.is_empty() {
-            return Some((p, t));
+        Control::Choice(opts) if show_all => {
+            let mut spans = vec![Span::styled("‹ ", Style::default().fg(MUTED))];
+            for (v, label) in opts {
+                if *v == value {
+                    spans.push(Span::styled(
+                        format!("[{label}]"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::styled(label.to_string(), Style::default().fg(MUTED)));
+                }
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled("›", Style::default().fg(MUTED)));
+            spans
         }
-    }
-    let (prev, typed) = trimmed.rsplit_once(char::is_whitespace)?;
-    let p = prev.trim();
-    let t = typed.trim();
-    if p.is_empty() || t.is_empty() {
-        None
-    } else {
-        Some((p, t))
+        Control::Choice(_) => vec![Span::raw(display_setting(spec, value))],
+        Control::Number { .. } => vec![
+            Span::raw(display_setting(spec, value)),
+            Span::styled("   ←→ adjust", Style::default().fg(MUTED)),
+        ],
     }
 }
 
-fn collect_active_rule_rows(store: &RuleStore) -> (ConfidenceCountsJson, Vec<ActiveRuleRow>) {
+fn profile_label(p: AppProfile) -> &'static str {
+    match p {
+        AppProfile::Bypass => "off",
+        AppProfile::Browser => "browser",
+        AppProfile::Chat => "chat",
+        AppProfile::Prose => "prose",
+    }
+}
+
+fn reason_label(reason: &str) -> &'static str {
+    match reason {
+        "program-list" => "built-in (terminal/editor)",
+        "browser" | "chat" => "built-in",
+        "prose" => "default",
+        "user-app-override" => "your choice",
+        "unknown-app-policy" => "unlisted-app rule",
+        _ => "built-in",
+    }
+}
+
+fn kind_label(kind: MatchKind) -> &'static str {
+    match kind {
+        MatchKind::Bypass => "skipped",
+        MatchKind::ValidWord => "real word",
+        MatchKind::StretchedWord => "stretched word",
+        MatchKind::UserSnippet => "your snippet",
+        MatchKind::ShorthandExpansion => "shorthand",
+        MatchKind::UserContextRule => "your fix (after a word)",
+        MatchKind::UserCorrectionRule => "your fix",
+        MatchKind::ShiftSlip => "Shift slip",
+        MatchKind::ProperNoun => "name capitalised",
+        MatchKind::DialectNormalization => "US/UK spelling",
+        MatchKind::Contraction => "apostrophe",
+        MatchKind::UnmergedCompound => "joined word",
+        MatchKind::SemicolonContraction => "; typed for '",
+        MatchKind::TransposedApostrophe => "apostrophe moved",
+        MatchKind::KnownTypoDict => "common typo",
+        MatchKind::SwitchChatter => "double key press",
+        MatchKind::MissedSpaceSplit => "missed space",
+        MatchKind::SpaceShift => "space in wrong place",
+        MatchKind::FuzzyLexicon => "spelling",
+        MatchKind::SmashRescue => "scrambled letters",
+        MatchKind::PersonalDict => "your word",
+        MatchKind::VietnameseTelexRescue => "Telex fix",
+    }
+}
+
+fn manual_outcome_label(outcome: &str) -> String {
+    if outcome.starts_with("skipped") {
+        "not learned".to_string()
+    } else if outcome.starts_with("staged") {
+        "learning".to_string()
+    } else if outcome.contains("graduat") || outcome.contains("learn") || outcome.contains("promot")
+    {
+        "learned".to_string()
+    } else {
+        outcome.replace('_', " ")
+    }
+}
+
+fn describe_event(ev: &DiagnosticEvent) -> (String, String, String, Tone) {
+    match ev {
+        DiagnosticEvent::AutocorrectApplied {
+            typed,
+            applied,
+            kind,
+            total_count,
+        } => (
+            format!("{typed} → {applied}"),
+            kind_label(*kind).to_string(),
+            if *total_count > 1 {
+                format!("{total_count}× so far")
+            } else {
+                String::new()
+            },
+            Tone::Normal,
+        ),
+        DiagnosticEvent::BackspaceUndo {
+            typed,
+            rejected,
+            resolution,
+            ..
+        } => {
+            let note = match resolution {
+                UndoResolution::Triggered => String::new(),
+                UndoResolution::KeptVerbatim => "kept what you typed".to_string(),
+                UndoResolution::EditedToThird { final_word } => format!("you wrote {final_word}"),
+                UndoResolution::SelfConfirmCancelled => "you retyped the fix".to_string(),
+                UndoResolution::ClauseErased => "you erased it".to_string(),
+            };
+            (
+                format!("{typed} → {rejected}"),
+                "you undid it".to_string(),
+                note,
+                Tone::Warn,
+            )
+        }
+        DiagnosticEvent::ManualBackspaceFix {
+            orig,
+            fixed,
+            outcome,
+            ..
+        } => (
+            format!("{orig} → {fixed}"),
+            "you fixed it".to_string(),
+            manual_outcome_label(outcome),
+            Tone::Normal,
+        ),
+        DiagnosticEvent::UnfixedUnknown {
+            word,
+            best_candidate,
+            ..
+        } => (
+            word.clone(),
+            match best_candidate {
+                Some(c) => format!("left alone (maybe {c}?)"),
+                None => "unknown word".to_string(),
+            },
+            String::new(),
+            Tone::Muted,
+        ),
+        DiagnosticEvent::RealWordDeclined {
+            word,
+            prev,
+            candidate,
+            ..
+        } => (
+            format!("{prev} {word}"),
+            format!("left alone ({candidate} too risky)"),
+            String::new(),
+            Tone::Muted,
+        ),
+        DiagnosticEvent::AppBypass {
+            app,
+            profile,
+            reason,
+        } => (
+            app.clone(),
+            if *profile == AppProfile::Bypass {
+                "SmartKey off here".to_string()
+            } else {
+                format!("treated as {}", profile_label(*profile))
+            },
+            reason.replace(['-', '_'], " "),
+            Tone::Muted,
+        ),
+        DiagnosticEvent::RuleLearned {
+            rule,
+            stage,
+            previous,
+        } => (
+            humanize_rule(rule),
+            "SmartKey learned this".to_string(),
+            match (stage.as_str(), previous) {
+                ("graduated_2x", _) => "after 2 fixes".to_string(),
+                ("superseded", Some(old)) => format!("replaces {old}"),
+                ("block_permanent", _) => "after you undid it".to_string(),
+                (s, _) if s.contains("untouched") => "typed 3× unfixed".to_string(),
+                (s, _) => s.replace('_', " "),
+            },
+            Tone::Normal,
+        ),
+        DiagnosticEvent::WordUnchanged { word, reason } => (
+            word.clone(),
+            format!("kept ({})", kind_label(*reason)),
+            String::new(),
+            Tone::Muted,
+        ),
+        DiagnosticEvent::PackNotice { notice, detail } => (
+            notice.replace('_', " "),
+            detail.clone(),
+            String::new(),
+            Tone::Warn,
+        ),
+    }
+}
+
+fn explain_target(ev: &DiagnosticEvent) -> Option<(Option<String>, String)> {
+    match ev {
+        DiagnosticEvent::AutocorrectApplied { typed, .. }
+        | DiagnosticEvent::BackspaceUndo { typed, .. } => Some((None, typed.clone())),
+        DiagnosticEvent::ManualBackspaceFix { orig, .. } => Some((None, orig.clone())),
+        DiagnosticEvent::UnfixedUnknown { word, .. }
+        | DiagnosticEvent::WordUnchanged { word, .. } => Some((None, word.clone())),
+        DiagnosticEvent::RealWordDeclined { word, prev, .. } => {
+            Some((Some(prev.clone()), word.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn is_single_word(s: &str) -> bool {
+    !s.trim().is_empty() && !s.trim().contains(char::is_whitespace)
+}
+
+fn activity_actions(row: &ActivityRow) -> Vec<ActionItem> {
+    let lang = if row.lang.is_empty() || row.lang == "-" {
+        LangId::en()
+    } else {
+        LangId(row.lang.clone())
+    };
+    let mut items = Vec::new();
+    let mut add = |key: char, label: String, hint: String, action: RowAction| {
+        items.push(ActionItem {
+            key,
+            label,
+            hint,
+            action,
+        });
+    };
+    let word_item = |word: &str| RowAction::Ops {
+        ops: vec![StoreOp::AddWord {
+            lang: lang.clone(),
+            word: word.to_string(),
+        }],
+        msg: format!("Added \"{word}\" to your words"),
+    };
+    match &row.event {
+        DiagnosticEvent::AutocorrectApplied {
+            typed,
+            applied,
+            kind,
+            ..
+        } => {
+            add(
+                'b',
+                "Never do this again".to_string(),
+                format!("blocks {typed} → {applied}"),
+                RowAction::Ops {
+                    ops: vec![StoreOp::AddBlock {
+                        typed: typed.clone(),
+                        rejected: applied.clone(),
+                    }],
+                    msg: format!("SmartKey will never change {typed} → {applied}"),
+                },
+            );
+            if *kind != MatchKind::UserCorrectionRule {
+                add(
+                    'a',
+                    "Always fix it this way".to_string(),
+                    "saves it as your fix".to_string(),
+                    RowAction::Ops {
+                        ops: vec![StoreOp::SetFix {
+                            lang: lang.clone(),
+                            typed: typed.clone(),
+                            fixed: applied.clone(),
+                        }],
+                        msg: format!("Saved fix {typed} → {applied}"),
+                    },
+                );
+            }
+            if is_single_word(typed) {
+                add(
+                    'w',
+                    format!("\"{typed}\" is a real word"),
+                    "adds it to your words".to_string(),
+                    word_item(typed),
+                );
+            }
+        }
+        DiagnosticEvent::BackspaceUndo {
+            typed, rejected, ..
+        } => {
+            add(
+                'b',
+                "Never do this again".to_string(),
+                format!("blocks {typed} → {rejected}"),
+                RowAction::Ops {
+                    ops: vec![StoreOp::AddBlock {
+                        typed: typed.clone(),
+                        rejected: rejected.clone(),
+                    }],
+                    msg: format!("SmartKey will never change {typed} → {rejected}"),
+                },
+            );
+            if is_single_word(typed) {
+                add(
+                    'w',
+                    format!("\"{typed}\" is a real word"),
+                    "adds it to your words".to_string(),
+                    word_item(typed),
+                );
+            }
+        }
+        DiagnosticEvent::ManualBackspaceFix { orig, fixed, .. } => {
+            add(
+                'a',
+                format!("Always fix {orig} → {fixed}"),
+                "saves it now instead of waiting".to_string(),
+                RowAction::Ops {
+                    ops: vec![StoreOp::SetFix {
+                        lang: lang.clone(),
+                        typed: orig.clone(),
+                        fixed: fixed.clone(),
+                    }],
+                    msg: format!("Saved fix {orig} → {fixed}"),
+                },
+            );
+        }
+        DiagnosticEvent::UnfixedUnknown {
+            word,
+            best_candidate,
+            ..
+        } => {
+            if is_single_word(word) {
+                add(
+                    'w',
+                    format!("\"{word}\" is a real word"),
+                    "stops it showing as missed".to_string(),
+                    word_item(word),
+                );
+            }
+            if let Some(c) = best_candidate {
+                add(
+                    'a',
+                    format!("Always fix {word} → {c}"),
+                    "saves it as your fix".to_string(),
+                    RowAction::Ops {
+                        ops: vec![StoreOp::SetFix {
+                            lang: lang.clone(),
+                            typed: word.clone(),
+                            fixed: c.clone(),
+                        }],
+                        msg: format!("Saved fix {word} → {c}"),
+                    },
+                );
+            }
+        }
+        DiagnosticEvent::RealWordDeclined {
+            word,
+            prev,
+            candidate,
+            ..
+        } => {
+            add(
+                'a',
+                format!("Fix \"{word}\" → \"{candidate}\" after \"{prev}\""),
+                "only in this phrase".to_string(),
+                RowAction::Ops {
+                    ops: vec![StoreOp::SetContext {
+                        prev: prev.clone(),
+                        typed: word.clone(),
+                        fixed: candidate.clone(),
+                    }],
+                    msg: format!("Saved fix {prev} {word} → {candidate}"),
+                },
+            );
+        }
+        DiagnosticEvent::RuleLearned { .. } => {
+            add(
+                'v',
+                "Review learned rules".to_string(),
+                "opens the Review screen".to_string(),
+                RowAction::GoReview,
+            );
+        }
+        _ => {}
+    }
+    if let Some((prev, token)) = explain_target(&row.event) {
+        add(
+            'x',
+            "Why did this happen?".to_string(),
+            "scores and other guesses".to_string(),
+            RowAction::Explain {
+                lang: lang.clone(),
+                prev,
+                token,
+            },
+        );
+    }
+    let app = match &row.event {
+        DiagnosticEvent::AppBypass { app, .. } => Some(app.clone()),
+        _ => row.app.clone(),
+    };
+    if let Some(app) = app.filter(|a| !a.trim().is_empty()) {
+        add(
+            'p',
+            format!("Change how {app} is treated"),
+            "off, browser, chat, or prose".to_string(),
+            RowAction::PickApp { app },
+        );
+    }
+    items
+}
+
+fn humanize_rule(rule: &str) -> String {
+    if let Some(w) = rule.strip_prefix("personal_dict:") {
+        format!("new word \"{w}\"")
+    } else if let Some(w) = rule.strip_prefix("telex_passthrough:") {
+        format!("Telex keeps \"{w}\"")
+    } else if let Some(pair) = rule.strip_prefix("block:") {
+        format!("never {}", pair.replace("->", " → "))
+    } else {
+        rule.replace("->", " → ")
+    }
+}
+
+/// Staging counters keep ticking after a rule graduates; hide the ones that are already rules.
+fn staged_already_active(queue: &str, key: &str, active: &BTreeSet<String>) -> bool {
+    let probe = match queue {
+        "fix" => key
+            .split_once("->")
+            .and_then(|(lhs, _)| lhs.split_once(':'))
+            .map(|(lang, typed)| format!("fix:{lang}:{typed}")),
+        "context" => key.split_once("->").map(|(lhs, _)| format!("ctx:{lhs}")),
+        "untouched_word" => key
+            .split_once(':')
+            .map(|(lang, w)| format!("word:{lang}:{}", w.to_lowercase())),
+        "case_fix" => key
+            .strip_prefix("case:")
+            .and_then(|r| r.split_once(':'))
+            .map(|(lang, w)| format!("word:{lang}:{}", w.to_lowercase())),
+        "telex_passthrough" => Some(format!("pt:{key}")),
+        _ => None,
+    };
+    probe.is_some_and(|p| active.contains(&p))
+}
+
+fn describe_staged(
+    queue: &str,
+    key: &str,
+    canonical: Option<&str>,
+    count: u32,
+    threshold: u32,
+) -> Option<(String, String)> {
+    let progress = if count >= threshold {
+        format!("{count}× (not learned yet)")
+    } else {
+        format!("{count} of {threshold} times")
+    };
+    match queue {
+        "fix" => {
+            let (lang, pair) = key.split_once(':')?;
+            let (typed, fixed) = pair.split_once("->")?;
+            let tag = if lang == "en" {
+                String::new()
+            } else {
+                format!("  ({lang})")
+            };
+            Some((
+                format!("{typed} → {fixed}{tag}"),
+                format!("you fixed this {progress}"),
+            ))
+        }
+        "context" => {
+            let (lhs, fixed) = key.split_once("->")?;
+            let (prev, typed) = lhs.split_once('|')?;
+            Some((
+                format!("{prev} {typed} → {fixed}"),
+                format!("you fixed this {progress}"),
+            ))
+        }
+        "untouched_word" => {
+            let (lang, word) = key.split_once(':')?;
+            let shown = canonical.unwrap_or(word);
+            let tag = if lang == "en" {
+                String::new()
+            } else {
+                format!("  ({lang})")
+            };
+            Some((
+                format!("{shown}{tag}"),
+                format!("typed {progress} without fixing"),
+            ))
+        }
+        "case_fix" => {
+            let rest = key.strip_prefix("case:")?;
+            let (_, word) = rest.split_once(':')?;
+            Some((
+                canonical.unwrap_or(word).to_string(),
+                format!("capitalisation fixed {progress}"),
+            ))
+        }
+        "telex_passthrough" => Some((
+            key.to_string(),
+            format!("kept as typed in Telex {progress}"),
+        )),
+        _ => None,
+    }
+}
+
+fn collect_rules(store: &RuleStore) -> Vec<RuleEntry> {
     let c = store.compiled();
-    let mut raw: Vec<(&'static str, String, String, bool, RuleDeleteTarget)> = Vec::new();
+    let mut out = Vec::new();
+    let mut push = |kind: RuleKind,
+                    lang: LangId,
+                    a: &str,
+                    b: &str,
+                    prev: &str,
+                    stat_key: Option<String>,
+                    pinned: bool| {
+        let (tier, origin, hits, strikes, last_hit_ms) = match &stat_key {
+            Some(k) => {
+                let (tier, stat, hits, strikes) = store.classify_rule_confidence(k);
+                (
+                    tier,
+                    stat.map(|s| s.origin),
+                    hits,
+                    strikes,
+                    stat.and_then(|s| s.last_hit_epoch_ms),
+                )
+            }
+            None => (ConfidenceTier::Manual, Some(RuleOrigin::Manual), 0, 0, None),
+        };
+        out.push(RuleEntry {
+            kind,
+            lang,
+            a: a.to_string(),
+            b: b.to_string(),
+            prev: prev.to_string(),
+            tier,
+            origin,
+            pinned,
+            hits,
+            strikes,
+            last_hit_ms,
+        });
+    };
 
     for (typed, fixed) in &c.corrections {
-        raw.push((
-            "fix",
-            RuleStore::stat_key_fix("en", typed),
-            format!("{typed} -> {fixed}"),
+        push(
+            RuleKind::Fix,
+            LangId::en(),
+            typed,
+            fixed,
+            "",
+            Some(RuleStore::stat_key_fix("en", typed)),
             false,
-            RuleDeleteTarget::Fix {
-                lang: LangId::en(),
-                typed: typed.clone(),
-            },
-        ));
+        );
     }
     for (lk, map) in &c.lang_corrections {
         for (typed, fixed) in map {
-            let display = if lk == "en" {
-                format!("{typed} -> {fixed}")
-            } else {
-                format!("[{lk}] {typed} -> {fixed}")
-            };
-            raw.push((
-                "fix",
-                RuleStore::stat_key_fix(lk, typed),
-                display,
+            push(
+                RuleKind::Fix,
+                LangId(lk.clone()),
+                typed,
+                fixed,
+                "",
+                Some(RuleStore::stat_key_fix(lk, typed)),
                 false,
-                RuleDeleteTarget::Fix {
-                    lang: LangId(lk.clone()),
-                    typed: typed.clone(),
-                },
-            ));
+            );
         }
     }
     for ((prev, typed), fixed) in &c.context_corrections {
-        raw.push((
-            "context",
-            RuleStore::stat_key_ctx(prev, typed),
-            format!("{prev} {typed} -> {fixed}"),
+        push(
+            RuleKind::Context,
+            LangId::en(),
+            typed,
+            fixed,
+            prev,
+            Some(RuleStore::stat_key_ctx(prev, typed)),
             false,
-            RuleDeleteTarget::Context {
-                prev: prev.clone(),
-                typed: typed.clone(),
-            },
-        ));
+        );
     }
     for (trigger, expansion) in &c.snippets {
-        raw.push((
-            "snippet",
-            format!("snippet:{trigger}"),
-            format!("{trigger} -> {expansion}"),
+        push(
+            RuleKind::Snippet,
+            LangId::en(),
+            trigger,
+            expansion,
+            "",
+            None,
             false,
-            RuleDeleteTarget::Snippet {
-                trigger: trigger.clone(),
-            },
-        ));
+        );
     }
     for w in &c.personal_dict {
         let canon = c
             .personal_dict_canonical
             .get(w)
             .map(String::as_str)
-            .unwrap_or(w.as_str());
-        raw.push((
-            "word",
-            RuleStore::stat_key_word("en", w),
-            canon.to_string(),
+            .unwrap_or(w);
+        push(
+            RuleKind::Word,
+            LangId::en(),
+            w,
+            canon,
+            "",
+            Some(RuleStore::stat_key_word("en", w)),
             c.pinned.contains(w),
-            RuleDeleteTarget::Word {
-                lang: LangId::en(),
-                word: w.clone(),
-            },
-        ));
+        );
     }
     for (lk, set) in &c.lang_personal_dict {
         if lk == "en" {
@@ -2056,153 +3864,41 @@ fn collect_active_rule_rows(store: &RuleStore) -> (ConfidenceCountsJson, Vec<Act
             let canon = canon_map
                 .and_then(|m| m.get(w))
                 .map(String::as_str)
-                .unwrap_or(w.as_str());
-            raw.push((
-                "word",
-                RuleStore::stat_key_word(lk, w),
-                format!("[{lk}] {canon}"),
+                .unwrap_or(w);
+            push(
+                RuleKind::Word,
+                LangId(lk.clone()),
+                w,
+                canon,
+                "",
+                Some(RuleStore::stat_key_word(lk, w)),
                 false,
-                RuleDeleteTarget::Word {
-                    lang: LangId(lk.clone()),
-                    word: w.clone(),
-                },
-            ));
+            );
         }
     }
     for (t, r) in &c.blocklist {
-        raw.push((
-            "block",
-            RuleStore::stat_key_block(t, r),
-            format!("{t} !-> {r}"),
+        push(
+            RuleKind::Block,
+            LangId::en(),
+            t,
+            r,
+            "",
+            Some(RuleStore::stat_key_block(t, r)),
             false,
-            RuleDeleteTarget::Block {
-                typed: t.clone(),
-                rejected: r.clone(),
-            },
-        ));
+        );
     }
     for w in &c.telex_passthrough {
-        raw.push((
-            "passthrough",
-            RuleStore::stat_key_pt(w),
-            w.clone(),
+        push(
+            RuleKind::Passthrough,
+            LangId::vi(),
+            w,
+            "",
+            "",
+            Some(RuleStore::stat_key_pt(w)),
             false,
-            RuleDeleteTarget::Passthrough { raw: w.clone() },
-        ));
+        );
     }
-
-    let mut counts = ConfidenceCountsJson {
-        manual: 0,
-        confirmed: 0,
-        provisional: 0,
-        suspect: 0,
-    };
-    let mut rows = Vec::with_capacity(raw.len());
-    for (kind, stat_key, display, is_pinned, delete_target) in raw {
-        let (tier, origin, hits, strikes) = if kind == "snippet" {
-            counts.manual += 1;
-            (ConfidenceTier::Manual, "manual".to_string(), 0, 0)
-        } else {
-            let (tier, stat, hits, strikes) = store.classify_rule_confidence(&stat_key);
-            match tier {
-                ConfidenceTier::Manual => counts.manual += 1,
-                ConfidenceTier::Confirmed => counts.confirmed += 1,
-                ConfidenceTier::Provisional => counts.provisional += 1,
-                ConfidenceTier::Suspect => counts.suspect += 1,
-            }
-            let origin = if is_pinned {
-                "pinned".to_string()
-            } else {
-                stat.map(|s| s.origin.as_str().to_string())
-                    .unwrap_or_else(|| "untracked".to_string())
-            };
-            (tier, origin, hits, strikes)
-        };
-        rows.push(ActiveRuleRow {
-            kind,
-            display,
-            tier,
-            origin,
-            hits,
-            strikes,
-            delete_target,
-        });
-    }
-
-    rows.sort_by(|a, b| {
-        tier_rank(a.tier)
-            .cmp(&tier_rank(b.tier))
-            .then_with(|| a.kind.cmp(b.kind))
-            .then_with(|| a.display.cmp(&b.display))
-    });
-    (counts, rows)
-}
-
-fn tier_rank(tier: ConfidenceTier) -> u8 {
-    match tier {
-        ConfidenceTier::Suspect => 0,
-        ConfidenceTier::Provisional => 1,
-        ConfidenceTier::Confirmed => 2,
-        ConfidenceTier::Manual => 3,
-    }
-}
-
-fn collect_app_overrides(c: &smartkey_core::CompiledRules) -> Vec<AppOverrideRow> {
-    let mut rows = Vec::new();
-    for (profile, set) in [
-        (AppProfile::Bypass, &c.app_profiles.bypass),
-        (AppProfile::Browser, &c.app_profiles.browser),
-        (AppProfile::Chat, &c.app_profiles.chat),
-        (AppProfile::Prose, &c.app_profiles.prose),
-    ] {
-        for app_id in set {
-            rows.push(AppOverrideRow {
-                profile,
-                app_id: app_id.clone(),
-            });
-        }
-    }
-    rows
-}
-
-fn load_logs(log_dir: &Path, fallback_events: &[DiagnosticEvent]) -> Vec<LogRow> {
-    if let Ok(records) = EventLog::read_records_in_range(log_dir, None, None) {
-        if !records.is_empty() {
-            return records
-                .into_iter()
-                .rev()
-                .map(|r| {
-                    let secs = (r.ts_ms / 1000) % 86_400;
-                    let ts = format!(
-                        "{} {:02}:{:02}:{:02}Z",
-                        date_string(r.ts_ms),
-                        secs / 3600,
-                        (secs % 3600) / 60,
-                        secs % 60
-                    );
-                    let summary = format_diagnostic_event_line(&r.event);
-                    LogRow {
-                        timestamp: ts,
-                        app: r.app,
-                        lang: r.lang,
-                        summary,
-                        event: r.event,
-                    }
-                })
-                .collect();
-        }
-    }
-    fallback_events
-        .iter()
-        .rev()
-        .map(|ev| LogRow {
-            timestamp: "recent".to_string(),
-            app: None,
-            lang: "-".to_string(),
-            summary: format_diagnostic_event_line(ev),
-            event: ev.clone(),
-        })
-        .collect()
+    out
 }
 
 fn promote_staged_entry(
@@ -2211,55 +3907,54 @@ fn promote_staged_entry(
     key: &str,
     canonical: Option<&str>,
 ) -> Result<(), String> {
+    let e = |err: io::Error| err.to_string();
     match queue {
         "fix" => {
-            let (lang_str, pair) = key
+            let (lang, pair) = key
                 .split_once(':')
-                .ok_or_else(|| format!("Malformed fix staged key '{key}'"))?;
+                .ok_or_else(|| format!("Malformed staged fix '{key}'"))?;
             let (typed, fixed) = pair
                 .split_once("->")
-                .ok_or_else(|| format!("Malformed fix staged pair '{pair}'"))?;
+                .ok_or_else(|| format!("Malformed staged fix '{key}'"))?;
             store
-                .set_user_correction(&LangId(lang_str.to_string()), typed, fixed)
-                .map_err(|e| format!("Promote fix failed: {e}"))?;
+                .set_user_correction(&LangId(lang.to_string()), typed, fixed)
+                .map_err(e)?;
         }
         "case_fix" => {
             let rest = key.strip_prefix("case:").unwrap_or(key);
-            let (lang_str, word) = rest
+            let (lang, word) = rest
                 .split_once(':')
-                .ok_or_else(|| format!("Malformed case_fix key '{key}'"))?;
-            let w = canonical.unwrap_or(word);
+                .ok_or_else(|| format!("Malformed staged word '{key}'"))?;
             store
-                .add_user_personal_word(&LangId(lang_str.to_string()), w)
-                .map_err(|e| format!("Promote case_fix failed: {e}"))?;
+                .add_user_personal_word(&LangId(lang.to_string()), canonical.unwrap_or(word))
+                .map_err(e)?;
         }
         "context" => {
             let (lhs, fixed) = key
                 .split_once("->")
-                .ok_or_else(|| format!("Malformed context key '{key}'"))?;
+                .ok_or_else(|| format!("Malformed staged fix '{key}'"))?;
             let (prev, typed) = lhs
                 .split_once('|')
-                .ok_or_else(|| format!("Malformed context pair '{lhs}'"))?;
+                .ok_or_else(|| format!("Malformed staged fix '{key}'"))?;
             store
                 .set_user_context_correction(prev, typed, fixed)
-                .map_err(|e| format!("Promote context failed: {e}"))?;
+                .map_err(e)?;
         }
         "untouched_word" => {
-            let (lang_str, word) = key
+            let (lang, word) = key
                 .split_once(':')
-                .ok_or_else(|| format!("Malformed word key '{key}'"))?;
-            let w = canonical.unwrap_or(word);
+                .ok_or_else(|| format!("Malformed staged word '{key}'"))?;
             store
-                .add_user_personal_word(&LangId(lang_str.to_string()), w)
-                .map_err(|e| format!("Promote word failed: {e}"))?;
+                .add_user_personal_word(&LangId(lang.to_string()), canonical.unwrap_or(word))
+                .map_err(e)?;
         }
         "telex_passthrough" => {
-            store
-                .add_user_telex_passthrough(key)
-                .map_err(|e| format!("Promote passthrough failed: {e}"))?;
+            store.add_user_telex_passthrough(key).map_err(e)?;
         }
         other => {
-            return Err(format!("Unsupported staged promotion queue '{other}'"));
+            return Err(format!(
+                "SmartKey can't learn '{other}' entries early; remove it instead"
+            ))
         }
     }
     Ok(())
@@ -2269,26 +3964,39 @@ fn promote_staged_entry(
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use smartkey_core::event_log::DiagnosticsConfig;
-    use smartkey_core::Preset;
+    use smartkey_core::RuleStat;
 
-    static TUI_NONCE: AtomicU64 = AtomicU64::new(1);
-    static RELOAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static NONCE: AtomicU64 = AtomicU64::new(1);
+    static RELOADS: AtomicUsize = AtomicUsize::new(0);
 
     fn test_reload() -> bool {
-        RELOAD_COUNT.fetch_add(1, Ordering::SeqCst);
+        RELOADS.fetch_add(1, Ordering::SeqCst);
         true
     }
 
-    fn temp_tui_dirs(name: &str) -> (PathBuf, PathBuf) {
+    struct Dirs {
+        base: PathBuf,
+        cfg: PathBuf,
+        logs: PathBuf,
+    }
+
+    impl Drop for Dirs {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn dirs(name: &str) -> Dirs {
         let base = std::env::temp_dir().join(format!(
             "smartkey_tui_{name}_{}_{}",
             std::process::id(),
-            TUI_NONCE.fetch_add(1, Ordering::Relaxed)
+            NONCE.fetch_add(1, Ordering::Relaxed)
         ));
         let cfg = base.join("config");
         let logs = base.join("logs");
@@ -2300,25 +4008,40 @@ mod tests {
             Preset::Balanced,
         )
         .unwrap();
-        (base, cfg)
+        Dirs { base, cfg, logs }
+    }
+
+    fn log_event(logs: &Path, app: &str, ev: DiagnosticEvent) {
+        let mut w = EventLog::new();
+        w.set_dir(Some(logs.to_path_buf()));
+        w.set_app(Some(app));
+        w.record(&DiagnosticsConfig::default(), "en", &ev);
     }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn ctrl(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    fn press(app: &mut App, c: char) {
+        app.handle_key(key(KeyCode::Char(c)));
     }
 
     fn type_text(app: &mut App, s: &str) {
         for c in s.chars() {
-            app.handle_key(key(KeyCode::Char(c)));
+            press(app, c);
         }
     }
 
-    fn buffer_text(term: &Terminal<TestBackend>) -> String {
-        let buf = term.backend().buffer();
+    fn store(d: &Dirs) -> RuleStore {
+        load_rule_store_readonly(&d.cfg, Preset::Balanced)
+            .unwrap()
+            .0
+    }
+
+    fn screen_text(app: &App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer().clone();
         let mut out = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
@@ -2330,260 +4053,362 @@ mod tests {
     }
 
     #[test]
-    fn tui_renders_all_tabs_and_narrow_viewport_without_panic() {
-        let (base, cfg) = temp_tui_dirs("render_tabs");
-        let logs = base.join("logs");
-        let mut app = App::new(cfg, logs, test_reload);
-
-        for (width, height) in [(100u16, 30u16), (40, 12)] {
-            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
-            for tab_key in ['1', '2', '3', '4', '5'] {
-                app.handle_key(key(KeyCode::Char(tab_key)));
-                term.draw(|f| app.render(f)).unwrap();
-            }
-            app.handle_key(key(KeyCode::Char('2')));
-            app.handle_key(key(KeyCode::Char('v')));
-            term.draw(|f| app.render(f)).unwrap();
-        }
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn tui_overview_toggles_persist_and_signal_reload() {
-        let (base, cfg) = temp_tui_dirs("overview_toggles");
-        let logs = base.join("logs");
-        let before_reloads = RELOAD_COUNT.load(Ordering::SeqCst);
-        let mut app = App::new(cfg.clone(), logs, test_reload);
-
-        assert!(app.overview.enabled);
-        assert!(app.overview.vi_lotus_enabled);
-
-        app.handle_key(key(KeyCode::Char('e')));
-        assert!(!app.overview.enabled);
-        app.handle_key(key(KeyCode::Char('l')));
-        assert!(!app.overview.vi_lotus_enabled);
-        assert!(RELOAD_COUNT.load(Ordering::SeqCst) >= before_reloads + 2);
-
-        let (reloaded, _) = load_rule_store_readonly(&cfg, Preset::Balanced).unwrap();
-        assert!(!reloaded.compiled().enabled);
-        assert!(!reloaded.compiled().vi_lotus_enabled);
-
-        app.handle_key(key(KeyCode::Char('l')));
-        assert!(app.overview.vi_lotus_enabled);
-
-        assert!(app.handle_key(key(KeyCode::Char('q'))));
-        assert!(app.handle_key(ctrl('c')));
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn tui_rules_add_delete_staged_promote_and_dismiss() {
-        let (base, cfg) = temp_tui_dirs("rules_staged");
-        let logs = base.join("logs");
-
-        {
-            let mut store = load_rule_store_mut(&cfg, Preset::Balanced).unwrap();
-            let st = store.state_mut();
-            st.staged_corrections.insert("en:teh->the".to_string(), 1);
-            st.untouched_unknowns.insert("en:hyprland".to_string(), 2);
-            st.staged_personal_canonical
-                .insert("en:hyprland".to_string(), "Hyprland".to_string());
-            st.staged_telex_passthrough.insert("aur".to_string(), 1);
-            store.flush_state().unwrap();
-        }
-
-        let mut app = App::new(cfg.clone(), logs, test_reload);
-        app.handle_key(key(KeyCode::Char('2')));
-
-        // Add active fix rule
-        app.handle_key(key(KeyCode::Char('a')));
-        type_text(&mut app, "recieve=receive");
-        app.handle_key(key(KeyCode::Enter));
-        assert!(app
-            .active_rules
-            .iter()
-            .any(|r| r.display == "recieve -> receive"));
-
-        // Delete active fix rule via filter + Confirm
-        app.handle_key(key(KeyCode::Char('/')));
-        type_text(&mut app, "recieve");
-        app.handle_key(key(KeyCode::Enter));
-        app.handle_key(key(KeyCode::Char('d')));
-        app.handle_key(key(KeyCode::Char('y')));
-        assert!(!app
-            .active_rules
-            .iter()
-            .any(|r| r.display == "recieve -> receive"));
-        app.handle_key(key(KeyCode::Esc));
-
-        // Switch to Staged view, promote "fix", promote "untouched_word", dismiss "telex_passthrough"
-        app.handle_key(key(KeyCode::Char('v')));
-        assert_eq!(app.staged_entries.len(), 3);
-        app.handle_key(key(KeyCode::Char('p'))); // promotes "fix"
-        app.handle_key(key(KeyCode::Char('p'))); // promotes "untouched_word"
-        assert_eq!(app.staged_entries.len(), 1);
-        app.handle_key(key(KeyCode::Char('d')));
-        app.handle_key(key(KeyCode::Char('y'))); // dismisses "telex_passthrough"
-        assert!(app.staged_entries.is_empty());
-
-        let (reloaded, _) = load_rule_store_readonly(&cfg, Preset::Balanced).unwrap();
-        assert_eq!(
-            reloaded.compiled().corrections.get("teh").map(String::as_str),
-            Some("the")
+    fn tab_bar_is_visible_and_every_screen_renders_at_any_size() {
+        let d = dirs("render");
+        log_event(
+            &d.logs,
+            "kitty",
+            DiagnosticEvent::AutocorrectApplied {
+                typed: "teh".into(),
+                applied: "the".into(),
+                kind: MatchKind::KnownTypoDict,
+                total_count: 1,
+            },
         );
-        assert!(reloaded.compiled().personal_dict.contains("hyprland"));
-        assert!(!reloaded.compiled().telex_passthrough.contains("aur"));
+        let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
+        let top = screen_text(&app, 110, 32);
+        let first_line = top.lines().next().unwrap();
+        for label in ["1 Activity", "2 Review", "3 Dictionary", "4 Settings"] {
+            assert!(
+                first_line.contains(label),
+                "tab bar missing {label}: {first_line}"
+            );
+        }
+        assert!(top.contains("teh → the"), "activity row missing:\n{top}");
 
-        let _ = fs::remove_dir_all(&base);
+        for (w, h) in [(110u16, 32u16), (60, 16), (40, 12), (24, 8), (10, 4)] {
+            for c in ['1', '2', '3', '4'] {
+                press(&mut app, c);
+                screen_text(&app, w, h);
+                press(&mut app, '?');
+                screen_text(&app, w, h);
+                app.handle_key(key(KeyCode::Esc));
+            }
+        }
     }
 
     #[test]
-    fn tui_settings_cycle_and_numeric_modal_persist() {
-        let (base, cfg) = temp_tui_dirs("settings");
-        let logs = base.join("logs");
-        let mut app = App::new(cfg.clone(), logs, test_reload);
-        app.handle_key(key(KeyCode::Char('3')));
+    fn activity_row_actions_block_a_fix_and_undo_restores_it() {
+        let d = dirs("activity");
+        log_event(
+            &d.logs,
+            "kitty",
+            DiagnosticEvent::AutocorrectApplied {
+                typed: "coule".into(),
+                applied: "could".into(),
+                kind: MatchKind::KnownTypoDict,
+                total_count: 1,
+            },
+        );
+        let before = RELOADS.load(Ordering::SeqCst);
+        let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
+        assert_eq!(app.activity.len(), 1);
 
-        let aggr_idx = app
-            .settings
-            .iter()
-            .position(|(k, _)| *k == "settings.aggressiveness")
-            .unwrap();
-        app.setting_idx = aggr_idx;
-        app.handle_key(key(KeyCode::Char(' ')));
-
-        let win_idx = app
-            .settings
-            .iter()
-            .position(|(k, _)| *k == "settings.undo_window_ms")
-            .unwrap();
-        app.setting_idx = win_idx;
         app.handle_key(key(KeyCode::Enter));
-        for _ in 0..8 {
+        let Some(Modal::Actions { items, .. }) = &app.modal else {
+            panic!("expected action menu");
+        };
+        let keys: Vec<char> = items.iter().map(|i| i.key).collect();
+        assert_eq!(keys, vec!['b', 'a', 'w', 'x', 'p']);
+
+        press(&mut app, 'b');
+        assert!(app.modal.is_none());
+        assert!(store(&d)
+            .compiled()
+            .blocklist
+            .contains(&("coule".to_string(), "could".to_string())));
+        assert!(RELOADS.load(Ordering::SeqCst) > before);
+        assert!(app.undo.is_some());
+
+        press(&mut app, 'u');
+        assert!(!store(&d)
+            .compiled()
+            .blocklist
+            .contains(&("coule".to_string(), "could".to_string())));
+        assert!(app.undo.is_none());
+
+        app.handle_key(key(KeyCode::Enter));
+        press(&mut app, 'w');
+        assert!(store(&d).compiled().personal_dict.contains("coule"));
+    }
+
+    #[test]
+    fn activity_explain_toggle_search_and_filter() {
+        let d = dirs("explain");
+        log_event(
+            &d.logs,
+            "kitty",
+            DiagnosticEvent::ManualBackspaceFix {
+                orig: "mt".into(),
+                fixed: "me".into(),
+                outcome: "staged (1x)".into(),
+                attempt_count: 1,
+            },
+        );
+        let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
+        assert_eq!(app.activity[0].why, "you fixed it");
+        assert_eq!(app.activity[0].note, "learning");
+
+        press(&mut app, 'x');
+        let Some(Modal::ExplainInput { input }) = &app.modal else {
+            panic!("expected explain input");
+        };
+        assert_eq!(input, "mt");
+        for _ in 0..2 {
             app.handle_key(key(KeyCode::Backspace));
         }
-        type_text(&mut app, "4200");
-        app.handle_key(key(KeyCode::Enter));
-
-        let (reloaded, _) = load_rule_store_readonly(&cfg, Preset::Balanced).unwrap();
-        assert_eq!(
-            reloaded.get_setting("settings.aggressiveness").as_deref(),
-            Some("aggressive")
-        );
-        assert_eq!(
-            reloaded.get_setting("settings.undo_window_ms").as_deref(),
-            Some("4200")
-        );
-
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn tui_apps_override_add_delete_and_policy_cycle() {
-        let (base, cfg) = temp_tui_dirs("apps");
-        let logs = base.join("logs");
-        let mut app = App::new(cfg.clone(), logs, test_reload);
-        app.handle_key(key(KeyCode::Char('4')));
-
-        app.handle_key(key(KeyCode::Char('u')));
-        assert_eq!(app.unknown_app_policy, "prose");
-
-        app.handle_key(key(KeyCode::Char('a')));
-        type_text(&mut app, "my-custom-term");
-        app.handle_key(key(KeyCode::Enter));
-        assert!(app
-            .app_overrides
-            .iter()
-            .any(|r| r.profile == AppProfile::Bypass && r.app_id == "my-custom-term"));
-
-        app.handle_key(key(KeyCode::Char('d')));
-        app.handle_key(key(KeyCode::Char('y')));
-        assert!(!app
-            .app_overrides
-            .iter()
-            .any(|r| r.app_id == "my-custom-term"));
-
-        let (reloaded, _) = load_rule_store_readonly(&cfg, Preset::Balanced).unwrap();
-        assert_eq!(
-            reloaded
-                .get_setting("app_profiles.unknown_app_policy")
-                .as_deref(),
-            Some("prose")
-        );
-
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn tui_logs_explain_filter_and_clear() {
-        let (base, cfg) = temp_tui_dirs("logs_explain");
-        let logs = base.join("logs");
-        {
-            let mut store = load_rule_store_mut(&cfg, Preset::Balanced).unwrap();
-            let ev = DiagnosticEvent::AutocorrectApplied {
-                typed: "teh".to_string(),
-                applied: "the".to_string(),
-                kind: smartkey_core::MatchKind::KnownTypoDict,
-                total_count: 1,
-            };
-            store.state_mut().push_event(ev.clone());
-            store.flush_state().unwrap();
-
-            let mut log_writer = EventLog::new();
-            log_writer.set_dir(Some(logs.clone()));
-            log_writer.record(&DiagnosticsConfig::default(), "en", &ev);
-        }
-
-        let mut app = App::new(cfg.clone(), logs.clone(), test_reload);
-        app.handle_key(key(KeyCode::Char('5')));
-        assert!(!app.logs.is_empty());
-
-        app.handle_key(key(KeyCode::Char('x')));
         type_text(&mut app, "teh");
         app.handle_key(key(KeyCode::Enter));
-        let joined = app.explain_lines.join("\n");
-        assert!(joined.contains("\"the\""), "explain output: {joined}");
+        let Some(Modal::Info { lines, .. }) = &app.modal else {
+            panic!("expected explain result");
+        };
+        assert!(lines[0].contains("“the”"), "explain: {lines:?}");
+        app.handle_key(key(KeyCode::Esc));
 
-        app.handle_key(key(KeyCode::Char('f')));
-        assert_eq!(app.log_filter, LogFilter::FixedOnly);
+        press(&mut app, 'f');
+        assert_eq!(app.activity_filter, ActivityFilter::Fixes);
+        assert!(app.activity_view.is_empty());
+        press(&mut app, 'f');
+        assert_eq!(app.activity_view.len(), 1);
 
-        app.handle_key(key(KeyCode::Char('c')));
-        app.handle_key(key(KeyCode::Char('y')));
-        assert!(app.logs.is_empty());
+        press(&mut app, '/');
+        type_text(&mut app, "zzz");
+        assert!(app.activity_view.is_empty());
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.activity_view.len(), 1);
 
-        let _ = fs::remove_dir_all(&base);
+        press(&mut app, 'e');
+        assert!(!store(&d).compiled().enabled);
+        press(&mut app, 'u');
+        assert!(store(&d).compiled().enabled);
     }
 
     #[test]
-    fn tui_parse_lock_renders_banner_and_refuses_edits() {
-        let (base, cfg) = temp_tui_dirs("parse_lock");
-        let logs = base.join("logs");
-        let corrupt = "enabled = [broken toml\n";
-        fs::write(cfg.join("rules.toml"), corrupt).unwrap();
+    fn review_shows_only_shaky_rules_and_repeated_staging() {
+        let d = dirs("review");
+        {
+            let mut s = load_rule_store_mut(&d.cfg, Preset::Balanced).unwrap();
+            s.add_user_personal_word(&LangId::en(), "zorblax").unwrap();
+            s.set_user_correction(&LangId::en(), "dont", "don't")
+                .unwrap();
+            s.state_mut().rule_stats.insert(
+                RuleStore::stat_key_word("en", "zorblax"),
+                RuleStat {
+                    origin: RuleOrigin::Untouched3x,
+                    created_epoch_ms: current_epoch_ms(),
+                    last_hit_epoch_ms: None,
+                    hits: 0,
+                },
+            );
+            let st = s.state_mut();
+            st.staged_corrections.insert("en:al->all".into(), 2);
+            st.staged_corrections.insert("en:abl->sable".into(), 1);
+            st.staged_corrections.insert("en:dont->don't".into(), 3);
+            st.untouched_unknowns.insert("en:hyprland".into(), 2);
+            st.staged_personal_canonical
+                .insert("en:hyprland".into(), "Hyprland".into());
+            s.flush_state().unwrap();
+        }
+        let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
+        let titles: Vec<&str> = app.review.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, vec!["zorblax", "al → all", "Hyprland"]);
+        assert_eq!(app.review_hidden, 1);
+        assert!(app.review[0].detail.contains("never used since"));
 
-        let mut app = App::new(cfg.clone(), logs, test_reload);
-        assert!(app.parse_locked);
+        press(&mut app, '2');
+        press(&mut app, 'a');
+        let s = store(&d);
+        let (tier, ..) = s.classify_rule_confidence(&RuleStore::stat_key_word("en", "zorblax"));
+        assert_eq!(tier, ConfidenceTier::Manual);
+        assert_eq!(app.review.len(), 2);
 
-        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = buffer_text(&term);
-        assert!(
-            screen.contains("Parse Lock") || screen.contains("Parse lock active"),
-            "missing parse-lock banner in screen:\n{screen}"
+        press(&mut app, 'a');
+        assert_eq!(
+            store(&d)
+                .compiled()
+                .corrections
+                .get("al")
+                .map(String::as_str),
+            Some("all")
+        );
+        assert!(!store(&d)
+            .state()
+            .staged_corrections
+            .contains_key("en:al->all"));
+
+        press(&mut app, ' ');
+        press(&mut app, 'D');
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        press(&mut app, 'y');
+        assert!(!store(&d)
+            .state()
+            .untouched_unknowns
+            .contains_key("en:hyprland"));
+        assert!(app.review.is_empty());
+    }
+
+    #[test]
+    fn dictionary_form_adds_fix_and_delete_can_be_undone() {
+        let d = dirs("dict");
+        let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
+        press(&mut app, '3');
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.dict_section, DictSection::Fixes);
+
+        press(&mut app, 'n');
+        type_text(&mut app, "recieve");
+        app.handle_key(key(KeyCode::Enter));
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("form should stay open while Becomes is empty");
+        };
+        assert_eq!(form.focus, 1);
+        type_text(&mut app, "receive");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        assert_eq!(
+            store(&d)
+                .compiled()
+                .corrections
+                .get("recieve")
+                .map(String::as_str),
+            Some("receive")
+        );
+        assert_eq!(app.dict_view.len(), 1);
+
+        press(&mut app, 'd');
+        assert!(!store(&d).compiled().corrections.contains_key("recieve"));
+        press(&mut app, 'u');
+        assert_eq!(
+            store(&d)
+                .compiled()
+                .corrections
+                .get("recieve")
+                .map(String::as_str),
+            Some("receive")
         );
 
-        app.handle_key(key(KeyCode::Char('e')));
-        assert!(app.status_is_error);
-        assert_eq!(fs::read_to_string(cfg.join("rules.toml")).unwrap(), corrupt);
-
-        let _ = fs::remove_dir_all(&base);
+        app.handle_key(key(KeyCode::Left));
+        press(&mut app, 'n');
+        type_text(&mut app, "Hyprland");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(store(&d).compiled().personal_dict.contains("hyprland"));
+        press(&mut app, '/');
+        type_text(&mut app, "nomatch");
+        assert!(app.dict_view.is_empty());
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.dict_view.len(), 1);
     }
 
     #[test]
-    fn tui_cmd_args_help_and_unknown_flag() {
+    fn settings_change_values_and_app_modes() {
+        let d = dirs("settings");
+        log_event(
+            &d.logs,
+            "obsidian",
+            DiagnosticEvent::AutocorrectApplied {
+                typed: "teh".into(),
+                applied: "the".into(),
+                kind: MatchKind::KnownTypoDict,
+                total_count: 1,
+            },
+        );
+        let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
+        press(&mut app, '4');
+        let find = |app: &App, pred: &dyn Fn(&SettingsRow) -> bool| {
+            app.settings_rows.iter().position(pred).unwrap()
+        };
+
+        app.settings_idx = find(
+            &app,
+            &|r| matches!(r, SettingsRow::Setting(s) if s.key == "settings.aggressiveness"),
+        );
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            store(&d).get_setting("settings.aggressiveness").as_deref(),
+            Some("aggressive")
+        );
+
+        app.settings_idx = find(
+            &app,
+            &|r| matches!(r, SettingsRow::Setting(s) if s.key == "settings.undo_window_ms"),
+        );
+        let before: u64 = store(&d)
+            .get_setting("settings.undo_window_ms")
+            .unwrap()
+            .parse()
+            .unwrap();
+        app.handle_key(key(KeyCode::Right));
+        let after: u64 = store(&d)
+            .get_setting("settings.undo_window_ms")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(after, before + 500);
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "3000");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            store(&d).get_setting("settings.undo_window_ms").as_deref(),
+            Some("3000")
+        );
+
+        app.settings_idx = find(
+            &app,
+            &|r| matches!(r, SettingsRow::App { app, .. } if app == "obsidian"),
+        );
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(store(&d)
+            .compiled()
+            .app_profiles
+            .bypass
+            .contains("obsidian"));
+        press(&mut app, 'u');
+        assert!(!store(&d)
+            .compiled()
+            .app_profiles
+            .bypass
+            .contains("obsidian"));
+
+        app.settings_idx = 0;
+        app.handle_key(key(KeyCode::Up));
+        assert!(!matches!(
+            app.settings_rows[app.settings_idx],
+            SettingsRow::Header(_)
+        ));
+    }
+
+    #[test]
+    fn broken_rules_toml_shows_banner_and_blocks_changes() {
+        let d = dirs("parse_lock");
+        let corrupt = "enabled = [broken toml\n";
+        fs::write(d.cfg.join("rules.toml"), corrupt).unwrap();
+        let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
+        assert!(app.parse_locked);
+        let screen = screen_text(&app, 110, 32);
+        assert!(
+            screen.contains("changes are blocked"),
+            "banner missing:\n{screen}"
+        );
+
+        press(&mut app, 'e');
+        assert!(app.toast.as_ref().is_some_and(|t| t.error));
+        assert_eq!(
+            fs::read_to_string(d.cfg.join("rules.toml")).unwrap(),
+            corrupt
+        );
+    }
+
+    #[test]
+    fn cmd_args_help_and_unknown_flag() {
         assert!(cmd_tui(&["--help".to_string()]).is_ok());
         assert!(matches!(
             cmd_tui(&["--bogus".to_string()]),
+            Err(CliError::Usage(_))
+        ));
+        assert!(matches!(
+            cmd_tui(&["--dir".to_string()]),
             Err(CliError::Usage(_))
         ));
     }
