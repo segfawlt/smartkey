@@ -34,15 +34,7 @@ pub(crate) enum CliError {
 pub(crate) type CliResult = Result<(), CliError>;
 
 pub(crate) fn default_config_dir() -> PathBuf {
-    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        if !xdg.trim().is_empty() {
-            return PathBuf::from(xdg).join("smartkey");
-        }
-    }
-    if let Some(home) = smartkey_core::resolve_home_dir() {
-        return home.join(".config/smartkey");
-    }
-    env::temp_dir().join("smartkey/config")
+    smartkey_core::default_config_dir()
 }
 
 pub(crate) fn load_rule_store_mut(dir: &Path, preset: Preset) -> Result<RuleStore, CliError> {
@@ -63,47 +55,62 @@ pub(crate) fn load_rule_store_readonly(
 }
 
 pub(crate) fn notify_fcitx5_reload() -> bool {
-    if let Ok(status) = Command::new("fcitx5-remote")
-        .arg("-r")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    #[cfg(windows)]
     {
-        if status.success() {
-            return true;
-        }
+        false
     }
-    if let Ok(status) = Command::new("busctl")
-        .args([
-            "--user",
-            "call",
-            "org.fcitx.Fcitx5",
-            "/controller",
-            "org.fcitx.Fcitx.Controller1",
-            "ReloadConfig",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    #[cfg(not(windows))]
     {
-        if status.success() {
-            return true;
+        if let Ok(status) = Command::new("fcitx5-remote")
+            .arg("-r")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            if status.success() {
+                return true;
+            }
         }
+        if let Ok(status) = Command::new("busctl")
+            .args([
+                "--user",
+                "call",
+                "org.fcitx.Fcitx5",
+                "/controller",
+                "org.fcitx.Fcitx.Controller1",
+                "ReloadConfig",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            if status.success() {
+                return true;
+            }
+        }
+        false
     }
-    false
 }
 
 pub(crate) fn detect_fcitx5_running() -> bool {
-    Command::new("fcitx5-remote")
-        .arg("--check")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    #[cfg(windows)]
+    {
+        smartkey_tsf::register::is_clsid_registered().is_some_and(|p| p.exists())
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("fcitx5-remote")
+            .arg("--check")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
 }
 
 /// Searches user-local (`~/.local/lib/fcitx5`), standard (`/usr/lib`, `/usr/lib64`, `/usr/local/lib`),
 /// and Debian/Ubuntu multiarch (`/usr/lib/<triplet>/fcitx5`) addon directories for `so_name`.
+#[allow(dead_code)]
 pub(crate) fn detect_fcitx5_module_so(so_name: &str) -> Option<PathBuf> {
     if let Some(home) = smartkey_core::resolve_home_dir() {
         let user_so = home.join(".local/lib/fcitx5").join(so_name);
@@ -140,53 +147,79 @@ pub(crate) fn detect_fcitx5_module_so(so_name: &str) -> Option<PathBuf> {
 }
 
 fn detect_installed_addon() -> Option<PathBuf> {
-    detect_fcitx5_module_so("libsmartkey.so")
+    #[cfg(windows)]
+    {
+        smartkey_tsf::register::is_clsid_registered()
+    }
+    #[cfg(not(windows))]
+    {
+        detect_fcitx5_module_so("libsmartkey.so")
+    }
 }
 
 /// Validates desktop input-method routing environment variables without printing raw env values.
 pub(crate) fn inspect_im_environment() -> (bool, Vec<String>) {
-    let mut warnings = Vec::new();
-    let is_wayland = env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
-        || env::var("XDG_SESSION_TYPE")
-            .map(|s| s.eq_ignore_ascii_case("wayland"))
-            .unwrap_or(false);
-
-    match env::var("XMODIFIERS") {
-        Ok(v) if v.contains("@im=fcitx") => {}
-        _ => {
-            warnings.push(
-                "XMODIFIERS does not include '@im=fcitx' (XWayland/X11 apps may bypass Fcitx5)"
+    #[cfg(windows)]
+    {
+        let mut warnings = Vec::new();
+        match smartkey_tsf::register::is_clsid_registered() {
+            None => warnings.push(
+                "SmartKey Windows TSF service is not registered (run `smartkey install`)"
                     .to_string(),
-            );
+            ),
+            Some(path) if !path.exists() => warnings.push(format!(
+                "Registered TSF DLL missing at {} (re-run `smartkey install`)",
+                path.display()
+            )),
+            Some(_) => {}
         }
+        (warnings.is_empty(), warnings)
     }
+    #[cfg(not(windows))]
+    {
+        let mut warnings = Vec::new();
+        let is_wayland = env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+            || env::var("XDG_SESSION_TYPE")
+                .map(|s| s.eq_ignore_ascii_case("wayland"))
+                .unwrap_or(false);
 
-    if is_wayland {
-        if env::var("GTK_IM_MODULE")
-            .map(|s| s.contains("fcitx"))
-            .unwrap_or(false)
-        {
-            warnings.push(
-                "GTK_IM_MODULE=fcitx on Wayland routes GTK4 apps via legacy DBus instead of native Wayland text-input; consider unsetting GTK_IM_MODULE on Wayland"
-                    .to_string(),
-            );
+        match env::var("XMODIFIERS") {
+            Ok(v) if v.contains("@im=fcitx") => {}
+            _ => {
+                warnings.push(
+                    "XMODIFIERS does not include '@im=fcitx' (XWayland/X11 apps may bypass Fcitx5)"
+                        .to_string(),
+                );
+            }
         }
-    } else if env::var_os("DISPLAY").is_some_and(|v| !v.is_empty()) {
-        if !env::var("GTK_IM_MODULE")
-            .map(|s| s.contains("fcitx"))
-            .unwrap_or(false)
-        {
-            warnings.push("GTK_IM_MODULE is not set to 'fcitx' on X11".to_string());
+
+        if is_wayland {
+            if env::var("GTK_IM_MODULE")
+                .map(|s| s.contains("fcitx"))
+                .unwrap_or(false)
+            {
+                warnings.push(
+                    "GTK_IM_MODULE=fcitx on Wayland routes GTK4 apps via legacy DBus instead of native Wayland text-input; consider unsetting GTK_IM_MODULE on Wayland"
+                        .to_string(),
+                );
+            }
+        } else if env::var_os("DISPLAY").is_some_and(|v| !v.is_empty()) {
+            if !env::var("GTK_IM_MODULE")
+                .map(|s| s.contains("fcitx"))
+                .unwrap_or(false)
+            {
+                warnings.push("GTK_IM_MODULE is not set to 'fcitx' on X11".to_string());
+            }
+            if !env::var("QT_IM_MODULE")
+                .map(|s| s.contains("fcitx"))
+                .unwrap_or(false)
+            {
+                warnings.push("QT_IM_MODULE is not set to 'fcitx' on X11".to_string());
+            }
         }
-        if !env::var("QT_IM_MODULE")
-            .map(|s| s.contains("fcitx"))
-            .unwrap_or(false)
-        {
-            warnings.push("QT_IM_MODULE is not set to 'fcitx' on X11".to_string());
-        }
+
+        (warnings.is_empty(), warnings)
     }
-
-    (warnings.is_empty(), warnings)
 }
 
 #[derive(Serialize)]
@@ -297,6 +330,7 @@ fn cmd_status(args: &[String]) -> CliResult {
         "Engine State         : {}",
         if c.enabled { "ENABLED" } else { "DISABLED" }
     );
+    #[cfg(not(windows))]
     println!(
         "Lotus Bridge Plugin  : {}",
         if c.vi_lotus_enabled {
@@ -313,28 +347,56 @@ fn cmd_status(args: &[String]) -> CliResult {
             "disabled (run `smartkey trace on` to record)"
         }
     );
-    println!(
-        "Fcitx5 Daemon        : {}",
-        if fcitx_up {
-            "running"
-        } else {
-            "not detected in current session"
-        }
-    );
-    println!(
-        "Fcitx5 Addon Library : {}",
-        addon_so
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "not found".to_string())
-    );
-    println!(
-        "IM Environment       : {}",
-        if im_env_ok {
-            "ok".to_string()
-        } else {
-            im_env_warnings.join("; ")
-        }
-    );
+    #[cfg(windows)]
+    {
+        println!(
+            "Windows TSF Service  : {}",
+            if fcitx_up {
+                "registered"
+            } else {
+                "not registered (run `smartkey install`)"
+            }
+        );
+        println!(
+            "TSF Service DLL      : {}",
+            addon_so
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not found".to_string())
+        );
+        println!(
+            "TSF Environment      : {}",
+            if im_env_ok {
+                "ok".to_string()
+            } else {
+                im_env_warnings.join("; ")
+            }
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        println!(
+            "Fcitx5 Daemon        : {}",
+            if fcitx_up {
+                "running"
+            } else {
+                "not detected in current session"
+            }
+        );
+        println!(
+            "Fcitx5 Addon Library : {}",
+            addon_so
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not found".to_string())
+        );
+        println!(
+            "IM Environment       : {}",
+            if im_env_ok {
+                "ok".to_string()
+            } else {
+                im_env_warnings.join("; ")
+            }
+        );
+    }
     println!("Rules File           : {rules_str}");
     if let Some(parse_err) = store.parse_error() {
         println!("TOML Syntax Warning  : WRITE-LOCKED ({parse_err})");
@@ -404,6 +466,12 @@ fn cmd_set_enabled(args: &[String], mode: Option<bool>) -> CliResult {
 
 fn cmd_reload(args: &[String]) -> CliResult {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        #[cfg(windows)]
+        println!(
+            "USAGE:\n  smartkey reload\n\n\
+             Validate rules.toml; active Windows apps hot-reload rules.toml automatically on focus change."
+        );
+        #[cfg(not(windows))]
         println!(
             "USAGE:\n  smartkey reload\n\n\
              Ask the running Fcitx5 daemon to reload SmartKey configuration and dictionary packs."
@@ -415,14 +483,31 @@ fn cmd_reload(args: &[String]) -> CliResult {
             "unknown argument {other} (usage: smartkey reload)"
         )));
     }
-    if notify_fcitx5_reload() {
-        println!("Reloaded Fcitx5 SmartKey configuration.");
+    #[cfg(windows)]
+    {
+        let dir = default_config_dir();
+        let (store, _) = load_rule_store_readonly(&dir, Preset::Balanced)?;
+        if let Some(err) = store.parse_error() {
+            return Err(CliError::Runtime(format!(
+                "rules.toml has a syntax error ({err})"
+            )));
+        }
+        println!(
+            "Configuration valid; active Windows apps hot-reload rules.toml automatically on focus change."
+        );
         Ok(())
-    } else {
-        Err(CliError::Runtime(
-            "could not reach running Fcitx5 daemon (rules.toml still hot-reloads on window focus change)"
-                .to_string(),
-        ))
+    }
+    #[cfg(not(windows))]
+    {
+        if notify_fcitx5_reload() {
+            println!("Reloaded Fcitx5 SmartKey configuration.");
+            Ok(())
+        } else {
+            Err(CliError::Runtime(
+                "could not reach running Fcitx5 daemon (rules.toml still hot-reloads on window focus change)"
+                    .to_string(),
+            ))
+        }
     }
 }
 
@@ -1318,7 +1403,11 @@ fn cmd_rules(args: &[String]) -> CliResult {
                 )));
             }
             let (store, initialized) = load_rule_store_readonly(&dir, Preset::Balanced)?;
-            let staged = collect_staged_entries(store.state());
+            let mut staged = collect_staged_entries(store.state());
+            staged.retain(|e| {
+                e.queue != "telex_passthrough"
+                    || !store.compiled().telex_passthrough.contains(&e.key)
+            });
             let rules_path = dir.join("rules.toml");
             if as_json {
                 let payload = StagedJson {
@@ -1516,19 +1605,30 @@ fn cmd_rules(args: &[String]) -> CliResult {
                             "usage: smartkey rules add passthrough <ascii_word>".to_string(),
                         ));
                     }
+                    let word_l = rest[0].trim().to_lowercase();
                     let changed = store
                         .add_user_telex_passthrough(rest[0])
                         .map_err(map_store_err)?;
                     if changed {
-                        format!(
-                            "Added Telex passthrough word: {:?}",
-                            rest[0].trim().to_lowercase()
-                        )
+                        let sim = smartkey_core::simulate_lotus_word_with_options(
+                            &word_l,
+                            store.lotus_options(),
+                        );
+                        if sim.is_valid_vietnamese
+                            && sim.is_composed_vietnamese
+                            && !smartkey_core::is_impossible_standalone_vi_syllable(
+                                &sim.committed_at_break.to_lowercase(),
+                            )
+                        {
+                            format!(
+                                "Added Telex passthrough word: {:?}\nNote: {:?} composes to Vietnamese {:?} in Telex and will stay ASCII unless undone or removed.",
+                                word_l, word_l, sim.committed_at_break
+                            )
+                        } else {
+                            format!("Added Telex passthrough word: {:?}", word_l)
+                        }
                     } else {
-                        format!(
-                            "Telex passthrough word already present: {:?}",
-                            rest[0].trim().to_lowercase()
-                        )
+                        format!("Telex passthrough word already present: {:?}", word_l)
                     }
                 }
                 other => {
@@ -1874,22 +1974,86 @@ impl LogFilter {
     }
 }
 
+#[cfg(windows)]
+const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
+
+#[cfg(windows)]
+fn epoch_ms_to_filetime(epoch_ms: u64) -> windows::Win32::Foundation::FILETIME {
+    let ticks = EPOCH_DIFF_100NS.saturating_add(epoch_ms.saturating_mul(10_000));
+    windows::Win32::Foundation::FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    }
+}
+
+#[cfg(windows)]
+fn filetime_to_epoch_ms(ft: windows::Win32::Foundation::FILETIME) -> Option<u64> {
+    let ticks = ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64);
+    ticks.checked_sub(EPOCH_DIFF_100NS).map(|t| t / 10_000)
+}
+
 fn local_midnight_epoch_ms(now_ms: u64, day_offset: i32) -> u64 {
-    let secs: libc::time_t = (now_ms / 1000) as libc::time_t;
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&secs, &mut tm);
-        tm.tm_hour = 0;
-        tm.tm_min = 0;
-        tm.tm_sec = 0;
-        tm.tm_mday = tm.tm_mday.saturating_add(day_offset);
-        tm.tm_isdst = -1;
-        let midnight = libc::mktime(&mut tm);
-        if midnight < 0 {
-            0
-        } else {
-            (midnight as u64) * 1000
+    #[cfg(unix)]
+    {
+        let secs: libc::time_t = (now_ms / 1000) as libc::time_t;
+        unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            libc::localtime_r(&secs, &mut tm);
+            tm.tm_hour = 0;
+            tm.tm_min = 0;
+            tm.tm_sec = 0;
+            tm.tm_mday = tm.tm_mday.saturating_add(day_offset);
+            tm.tm_isdst = -1;
+            let midnight = libc::mktime(&mut tm);
+            if midnight < 0 {
+                0
+            } else {
+                (midnight as u64) * 1000
+            }
         }
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::SYSTEMTIME;
+        use windows::Win32::System::Time::{
+            FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime,
+            TzSpecificLocalTimeToSystemTime,
+        };
+        let ft = epoch_ms_to_filetime(now_ms);
+        let mut utc_st = SYSTEMTIME::default();
+        let mut local_st = SYSTEMTIME::default();
+        unsafe {
+            if FileTimeToSystemTime(&ft, &mut utc_st).is_err()
+                || SystemTimeToTzSpecificLocalTime(None, &utc_st, &mut local_st).is_err()
+            {
+                return 0;
+            }
+        }
+        let days = smartkey_core::event_log::days_from_civil(
+            local_st.wYear as i32,
+            local_st.wMonth as u32,
+            local_st.wDay as u32,
+        ) + day_offset as i64;
+        let (y, m, d) = smartkey_core::event_log::civil_from_days(days);
+        if y < 1970 {
+            return 0;
+        }
+        let target_local = SYSTEMTIME {
+            wYear: y as u16,
+            wMonth: m as u16,
+            wDay: d as u16,
+            ..Default::default()
+        };
+        let mut utc_mid = SYSTEMTIME::default();
+        let mut out_ft = windows::Win32::Foundation::FILETIME::default();
+        unsafe {
+            if TzSpecificLocalTimeToSystemTime(None, &target_local, &mut utc_mid).is_err()
+                || SystemTimeToFileTime(&utc_mid, &mut out_ft).is_err()
+            {
+                return 0;
+            }
+        }
+        filetime_to_epoch_ms(out_ft).unwrap_or(0)
     }
 }
 
@@ -1907,20 +2071,48 @@ fn parse_local_date_midnight_ms(ymd: &str) -> Option<u64> {
     if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        tm.tm_year = year - 1900;
-        tm.tm_mon = month - 1;
-        tm.tm_mday = day;
-        tm.tm_hour = 0;
-        tm.tm_min = 0;
-        tm.tm_sec = 0;
-        tm.tm_isdst = -1;
-        let ts = libc::mktime(&mut tm);
-        if ts < 0 || tm.tm_year != year - 1900 || tm.tm_mon != month - 1 || tm.tm_mday != day {
+    #[cfg(unix)]
+    {
+        unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            tm.tm_year = year - 1900;
+            tm.tm_mon = month - 1;
+            tm.tm_mday = day;
+            tm.tm_hour = 0;
+            tm.tm_min = 0;
+            tm.tm_sec = 0;
+            tm.tm_isdst = -1;
+            let ts = libc::mktime(&mut tm);
+            if ts < 0 || tm.tm_year != year - 1900 || tm.tm_mon != month - 1 || tm.tm_mday != day
+            {
+                return None;
+            }
+            Some((ts as u64) * 1000)
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+        use windows::Win32::System::Time::{
+            SystemTimeToFileTime, TzSpecificLocalTimeToSystemTime,
+        };
+        let days = smartkey_core::event_log::days_from_civil(year, month as u32, day as u32);
+        if smartkey_core::event_log::civil_from_days(days) != (year, month as u32, day as u32) {
             return None;
         }
-        Some((ts as u64) * 1000)
+        let local_st = SYSTEMTIME {
+            wYear: year as u16,
+            wMonth: month as u16,
+            wDay: day as u16,
+            ..Default::default()
+        };
+        let mut utc_st = SYSTEMTIME::default();
+        let mut ft = FILETIME::default();
+        unsafe {
+            TzSpecificLocalTimeToSystemTime(None, &local_st, &mut utc_st).ok()?;
+            SystemTimeToFileTime(&utc_st, &mut ft).ok()?;
+        }
+        filetime_to_epoch_ms(ft)
     }
 }
 
@@ -1962,19 +2154,48 @@ fn parse_since_spec(raw: &str, now_ms: u64) -> Result<u64, CliError> {
 }
 
 fn format_local_timestamp(ts_ms: u64) -> String {
-    let secs: libc::time_t = (ts_ms / 1000) as libc::time_t;
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&secs, &mut tm);
-        format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
-        )
+    #[cfg(unix)]
+    {
+        let secs: libc::time_t = (ts_ms / 1000) as libc::time_t;
+        unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            libc::localtime_r(&secs, &mut tm);
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec
+            )
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::SYSTEMTIME;
+        use windows::Win32::System::Time::{
+            FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime,
+        };
+        let ft = epoch_ms_to_filetime(ts_ms);
+        let mut utc_st = SYSTEMTIME::default();
+        let mut local_st = SYSTEMTIME::default();
+        unsafe {
+            if FileTimeToSystemTime(&ft, &mut utc_st).is_ok()
+                && SystemTimeToTzSpecificLocalTime(None, &utc_st, &mut local_st).is_ok()
+            {
+                return format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    local_st.wYear,
+                    local_st.wMonth,
+                    local_st.wDay,
+                    local_st.wHour,
+                    local_st.wMinute,
+                    local_st.wSecond
+                );
+            }
+        }
+        format!("{ts_ms}ms")
     }
 }
 
@@ -3610,11 +3831,13 @@ fn cmd_dict(args: &[String]) -> CliResult {
     }
 }
 
+#[cfg(unix)]
 struct RawTermGuard {
     fd: i32,
     orig: libc::termios,
 }
 
+#[cfg(unix)]
 impl RawTermGuard {
     fn enter() -> io::Result<Self> {
         let fd = libc::STDIN_FILENO;
@@ -3635,11 +3858,30 @@ impl RawTermGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawTermGuard {
     fn drop(&mut self) {
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.orig);
         }
+    }
+}
+
+#[cfg(not(unix))]
+struct RawTermGuard;
+
+#[cfg(not(unix))]
+impl RawTermGuard {
+    fn enter() -> io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for RawTermGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
@@ -4250,6 +4492,199 @@ fn cmd_repl(args: &[String]) -> CliResult {
     Ok(())
 }
 
+fn cmd_install(args: &[String]) -> CliResult {
+    let mut dir = default_config_dir();
+    let mut dll_arg: Option<PathBuf> = None;
+    let mut user_only = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!(
+                    "USAGE:\n  smartkey install [--dll <path>] [--dir <config_dir>] [--user]\n\n\
+                     Initialize default rules.toml and register the Windows TSF text service DLL."
+                );
+                return Ok(());
+            }
+            "--dll" => {
+                i += 1;
+                let p = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--dll requires a path".to_string()))?;
+                dll_arg = Some(PathBuf::from(p));
+            }
+            "--dir" => {
+                i += 1;
+                let p = args
+                    .get(i)
+                    .ok_or_else(|| CliError::Usage("--dir requires a path".to_string()))?;
+                dir = PathBuf::from(p);
+            }
+            "--user" => {
+                user_only = true;
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag {other} (usage: smartkey install [--dll <path>] [--dir <config_dir>] [--user])"
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (&dir, &dll_arg, user_only);
+        Err(CliError::Runtime(
+            "`smartkey install` is for Windows TSF setup; on Linux run `./adapters/fcitx5-smartkey/scripts/install-local.sh`."
+                .to_string(),
+        ))
+    }
+
+    #[cfg(windows)]
+    {
+        let _store = load_rule_store_mut(&dir, Preset::Balanced)?;
+        let exe_path = env::current_exe().map_err(|e| CliError::Runtime(e.to_string()))?;
+        let src_dll = match dll_arg {
+            Some(p) => p,
+            None => exe_path
+                .parent()
+                .map(|p| p.join("smartkey_tsf.dll"))
+                .ok_or_else(|| CliError::Runtime("cannot resolve executable directory".into()))?,
+        };
+        if !src_dll.is_file() {
+            return Err(CliError::Runtime(format!(
+                "TSF DLL not found at {} (pass --dll <path>)",
+                src_dll.display()
+            )));
+        }
+
+        let user_install_dir = env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                smartkey_core::resolve_home_dir().map(|h| h.join("AppData").join("Local"))
+            })
+            .unwrap_or_else(env::temp_dir)
+            .join("Programs")
+            .join("SmartKey");
+        let machine_install_dir = env::var_os("ProgramFiles")
+            .filter(|v| !v.is_empty())
+            .map(|p| PathBuf::from(p).join("SmartKey"));
+
+        let mut use_hkcu = user_only;
+        let install_dir = if !user_only {
+            if let Some(ref sys_dir) = machine_install_dir {
+                if fs::create_dir_all(sys_dir).is_ok() {
+                    let test_dll = sys_dir.join("smartkey_tsf.dll");
+                    if fs::copy(&src_dll, &test_dll).is_ok() {
+                        sys_dir.clone()
+                    } else {
+                        use_hkcu = true;
+                        fs::create_dir_all(&user_install_dir)
+                            .map_err(|e| CliError::Runtime(e.to_string()))?;
+                        user_install_dir
+                    }
+                } else {
+                    use_hkcu = true;
+                    fs::create_dir_all(&user_install_dir)
+                        .map_err(|e| CliError::Runtime(e.to_string()))?;
+                    user_install_dir
+                }
+            } else {
+                use_hkcu = true;
+                fs::create_dir_all(&user_install_dir)
+                    .map_err(|e| CliError::Runtime(e.to_string()))?;
+                user_install_dir
+            }
+        } else {
+            fs::create_dir_all(&user_install_dir)
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            user_install_dir
+        };
+
+        let installed_dll = install_dir.join("smartkey_tsf.dll");
+        if src_dll != installed_dll {
+            fs::copy(&src_dll, &installed_dll)
+                .map_err(|e| CliError::Runtime(format!("failed copying TSF DLL: {e}")))?;
+        }
+        let installed_cli = install_dir.join("smartkey.exe");
+        if exe_path != installed_cli {
+            let _ = fs::copy(&exe_path, &installed_cli);
+        }
+
+        // Grant AppContainer / WinUI apps read+execute access to the installed DLL folder.
+        let _ = Command::new("icacls")
+            .arg(&install_dir)
+            .args(["/grant", "*S-1-15-2-1:(OI)(CI)(RX)", "/Q"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        if let Err(err) = smartkey_tsf::register::register_server(&installed_dll, use_hkcu) {
+            if !user_only && !use_hkcu {
+                smartkey_tsf::register::register_server(&installed_dll, true)
+                    .map_err(CliError::Runtime)?;
+                use_hkcu = true;
+            } else {
+                return Err(CliError::Runtime(err));
+            }
+        }
+
+        println!(
+            "Installed SmartKey ({} registration):",
+            if use_hkcu { "per-user HKCU" } else { "machine HKLM" }
+        );
+        println!("  TSF DLL : {}", installed_dll.display());
+        println!("  Config  : {}", dir.join("rules.toml").display());
+        println!("  Tip     : Switch input method with Win+Space and choose 'SmartKey Autocorrect'.");
+        Ok(())
+    }
+}
+
+fn cmd_uninstall(args: &[String]) -> CliResult {
+    let mut user_only = false;
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                println!(
+                    "USAGE:\n  smartkey uninstall [--user]\n\n\
+                     Unregister the Windows TSF text service profile and COM CLSID."
+                );
+                return Ok(());
+            }
+            "--user" => {
+                user_only = true;
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "unknown argument {other} (usage: smartkey uninstall [--user])"
+                )));
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = user_only;
+        Err(CliError::Runtime(
+            "`smartkey uninstall` is for Windows TSF cleanup; on Linux remove `~/.local/lib/fcitx5/libsmartkey.so` and `~/.local/share/fcitx5/addon/smartkey.conf`."
+                .to_string(),
+        ))
+    }
+
+    #[cfg(windows)]
+    {
+        smartkey_tsf::register::unregister_server(user_only).map_err(CliError::Runtime)?;
+        println!(
+            "Unregistered SmartKey Windows TSF service. User config and learned rules remain at {}",
+            default_config_dir().display()
+        );
+        Ok(())
+    }
+}
+
 fn print_help() {
     println!(
         "\
@@ -4260,14 +4695,16 @@ USAGE:
 
 COMMANDS:
   status [--json] [--dir <path>]                         Show daemon, addon, IM-env & personal brain status
-  enable|on [--dir <path>]                               Enable SmartKey and reload Fcitx5
-  disable|off [--dir <path>]                             Disable SmartKey and reload Fcitx5
-  toggle [--dir <path>]                                  Toggle SmartKey on/off (ideal for WM keybinds)
-  reload                                                 Reload configuration & dictionary packs in Fcitx5
+  enable|on [--dir <path>]                               Enable SmartKey and reload active settings
+  disable|off [--dir <path>]                             Disable SmartKey and reload active settings
+  toggle [--dir <path>]                                  Toggle SmartKey on/off
+  reload                                                 Reload or validate configuration & dictionary packs
+  install [--dll <path>] [--dir <path>] [--user]         Install & register Windows TSF IME (Windows)
+  uninstall [--user]                                     Unregister Windows TSF IME (Windows)
   log [fixed|manual|unfixed] [--today|--yesterday|--since <spec>] [--grep <p>] [--json] [-n <N>] [--clear]
                                                          Query diagnostic counters & durable JSONL event logs
   trace [show|on|off|status|clear] [--app <a>] [--since <spec>] [--grep <p>] [--json] [-n <N>]
-                                                         Control or inspect the low-overhead Fcitx5 flight-recorder trace log
+                                                         Control or inspect the low-overhead flight-recorder trace log
   rules [list|staged|prune|add|remove] ... [--json] [--dir <path>]
                                                          Inspect confidence, staged queues, prune stale rules, or edit rules
   config [list|get <key>|set <key> <val>] [--json]       Inspect or update settings & diagnostics in rules.toml
@@ -4280,12 +4717,12 @@ COMMANDS:
   dict|dicts [list [-v] [--json]|dir|install <lang> <src>|remove <lang>|update [lang]]
                                                          Inspect and manage modular language dictionary packs
   tui|ui [--dir <path>] [--log-dir <path>]               Interactive terminal manager for rules, settings, apps, and logs
-  init [--preset <name>] [--dir <path>] [--force]        Initialize ~/.config/smartkey/rules.toml
+  init [--preset <name>] [--dir <path>] [--force]        Initialize rules.toml from a starter preset
   repl [--lang en|vi] [--dir <path>] [--in-memory]       Interactive terminal typing & learning sandbox
 
 PATHS:
-  Config & brain : ~/.config/smartkey/rules.toml
-  Event logs     : ~/.local/state/smartkey/logs/events-YYYY-MM-DD.jsonl
+  Config & brain : ~/.config/smartkey/rules.toml (Windows: %APPDATA%\\smartkey\\rules.toml)
+  Event logs     : ~/.local/state/smartkey/logs/events-YYYY-MM-DD.jsonl (Windows: %LOCALAPPDATA%\\smartkey\\logs)
   Trace logs     : ~/.local/state/smartkey/logs/trace-YYYY-MM-DD.jsonl
   Pass `<COMMAND> --help` for per-command options. Exit codes: 0 ok, 1 runtime error, 2 usage error.",
         env!("CARGO_PKG_VERSION")
@@ -4299,6 +4736,8 @@ fn run_cli(args: &[String]) -> CliResult {
         Some("disable" | "off") => cmd_set_enabled(&args[1..], Some(false)),
         Some("toggle") => cmd_set_enabled(&args[1..], None),
         Some("reload") => cmd_reload(&args[1..]),
+        Some("install") => cmd_install(&args[1..]),
+        Some("uninstall") => cmd_uninstall(&args[1..]),
         Some("init") => cmd_init(&args[1..]),
         Some("rules") => cmd_rules(&args[1..]),
         Some("config" | "cfg") => cmd_config(&args[1..]),
@@ -4391,8 +4830,8 @@ mod tests {
 
         // Per-command `--help` exits Ok(())
         for sub in [
-            "status", "enable", "reload", "init", "rules", "config", "log", "trace", "explain",
-            "app", "plugin", "dict", "repl",
+            "status", "enable", "reload", "install", "uninstall", "init", "rules", "config", "log",
+            "trace", "explain", "app", "plugin", "dict", "repl",
         ] {
             assert_eq!(run_cli(&vec_args(&[sub, "--help"])), Ok(()));
         }

@@ -133,6 +133,7 @@ SCREENS:
 
 KEYS:
   1-4 / Tab      Switch screen
+  m              Toggle Activity list ↔ 2×2 split view
   gg / G / C-d u Vim navigation; v visual range select (Review / Dictionary)
   < > + - = z    Resize panes, adjust Inspect split, reset layout, or zoom
   u / Ctrl+r     Undo / Redo change
@@ -144,8 +145,8 @@ KEYS:
 #[cfg(test)]
 mod tests {
     use super::types::{
-        ActivityFilter, DictSection, Modal, ReviewTab, Screen, SettingsRow, SIDEBAR_WIDTH_DEFAULT,
-        SPLIT_PCT_DEFAULT,
+        ActivityFilter, ActivityLayout, ActivityPane, DictSection, Modal, ReviewTab, Screen,
+        SettingsRow, SIDEBAR_WIDTH_DEFAULT, SPLIT_PCT_DEFAULT,
     };
     use super::*;
     use std::fs;
@@ -159,8 +160,8 @@ mod tests {
     use ratatui::Terminal;
     use smartkey_core::event_log::{current_epoch_ms, DiagnosticsConfig};
     use smartkey_core::{
-        ConfidenceTier, DiagnosticEvent, EventLog, LangId, MatchKind, Preset, RuleOrigin, RuleStat,
-        RuleStore,
+        AppProfile, ConfidenceTier, DiagnosticEvent, EventLog, LangId, MatchKind, Preset,
+        RuleOrigin, RuleStat, RuleStore,
     };
 
     use crate::load_rule_store_mut;
@@ -205,11 +206,15 @@ mod tests {
         Dirs { base, cfg, logs }
     }
 
-    fn log_event(logs: &Path, app: &str, ev: DiagnosticEvent) {
+    fn log_event_lang(logs: &Path, app: &str, lang: &str, ev: DiagnosticEvent) {
         let mut w = EventLog::new();
         w.set_dir(Some(logs.to_path_buf()));
         w.set_app(Some(app));
-        w.record(&DiagnosticsConfig::default(), "en", &ev);
+        w.record(&DiagnosticsConfig::default(), lang, &ev);
+    }
+
+    fn log_event(logs: &Path, app: &str, ev: DiagnosticEvent) {
+        log_event_lang(logs, app, "en", ev);
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -855,6 +860,209 @@ mod tests {
             fs::read_to_string(d.cfg.join("rules.toml")).unwrap(),
             corrupt
         );
+    }
+
+    #[test]
+    fn warnings_render_at_bottom_not_top() {
+        let d = dirs("bottom_warn");
+        let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
+        app.env_warnings = vec!["XMODIFIERS test warn".into()];
+
+        let act = screen_text(&app, 110, 32);
+        let act_lines: Vec<&str> = act.lines().collect();
+        assert!(
+            act_lines[0].starts_with('╭'),
+            "top row should be flat box border:\n{act}"
+        );
+        assert!(
+            act_lines[act_lines.len() - 2].contains("XMODIFIERS test warn"),
+            "env warning should render on bottom idle row:\n{act}"
+        );
+
+        press(&mut app, '2');
+        let rev = screen_text(&app, 110, 32);
+        let rev_lines: Vec<&str> = rev.lines().collect();
+        assert_eq!(
+            rev_lines[0].chars().next(),
+            Some('╭'),
+            "Review top border should match Activity"
+        );
+        assert!(
+            rev_lines[rev_lines.len() - 2].contains("XMODIFIERS test warn"),
+            "env warning should stay visible on Review:\n{rev}"
+        );
+
+        app.set_status("Transient status toast");
+        let toasted = screen_text(&app, 110, 32);
+        assert!(toasted.contains("Transient status toast"), "{toasted}");
+
+        let d_bad = dirs("bottom_crit");
+        fs::write(d_bad.cfg.join("rules.toml"), "enabled = [broken toml\n").unwrap();
+        let bad_app = App::new(d_bad.cfg.clone(), d_bad.logs.clone(), test_reload);
+        let bad_screen = screen_text(&bad_app, 110, 32);
+        let bad_lines: Vec<&str> = bad_screen.lines().collect();
+        assert!(
+            bad_lines[0].starts_with('╭'),
+            "critical banner must sit at bottom, not top:\n{bad_screen}"
+        );
+        assert!(
+            bad_lines[bad_lines.len() - 3..]
+                .join("\n")
+                .contains("changes are blocked"),
+            "critical banner missing near bottom:\n{bad_screen}"
+        );
+    }
+
+    #[test]
+    fn activity_hides_app_bypass_by_default_and_exposes_apps_filter() {
+        let d = dirs("app_bypass_filter");
+        log_event(
+            &d.logs,
+            "antigravity",
+            DiagnosticEvent::AutocorrectApplied {
+                typed: "teh".into(),
+                applied: "the".into(),
+                kind: MatchKind::KnownTypoDict,
+                total_count: 1,
+            },
+        );
+        log_event(
+            &d.logs,
+            "com.mitchellh.ghostty",
+            DiagnosticEvent::AppBypass {
+                app: "com.mitchellh.ghostty".into(),
+                profile: AppProfile::Bypass,
+                reason: "capability:terminal".into(),
+            },
+        );
+        let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
+        assert_eq!(app.activity_filter, ActivityFilter::All);
+        assert_eq!(app.activity_view.len(), 1);
+        assert!(app
+            .selected_activity()
+            .unwrap()
+            .change
+            .contains("teh → the"));
+
+        let default_screen = screen_text(&app, 110, 32);
+        assert!(
+            !default_screen.contains("SmartKey off here"),
+            "default view should hide AppBypass rows:\n{default_screen}"
+        );
+
+        // Cycle: Fixes -> ByHand -> Missed -> Apps
+        for _ in 0..4 {
+            press(&mut app, 'f');
+        }
+        assert_eq!(app.activity_filter, ActivityFilter::Apps);
+        assert_eq!(app.activity_view.len(), 1);
+        assert_eq!(
+            app.selected_activity().unwrap().change,
+            "com.mitchellh.ghostty"
+        );
+    }
+
+    #[test]
+    fn activity_split_mode_buckets_navigates_actions_and_zooms() {
+        let d = dirs("activity_split");
+        log_event(
+            &d.logs,
+            "antigravity",
+            DiagnosticEvent::AutocorrectApplied {
+                typed: "teh".into(),
+                applied: "the".into(),
+                kind: MatchKind::KnownTypoDict,
+                total_count: 1,
+            },
+        );
+        log_event_lang(
+            &d.logs,
+            "antigravity",
+            "vi",
+            DiagnosticEvent::AutocorrectApplied {
+                typed: "hocj".into(),
+                applied: "học".into(),
+                kind: MatchKind::VietnameseTelexRescue,
+                total_count: 1,
+            },
+        );
+        log_event(
+            &d.logs,
+            "antigravity",
+            DiagnosticEvent::ManualBackspaceFix {
+                orig: "wrng".into(),
+                fixed: "wrong".into(),
+                outcome: "staged".into(),
+                attempt_count: 1,
+            },
+        );
+        log_event(
+            &d.logs,
+            "antigravity",
+            DiagnosticEvent::RuleLearned {
+                rule: "en:teh->the".into(),
+                stage: "graduated_2x".into(),
+                previous: None,
+            },
+        );
+        log_event(
+            &d.logs,
+            "com.mitchellh.ghostty",
+            DiagnosticEvent::AppBypass {
+                app: "com.mitchellh.ghostty".into(),
+                profile: AppProfile::Bypass,
+                reason: "capability:terminal".into(),
+            },
+        );
+
+        let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
+        press(&mut app, 'm');
+        assert_eq!(app.activity_layout, ActivityLayout::Split);
+        assert_eq!(app.split_views.each_ref().map(|v| v.len()), [1, 1, 1, 1]);
+
+        let grid = screen_text(&app, 110, 32);
+        for title in [
+            "Auto-fixes (1)",
+            "Telex / VI (1)",
+            "Edits & undos (1)",
+            "Learning & missed (1)",
+        ] {
+            assert!(grid.contains(title), "missing {title}:\n{grid}");
+        }
+
+        // Navigate quadrants with l (Telex), J (Learning), ] (wrap to AutoFixes)
+        press(&mut app, 'l');
+        assert_eq!(app.activity_pane, ActivityPane::Telex);
+        assert_eq!(app.selected_activity().unwrap().change, "hocj → học");
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(app.modal, Some(Modal::Actions { ref title, .. }) if title == "hocj → học")
+        );
+        app.handle_key(key(KeyCode::Esc));
+
+        press(&mut app, 'J');
+        assert_eq!(app.activity_pane, ActivityPane::Learning);
+
+        // Zoom focused quadrant cleanly and test narrow single-pane fallback
+        press(&mut app, 'z');
+        let zoomed = screen_text(&app, 110, 32);
+        assert!(zoomed.contains("[zoom]"), "{zoomed}");
+        press(&mut app, 'z');
+
+        let narrow = screen_text(&app, 62, 18);
+        assert!(narrow.contains("4/4"), "{narrow}");
+
+        // Mouse click inside top-left box switches back to AutoFixes
+        let _ = screen_text(&app, 110, 32);
+        let r = app.rects.get();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: r.split_boxes[0].x + 2,
+            row: r.split_boxes[0].y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.activity_pane, ActivityPane::AutoFixes);
     }
 
     #[test]

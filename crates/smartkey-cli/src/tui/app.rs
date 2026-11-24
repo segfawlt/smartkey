@@ -23,13 +23,13 @@ use super::ops::{
 };
 use super::theme::{clamp, cli_error_text, language_name, near_x, near_y, point_in, step};
 use super::types::{
-    range_indices, ActivityFilter, ActivityRow, ChangeEntry, ChangeKind, DictRow, DictSection,
-    DragTarget, Form, LayoutRects, LayoutState, Modal, ReviewItem, ReviewSection, ReviewTab,
-    RowAction, RuleEntry, RuleKind, Screen, SettingsRow, StoreOp, Toast, ACTIVITY_MAX_ROWS,
-    ACTIVITY_WINDOW_MS, APP_CHOICES, CORRECTION_SPECS, DETAIL_MIN_WIDTH, DIAGNOSTIC_SPECS,
-    INSPECT_PCT_MAX, INSPECT_PCT_MIN, MAX_ALMOST, MAX_HISTORY, MAX_SEEN_APPS, SIDEBAR_MIN_TOTAL,
-    SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN, SPLIT_PCT_MAX, SPLIT_PCT_MIN, UNDO_SPECS, UNLISTED_SPEC,
-    VIETNAMESE_SPECS,
+    range_indices, ActivityFilter, ActivityLayout, ActivityPane, ActivityRow, ChangeEntry,
+    ChangeKind, DictRow, DictSection, DragTarget, Form, LayoutRects, LayoutState, Modal,
+    ReviewItem, ReviewSection, ReviewTab, RowAction, RuleEntry, RuleKind, Screen, SettingsRow,
+    StoreOp, Toast, ACTIVITY_MAX_ROWS, ACTIVITY_WINDOW_MS, APP_CHOICES, CORRECTION_SPECS,
+    DETAIL_MIN_WIDTH, DIAGNOSTIC_SPECS, GRID_PCT_MAX, GRID_PCT_MIN, INSPECT_PCT_MAX,
+    INSPECT_PCT_MIN, MAX_ALMOST, MAX_HISTORY, MAX_SEEN_APPS, SIDEBAR_MIN_TOTAL, SIDEBAR_WIDTH_MAX,
+    SIDEBAR_WIDTH_MIN, SPLIT_PCT_MAX, SPLIT_PCT_MIN, UNDO_SPECS, UNLISTED_SPEC, VIETNAMESE_SPECS,
 };
 
 pub(crate) struct App {
@@ -71,6 +71,10 @@ pub(crate) struct App {
     pub(super) activity_idx: usize,
     pub(super) activity_filter: ActivityFilter,
     pub(super) activity_search: String,
+    pub(super) activity_layout: ActivityLayout,
+    pub(super) activity_pane: ActivityPane,
+    pub(super) split_views: [Vec<usize>; 4],
+    pub(super) split_idx: [usize; 4],
     pub(super) day_fixes: usize,
     pub(super) day_undone: usize,
     pub(super) day_by_hand: usize,
@@ -133,6 +137,10 @@ impl App {
             activity_idx: 0,
             activity_filter: ActivityFilter::All,
             activity_search: String::new(),
+            activity_layout: ActivityLayout::List,
+            activity_pane: ActivityPane::AutoFixes,
+            split_views: Default::default(),
+            split_idx: [0; 4],
             day_fixes: 0,
             day_undone: 0,
             day_by_hand: 0,
@@ -274,24 +282,38 @@ impl App {
 
     pub(super) fn rebuild_activity_view(&mut self) {
         let needle = self.activity_search.trim().to_lowercase();
+        let matches_search = |r: &ActivityRow| {
+            needle.is_empty()
+                || r.change.to_lowercase().contains(&needle)
+                || r.why.to_lowercase().contains(&needle)
+                || r.app
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&needle)
+        };
         self.activity_view = self
             .activity
             .iter()
             .enumerate()
             .filter(|(_, r)| self.activity_filter.matches(&r.event))
-            .filter(|(_, r)| {
-                needle.is_empty()
-                    || r.change.to_lowercase().contains(&needle)
-                    || r.why.to_lowercase().contains(&needle)
-                    || r.app
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&needle)
-            })
+            .filter(|(_, r)| matches_search(r))
             .map(|(i, _)| i)
             .collect();
         clamp(&mut self.activity_idx, self.activity_view.len());
+
+        self.split_views = Default::default();
+        for (i, r) in self.activity.iter().enumerate() {
+            if !matches_search(r) {
+                continue;
+            }
+            if let Some(pane) = ActivityPane::classify(r) {
+                self.split_views[pane.index()].push(i);
+            }
+        }
+        for p in 0..4 {
+            clamp(&mut self.split_idx[p], self.split_views[p].len());
+        }
     }
 
     fn build_review(
@@ -919,19 +941,11 @@ impl App {
                 return false;
             }
             KeyCode::Char('+') => {
-                self.layout.review_inspect_pct = self
-                    .layout
-                    .review_inspect_pct
-                    .saturating_add(5)
-                    .clamp(INSPECT_PCT_MIN, INSPECT_PCT_MAX);
+                self.adjust_vertical(5);
                 return false;
             }
             KeyCode::Char('-') => {
-                self.layout.review_inspect_pct = self
-                    .layout
-                    .review_inspect_pct
-                    .saturating_sub(5)
-                    .clamp(INSPECT_PCT_MIN, INSPECT_PCT_MAX);
+                self.adjust_vertical(-5);
                 return false;
             }
             KeyCode::Char('=') => {
@@ -995,10 +1009,29 @@ impl App {
             let next = (self.layout.sidebar_width as i16 + dir * 2)
                 .clamp(SIDEBAR_WIDTH_MIN as i16, SIDEBAR_WIDTH_MAX as i16);
             self.layout.sidebar_width = next as u16;
+        } else if self.screen == Screen::Activity && self.activity_layout == ActivityLayout::Split {
+            let next = (self.layout.activity_grid_h_pct as i16 + dir * 4)
+                .clamp(GRID_PCT_MIN as i16, GRID_PCT_MAX as i16);
+            self.layout.activity_grid_h_pct = next as u16;
         } else {
             let next = (self.layout.split_pct as i16 + dir * 4)
                 .clamp(SPLIT_PCT_MIN as i16, SPLIT_PCT_MAX as i16);
             self.layout.split_pct = next as u16;
+        }
+    }
+
+    fn adjust_vertical(&mut self, delta: i16) {
+        if !self.focus_sidebar
+            && self.screen == Screen::Activity
+            && self.activity_layout == ActivityLayout::Split
+        {
+            let next = (self.layout.activity_grid_v_pct as i16 + delta)
+                .clamp(GRID_PCT_MIN as i16, GRID_PCT_MAX as i16);
+            self.layout.activity_grid_v_pct = next as u16;
+        } else {
+            let next = (self.layout.review_inspect_pct as i16 + delta)
+                .clamp(INSPECT_PCT_MIN as i16, INSPECT_PCT_MAX as i16);
+            self.layout.review_inspect_pct = next as u16;
         }
     }
 
@@ -1009,6 +1042,10 @@ impl App {
             return;
         }
         match self.screen {
+            Screen::Activity if self.activity_layout == ActivityLayout::Split => {
+                let p = self.activity_pane.index();
+                step(&mut self.split_idx[p], delta, self.split_views[p].len());
+            }
             Screen::Activity => step(&mut self.activity_idx, delta, self.activity_view.len()),
             Screen::Review => match self.review_tab {
                 ReviewTab::Queue => step(&mut self.review_idx, delta, self.review.len()),
@@ -1029,6 +1066,14 @@ impl App {
             return;
         }
         match self.screen {
+            Screen::Activity if self.activity_layout == ActivityLayout::Split => {
+                let p = self.activity_pane.index();
+                self.split_idx[p] = if bottom {
+                    self.split_views[p].len().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
             Screen::Activity => {
                 self.activity_idx = if bottom {
                     self.activity_view.len().saturating_sub(1)
@@ -1120,13 +1165,41 @@ impl App {
     }
 
     pub(super) fn selected_activity(&self) -> Option<&ActivityRow> {
-        self.activity_view
-            .get(self.activity_idx)
-            .and_then(|&i| self.activity.get(i))
+        let idx = if self.activity_layout == ActivityLayout::Split {
+            let p = self.activity_pane.index();
+            self.split_views[p].get(self.split_idx[p]).copied()
+        } else {
+            self.activity_view.get(self.activity_idx).copied()
+        };
+        idx.and_then(|i| self.activity.get(i))
     }
 
     fn handle_activity_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Char('m') => {
+                self.activity_layout = match self.activity_layout {
+                    ActivityLayout::List => ActivityLayout::Split,
+                    ActivityLayout::Split => ActivityLayout::List,
+                };
+                self.set_status(match self.activity_layout {
+                    ActivityLayout::Split => "Activity: 2×2 split (h/l J/K panes, m list)",
+                    ActivityLayout::List => "Activity: list view",
+                });
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l')
+                if self.activity_layout == ActivityLayout::Split =>
+            {
+                self.activity_pane = self.activity_pane.toggle_lr();
+            }
+            KeyCode::Char('J' | 'K') if self.activity_layout == ActivityLayout::Split => {
+                self.activity_pane = self.activity_pane.toggle_ud();
+            }
+            KeyCode::Char('[' | '{') if self.activity_layout == ActivityLayout::Split => {
+                self.activity_pane = ActivityPane::from_index(self.activity_pane.index() + 3);
+            }
+            KeyCode::Char(']' | '}') if self.activity_layout == ActivityLayout::Split => {
+                self.activity_pane = ActivityPane::from_index(self.activity_pane.index() + 1);
+            }
             KeyCode::Char(c @ ('b' | 'a' | 'w' | 'p' | 'v')) => {
                 let action = self
                     .selected_activity()
@@ -1136,24 +1209,24 @@ impl App {
                     self.run_action(action);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                step(&mut self.activity_idx, 1, self.activity_view.len())
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                step(&mut self.activity_idx, -1, self.activity_view.len())
-            }
+            KeyCode::Down | KeyCode::Char('j') => self.move_active(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_active(-1),
             KeyCode::Char('G') => self.jump_edge(true),
-            KeyCode::PageDown => step(&mut self.activity_idx, 10, self.activity_view.len()),
-            KeyCode::PageUp => step(&mut self.activity_idx, -10, self.activity_view.len()),
+            KeyCode::PageDown => self.move_active(10),
+            KeyCode::PageUp => self.move_active(-10),
             KeyCode::Char('/') => self.filter_editing = true,
             KeyCode::Esc if !self.activity_search.is_empty() => {
                 self.activity_search.clear();
                 self.rebuild_activity_view();
             }
             KeyCode::Char('f') => {
-                self.activity_filter = self.activity_filter.next();
-                self.rebuild_activity_view();
-                self.set_status(format!("Showing {}", self.activity_filter.label()));
+                if self.activity_layout == ActivityLayout::Split {
+                    self.set_status("Filters apply in list view (press m)");
+                } else {
+                    self.activity_filter = self.activity_filter.next();
+                    self.rebuild_activity_view();
+                    self.set_status(format!("Showing {}", self.activity_filter.label()));
+                }
             }
             KeyCode::Char('e') => {
                 let next = !self.enabled;
@@ -1756,6 +1829,27 @@ impl App {
                     self.dragging = Some(DragTarget::ReviewVertical);
                     return;
                 }
+                if self.screen == Screen::Activity && self.activity_layout == ActivityLayout::Split
+                {
+                    if r.split_boxes[0].width > 0
+                        && r.split_boxes[1].width > 0
+                        && near_x(ev.column, r.split_boxes[0].right().saturating_sub(1))
+                        && ev.row >= r.main.y
+                        && ev.row < r.main.bottom()
+                    {
+                        self.dragging = Some(DragTarget::ActivityGridH);
+                        return;
+                    }
+                    if r.split_boxes[0].height > 0
+                        && r.split_boxes[2].height > 0
+                        && near_y(ev.row, r.split_boxes[0].bottom().saturating_sub(1))
+                        && ev.column >= r.main.x
+                        && ev.column < r.main.right()
+                    {
+                        self.dragging = Some(DragTarget::ActivityGridV);
+                        return;
+                    }
+                }
                 if point_in(ev.column, ev.row, r.nav_inner) {
                     let row = (ev.row - r.nav_inner.y) as usize;
                     if row < Screen::ALL.len() {
@@ -1794,6 +1888,26 @@ impl App {
                     self.focus_sidebar = false;
                     self.rebuild_dict_view();
                     return;
+                }
+                if self.screen == Screen::Activity && self.activity_layout == ActivityLayout::Split
+                {
+                    for p in 0..4 {
+                        if point_in(ev.column, ev.row, r.split_boxes[p]) {
+                            self.focus_sidebar = false;
+                            self.activity_pane = ActivityPane::from_index(p);
+                            if point_in(ev.column, ev.row, r.split_inners[p]) {
+                                let rel_y = (ev.row - r.split_inners[p].y) as usize;
+                                let row_offset = usize::from(r.split_has_header[p]);
+                                if rel_y >= row_offset {
+                                    let target = r.split_offsets[p] + (rel_y - row_offset);
+                                    if target < self.split_views[p].len() {
+                                        self.split_idx[p] = target;
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                    }
                 }
                 if point_in(ev.column, ev.row, r.list_inner) {
                     self.focus_sidebar = false;
@@ -1856,6 +1970,16 @@ impl App {
                     let pct = ((u32::from(rel) * 100) / u32::from(r.main.height.max(1))) as u16;
                     self.layout.review_inspect_pct = pct.clamp(INSPECT_PCT_MIN, INSPECT_PCT_MAX);
                 }
+                Some(DragTarget::ActivityGridH) if r.main.width > 0 => {
+                    let rel = ev.column.saturating_sub(r.main.x).saturating_add(1);
+                    let pct = ((u32::from(rel) * 100) / u32::from(r.main.width.max(1))) as u16;
+                    self.layout.activity_grid_h_pct = pct.clamp(GRID_PCT_MIN, GRID_PCT_MAX);
+                }
+                Some(DragTarget::ActivityGridV) if r.main.height > 0 => {
+                    let rel = ev.row.saturating_sub(r.main.y).saturating_add(1);
+                    let pct = ((u32::from(rel) * 100) / u32::from(r.main.height.max(1))) as u16;
+                    self.layout.activity_grid_v_pct = pct.clamp(GRID_PCT_MIN, GRID_PCT_MAX);
+                }
                 _ => {}
             },
             MouseEventKind::Up(MouseButton::Left) => {
@@ -1865,6 +1989,17 @@ impl App {
                 if point_in(ev.column, ev.row, r.nav_inner) {
                     self.switch_screen(Screen::from_index(self.screen.index() + 3));
                 } else {
+                    if self.screen == Screen::Activity
+                        && self.activity_layout == ActivityLayout::Split
+                    {
+                        for p in 0..4 {
+                            if point_in(ev.column, ev.row, r.split_boxes[p]) {
+                                self.focus_sidebar = false;
+                                self.activity_pane = ActivityPane::from_index(p);
+                                break;
+                            }
+                        }
+                    }
                     self.move_active(-3);
                 }
             }
@@ -1872,6 +2007,17 @@ impl App {
                 if point_in(ev.column, ev.row, r.nav_inner) {
                     self.switch_screen(Screen::from_index(self.screen.index() + 1));
                 } else {
+                    if self.screen == Screen::Activity
+                        && self.activity_layout == ActivityLayout::Split
+                    {
+                        for p in 0..4 {
+                            if point_in(ev.column, ev.row, r.split_boxes[p]) {
+                                self.focus_sidebar = false;
+                                self.activity_pane = ActivityPane::from_index(p);
+                                break;
+                            }
+                        }
+                    }
                     self.move_active(3);
                 }
             }
@@ -1900,14 +2046,11 @@ impl App {
         if compact {
             cons.push(Constraint::Length(1));
         }
+        cons.push(Constraint::Min(3));
         if !banners.is_empty() {
             cons.push(Constraint::Length(banners.len() as u16));
         }
-        cons.extend([
-            Constraint::Min(3),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ]);
+        cons.extend([Constraint::Length(1), Constraint::Length(1)]);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(cons)
@@ -1919,11 +2062,8 @@ impl App {
             self.render_header(frame, chunks[0]);
             i = 1;
         }
-        if !banners.is_empty() {
-            frame.render_widget(Paragraph::new(banners), chunks[i]);
-            i += 1;
-        }
         let body = chunks[i];
+        i += 1;
         rects.body = body;
         let main = if compact {
             body
@@ -1948,8 +2088,12 @@ impl App {
             Screen::Dictionary => self.render_dictionary(frame, main, &mut rects),
             Screen::Settings => self.render_settings(frame, main, &mut rects),
         }
-        self.render_toast(frame, chunks[i + 1]);
-        self.render_hints(frame, chunks[i + 2]);
+        if !banners.is_empty() {
+            frame.render_widget(Paragraph::new(banners), chunks[i]);
+            i += 1;
+        }
+        self.render_toast(frame, chunks[i]);
+        self.render_hints(frame, chunks[i + 1]);
         self.rects.set(rects);
 
         if let Some(modal) = &self.modal {

@@ -410,14 +410,17 @@ impl LearnerState {
 }
 
 /// Normalizes an application / compositor program ID (`app_id`, `WM_CLASS`, or executable path)
-/// by stripping any leading path prefix, trimming whitespace, and ASCII-lowercasing.
+/// by stripping any leading Unix/Windows path prefix, trimming whitespace, ASCII-lowercasing,
+/// and stripping a trailing `.exe` suffix.
 pub fn normalize_program_id(raw: &str) -> String {
     let trimmed = raw.trim();
-    let base = trimmed
-        .rsplit_once('/')
-        .map(|(_, tail)| tail)
-        .unwrap_or(trimmed);
-    base.to_ascii_lowercase()
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let lower = base.to_ascii_lowercase();
+    if lower.len() > 4 && lower.ends_with(".exe") {
+        lower[..lower.len() - 4].to_string()
+    } else {
+        lower
+    }
 }
 
 fn matches_exact_or_app_segment(prog: &str, names: &[&str]) -> bool {
@@ -526,6 +529,24 @@ pub fn classify_builtin_program(raw_program: &str) -> (AppProfile, &'static str)
         "lite-xl",
         "kakoune",
         "micro",
+        "cmd",
+        "conhost",
+        "openconsole",
+        "powershell",
+        "pwsh",
+        "wt",
+        "windowsterminal",
+        "mintty",
+        "devenv",
+        "notepad++",
+        "unikey",
+        "unikeynt",
+        "evkey",
+        "evkey64",
+        "evkey32",
+        "openkey",
+        "openkey64",
+        "openkey32",
     ];
     const BYPASS_SUBSTR: &[&str] = &["terminal", "jetbrains-", "jetbrains.", "androidstudio"];
 
@@ -588,6 +609,9 @@ pub fn classify_builtin_program(raw_program: &str) -> (AppProfile, &'static str)
         "riot",
         "fractal",
         "caprine",
+        "teams",
+        "ms-teams",
+        "zalo",
     ];
     const CHAT_SUBSTR: &[&str] = &["discord", "telegram", "slack", "signal"];
 
@@ -2778,17 +2802,27 @@ impl RuleStore {
     pub fn add_telex_passthrough_with_origin(&mut self, raw_ascii_lower: &str, origin: RuleOrigin) {
         self.with_file_lock(|this| {
             this.sync_external_edits_before_write();
+            this.sync_external_state_before_write();
+            let cleared_staged = this
+                .state
+                .staged_telex_passthrough
+                .remove(raw_ascii_lower)
+                .is_some();
             let is_new = this
                 .compiled
                 .telex_passthrough
                 .insert(raw_ascii_lower.to_string());
             if !is_new {
+                let mut state_changed = cleared_staged;
                 if origin == RuleOrigin::Manual {
                     this.upsert_rule_stat_in_memory(
                         Self::stat_key_pt(raw_ascii_lower),
                         RuleOrigin::Manual,
                         false,
                     );
+                    state_changed = true;
+                }
+                if state_changed {
                     let _ = this.flush_state();
                 }
                 return;
@@ -2810,6 +2844,38 @@ impl RuleStore {
                 );
             }
         });
+    }
+
+    /// Removes a machine-learned `telex_passthrough` entry (preserving manually added
+    /// entries) and clears any staged candidate count for `raw_ascii`.
+    pub fn remove_telex_passthrough_if_machine_learned(&mut self, raw_ascii: &str) -> bool {
+        let word_l = raw_ascii.trim().to_lowercase();
+        if word_l.is_empty() {
+            return false;
+        }
+        self.with_file_lock(|this| {
+            this.sync_external_edits_before_write();
+            this.sync_external_state_before_write();
+            let mut state_changed = this.state.staged_telex_passthrough.remove(&word_l).is_some();
+            let mut rules_changed = false;
+            let is_machine = this
+                .state
+                .rule_stats
+                .get(&Self::stat_key_pt(&word_l))
+                .is_some_and(|s| s.origin.is_machine_learned());
+            if is_machine && this.remove_telex_passthrough_entry(&word_l) {
+                this.state.rule_stats.remove(&Self::stat_key_pt(&word_l));
+                rules_changed = true;
+                state_changed = true;
+            }
+            if rules_changed {
+                let _ = this.flush_rules();
+            }
+            if state_changed {
+                let _ = this.flush_state();
+            }
+            rules_changed
+        })
     }
 
     // -------------------------------------------------------------------------
@@ -5188,6 +5254,141 @@ fomr = \"from\"
         assert!(st.untouched_unknowns.is_empty());
         assert!(st.staged_personal_canonical.is_empty());
         assert!(st.staged_telex_passthrough.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_exe_paths_normalize_and_classify_correctly() {
+        assert_eq!(
+            normalize_program_id(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+            "code"
+        );
+        assert_eq!(normalize_program_id(r"C:\Windows\System32\cmd.exe"), "cmd");
+        assert_eq!(normalize_program_id("UniKeyNT.exe"), "unikeynt");
+        assert_eq!(normalize_program_id("Zalo.exe"), "zalo");
+        assert_eq!(normalize_program_id("brave.exe"), "brave");
+        assert_eq!(normalize_program_id("notepad.exe"), "notepad");
+        assert_eq!(
+            normalize_program_id("org.gnome.Console"),
+            "org.gnome.console"
+        );
+
+        let store = RuleStore::in_memory(Preset::Balanced);
+        let apps = &store.compiled().app_profiles;
+        assert_eq!(
+            apps.classify_app(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+            (AppProfile::Bypass, "program-list")
+        );
+        assert_eq!(
+            apps.classify_app(r"C:\Windows\System32\cmd.exe"),
+            (AppProfile::Bypass, "program-list")
+        );
+        assert_eq!(
+            apps.classify_app("UniKeyNT.exe"),
+            (AppProfile::Bypass, "program-list")
+        );
+        assert_eq!(apps.classify_app("Zalo.exe"), (AppProfile::Chat, "chat"));
+        assert_eq!(
+            apps.classify_app("brave.exe"),
+            (AppProfile::Browser, "browser")
+        );
+        assert_eq!(
+            apps.classify_app("notepad.exe"),
+            (AppProfile::Prose, "prose")
+        );
+        assert_eq!(
+            apps.classify_app("org.gnome.Console"),
+            (AppProfile::Bypass, "program-list")
+        );
+    }
+
+    #[test]
+    fn multi_engine_concurrent_learner_graduates_all_rules_without_clobber() {
+        use crate::learner::{record_manual_edit, record_undo_keep_verbatim, LearnEvent};
+        use crate::lexicon::PackLexicon;
+
+        let dir = temp_store_dir("concurrent_learner_lock");
+        let rules_path = dir.join("rules.toml");
+        let state_path = dir.join("learner_state.json");
+        // Seed initial files before spawning workers.
+        let _seed =
+            RuleStore::load_or_init(rules_path.clone(), state_path.clone(), Preset::Balanced)
+                .unwrap();
+        drop(_seed);
+
+        let lex = PackLexicon::from_word_list(&[("form", 200), ("from", 200), ("time", 200)], &[], &[])
+            .unwrap();
+
+        std::thread::scope(|scope| {
+            let rp1 = rules_path.clone();
+            let sp1 = state_path.clone();
+            let lex_ref = &lex;
+            let t1 = scope.spawn(move || {
+                let mut store = RuleStore::load_or_init(rp1, sp1, Preset::Balanced).unwrap();
+                let ev1 = record_manual_edit(
+                    &mut store,
+                    Some(lex_ref),
+                    &LangId::en(),
+                    None,
+                    "fomr",
+                    "form",
+                );
+                let ev2 = record_manual_edit(
+                    &mut store,
+                    Some(lex_ref),
+                    &LangId::en(),
+                    None,
+                    "fomr",
+                    "form",
+                );
+                assert!(matches!(
+                    ev1,
+                    LearnEvent::StagedCorrection { count: 1, .. }
+                ));
+                assert!(matches!(ev2, LearnEvent::GraduatedCorrection { .. }));
+            });
+
+            let rp2 = rules_path.clone();
+            let sp2 = state_path.clone();
+            let t2 = scope.spawn(move || {
+                let mut store = RuleStore::load_or_init(rp2, sp2, Preset::Balanced).unwrap();
+                let ev1 = record_undo_keep_verbatim(
+                    &mut store,
+                    Some(lex_ref),
+                    &LangId::en(),
+                    "customkeep",
+                    "time",
+                );
+                let ev2 = record_undo_keep_verbatim(
+                    &mut store,
+                    Some(lex_ref),
+                    &LangId::en(),
+                    "customkeep",
+                    "time",
+                );
+                assert!(matches!(ev1, LearnEvent::ShieldedWordSession { .. }));
+                assert!(matches!(ev2, LearnEvent::GraduatedUndoKeep { .. }));
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+        });
+
+        let reloaded = RuleStore::load_or_init(rules_path, state_path, Preset::Balanced).unwrap();
+        assert_eq!(
+            reloaded.compiled().corrections.get("fomr").map(String::as_str),
+            Some("form"),
+            "concurrent manual edit graduation must survive sibling writer"
+        );
+        assert!(
+            reloaded.compiled().personal_dict.contains("customkeep"),
+            "concurrent undo-keep graduation must survive sibling writer"
+        );
+        assert!(reloaded
+            .compiled()
+            .blocklist
+            .contains(&("customkeep".to_string(), "time".to_string())));
 
         let _ = fs::remove_dir_all(&dir);
     }

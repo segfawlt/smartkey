@@ -131,12 +131,13 @@ steps = [
 ]
 
 [[trace]]
-name = "vi_lotus_telex_passthrough_2x_graduation"
+name = "vi_lotus_telex_passthrough_stage_only_and_tier1_restore"
 lang = "vi"
 steps = [
   { keys = "aurr ", expect_buf = "aur " },
   { keys = "aurr ", expect_buf = "aur aur " },
-  { keys = "aur ", expect_buf = "aur aur aur " },
+  { keys = "aur ", expect_buf = "aur aur ảu " },
+  { keys = "dufng aws ", expect_buf = "aur aur ảu dùng aws " },
 ]
 
 [[trace]]

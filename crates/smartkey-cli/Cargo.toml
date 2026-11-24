@@ -23,6 +23,17 @@ path = "src/dev.rs"
 smartkey-core = { path = "../smartkey-core", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
-libc = "0.2"
 ratatui = "0.30"
 crossterm = "0.29"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+smartkey-tsf = { path = "../../adapters/windows-smartkey" }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_Time",
+] }

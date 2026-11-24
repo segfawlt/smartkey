@@ -11,8 +11,8 @@ pub mod types;
 pub mod vi_telex;
 
 pub use event_log::{
-    default_state_log_dir, parse_trace_filename_days, resolve_home_dir, DiagnosticsConfig,
-    EventLog, EventLogLevel, LoggedDiagnosticRecord,
+    default_config_dir, default_state_log_dir, parse_trace_filename_days, resolve_home_dir,
+    DiagnosticsConfig, EventLog, EventLogLevel, LoggedDiagnosticRecord,
 };
 pub use learner::{LearnEvent, SkipReason};
 pub use lexicon::{
@@ -42,8 +42,9 @@ pub use types::{
     MatchKind, ScorerConfig, SpaceHabitKind, UndoMode,
 };
 pub use vi_telex::{
-    has_any_vietnamese_rune, is_vietnamese_dict_word, is_vietnamese_slang_word,
-    lookup_vietnamese_shorthand, project_shorthand_case, rescue_telex_typo,
-    rescue_telex_typo_with_options, resolve_lotus_dict_path, simulate_lotus_word,
-    simulate_lotus_word_with_options, LotusOptions, LotusSimulation, TelexRescue, W2uMode,
+    has_any_vietnamese_rune, is_impossible_standalone_vi_syllable, is_vietnamese_dict_word,
+    is_vietnamese_slang_word, lookup_vietnamese_shorthand, project_shorthand_case,
+    rescue_telex_typo, rescue_telex_typo_with_options, resolve_lotus_dict_path,
+    simulate_lotus_word, simulate_lotus_word_with_options, LotusOptions, LotusSimulation,
+    TelexRescue, W2uMode,
 };

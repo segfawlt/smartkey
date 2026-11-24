@@ -74,6 +74,23 @@ pub fn resolve_home_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(home));
         }
     }
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            if !profile.is_empty() && profile.to_string_lossy().trim() != "" {
+                return Some(PathBuf::from(profile));
+            }
+        }
+        if let (Some(drive), Some(path)) =
+            (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+        {
+            let mut combined = drive;
+            combined.push(path);
+            if !combined.is_empty() && combined.to_string_lossy().trim() != "" {
+                return Some(PathBuf::from(combined));
+            }
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -107,7 +124,43 @@ pub fn resolve_home_dir() -> Option<PathBuf> {
     None
 }
 
-/// Resolves `$XDG_STATE_HOME/smartkey/logs` (defaulting to `~/.local/state/smartkey/logs`).
+/// Resolves the SmartKey configuration and brain directory (`rules.toml`, `learner_state.json`).
+/// Checks `$SMARTKEY_CONFIG_DIR` and `$XDG_CONFIG_HOME` first, then `%APPDATA%\smartkey` on
+/// Windows or `~/.config/smartkey` on Unix.
+pub fn default_config_dir() -> PathBuf {
+    if let Ok(custom) = std::env::var("SMARTKEY_CONFIG_DIR") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        let trimmed = xdg.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("smartkey");
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let trimmed = appdata.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("smartkey");
+            }
+        }
+        if let Some(home) = resolve_home_dir() {
+            return home.join("AppData").join("Roaming").join("smartkey");
+        }
+    }
+    #[cfg(not(windows))]
+    if let Some(home) = resolve_home_dir() {
+        return home.join(".config").join("smartkey");
+    }
+    std::env::temp_dir().join("smartkey").join("config")
+}
+
+/// Resolves `$XDG_STATE_HOME/smartkey/logs` (defaulting to `~/.local/state/smartkey/logs` on Unix
+/// or `%LOCALAPPDATA%\smartkey\logs` on Windows).
 pub fn default_state_log_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
         let trimmed = xdg.trim();
@@ -115,6 +168,23 @@ pub fn default_state_log_dir() -> PathBuf {
             return PathBuf::from(trimmed).join("smartkey/logs");
         }
     }
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let trimmed = local.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("smartkey").join("logs");
+            }
+        }
+        if let Some(home) = resolve_home_dir() {
+            return home
+                .join("AppData")
+                .join("Local")
+                .join("smartkey")
+                .join("logs");
+        }
+    }
+    #[cfg(not(windows))]
     if let Some(home) = resolve_home_dir() {
         return home.join(".local/state/smartkey/logs");
     }

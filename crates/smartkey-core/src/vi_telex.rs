@@ -377,6 +377,19 @@ pub fn has_any_vietnamese_rune(word: &str) -> bool {
     word.chars().any(is_vietnamese_rune)
 }
 
+/// Returns `true` when `composed_lower` ends in a toned open `ă`/`â` vowel
+/// (`ằ, ắ, ẳ, ẵ, ặ, ầ, ấ, ẩ, ẫ, ậ`). In Vietnamese phonology, `ă` and `â` require
+/// a coda/glide and never form real toned open syllables (unlike toneless `ă`/`â`/`đ`
+/// used in `"chữ ă"`, `"chữ â"`, `"chữ đ"`, and `"kpă"`).
+pub fn is_impossible_standalone_vi_syllable(composed_lower: &str) -> bool {
+    composed_lower.chars().last().is_some_and(|ch| {
+        matches!(
+            ch,
+            'ằ' | 'ắ' | 'ẳ' | 'ẵ' | 'ặ' | 'ầ' | 'ấ' | 'ẩ' | 'ẫ' | 'ậ'
+        )
+    })
+}
+
 fn has_any_vietnamese_vowel(word: &str) -> bool {
     word.chars().any(is_vowel)
 }
@@ -2257,6 +2270,22 @@ mod tests {
                 rescue_telex_typo(eng),
                 None,
                 "English word {eng:?} must not rescue as dropped -ng"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_impossible_standalone_vi_syllable() {
+        for impossible in ["ắ", "ằ", "ẳ", "ẵ", "ặ", "ấ", "ầ", "ẩ", "ẫ", "ậ", "chấ", "đẵ"] {
+            assert!(
+                is_impossible_standalone_vi_syllable(impossible),
+                "{impossible:?} should be impossible standalone"
+            );
+        }
+        for allowed in ["ă", "â", "đ", "kpă", "đi", "mã", "tét", "thí", "chấn", "đẵn"] {
+            assert!(
+                !is_impossible_standalone_vi_syllable(allowed),
+                "{allowed:?} must NOT be treated as impossible standalone"
             );
         }
     }

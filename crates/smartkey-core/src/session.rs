@@ -8,7 +8,7 @@ use crate::keyboard::damerau_levenshtein_chars;
 use crate::learner::{
     record_manual_edit, record_manual_space_shift, record_manual_space_split,
     record_telex_passthrough_repair, record_undo_keep_verbatim, record_untouched_unknown,
-    resolve_restored_edit, LearnEvent,
+    resolve_restored_edit, stage_telex_passthrough_candidate, LearnEvent,
 };
 use crate::lexicon::{LexiconError, PackLexicon, PackTier};
 use crate::scorer::{EvalContext, LanguageScorer, LatinScorer, UserRuleView};
@@ -79,13 +79,9 @@ impl LexiconRegistry {
         if !dirs.contains(&user_dir) {
             dirs.push(user_dir);
         }
-        for sys in [
-            "/usr/local/share/smartkey/dicts",
-            "/usr/share/smartkey/dicts",
-        ] {
-            let p = PathBuf::from(sys);
-            if !dirs.contains(&p) {
-                dirs.push(p);
+        for sys in crate::lexicon::system_dict_dirs() {
+            if !dirs.contains(&sys) {
+                dirs.push(sys);
             }
         }
         dirs
@@ -295,26 +291,6 @@ impl SmartKeyEngine {
             .unwrap_or(&[])
     }
 
-    fn vi_dict_and_store_mut(&mut self) -> (&[Box<str>], &mut RuleStore) {
-        let syls: &[Box<str>] = if let Some(syls) = &self.vi_runtime_syllables {
-            syls
-        } else if let Some(vi_lex) = self.registry.lexicon("vi") {
-            let syls = vi_lex.syllable_dict();
-            if !syls.is_empty() {
-                syls
-            } else {
-                crate::lexicon::bundled_vi_lexicon()
-                    .map(PackLexicon::syllable_dict)
-                    .unwrap_or(&[])
-            }
-        } else {
-            crate::lexicon::bundled_vi_lexicon()
-                .map(PackLexicon::syllable_dict)
-                .unwrap_or(&[])
-        };
-        (syls, &mut self.store)
-    }
-
     fn active_vi_pack(&self) -> Option<&PackLexicon> {
         match self.registry.lexicon("vi") {
             Some(lex) => Some(lex),
@@ -412,8 +388,25 @@ impl SmartKeyEngine {
             .contains(&raw_ascii.to_lowercase())
     }
 
+    fn is_known_english_or_personal_for_passthrough(&self, lower: &str) -> bool {
+        if lower.len() < 2 || !lower.is_ascii() {
+            return false;
+        }
+        if self.store.is_lang_only_personal_word("vi", lower) || self.is_vi_slang_word(lower) {
+            return false;
+        }
+        if self.store.compiled().personal_dict.contains(lower) {
+            return true;
+        }
+        let dialect = self.store.scorer_config().dialect;
+        self.lexicon()
+            .and_then(|lex| lex.lookup_word(lower))
+            .is_some_and(|m| m.is_valid_for_dialect(dialect))
+    }
+
     /// Returns true if a Lotus-composed Vietnamese syllable (`"ò"` from `"of"`, `"í"` from `"is"`,
-    /// `"ảu"` from `"aur"`) should be restored to raw ASCII `token` via explicit `telex_passthrough`
+    /// `"ảu"` from `"aur"`) should be restored to raw ASCII `token` via explicit `telex_passthrough`,
+    /// Tier 1 impossible standalone Vietnamese syllables (`"ắ"` from `"aws"`),
     /// or the bilingual English-Sentence Momentum Shield.
     pub fn should_passthrough_telex(
         &self,
@@ -428,6 +421,15 @@ impl SmartKeyEngine {
             return false;
         }
         if self.is_telex_passthrough(token) {
+            return true;
+        }
+
+        // Tier 1: phonologically impossible toned open `ă`/`â` syllables (`ắ`, `ằ`, `ấ`, ...)
+        // that come from a known English/tech/personal word (`aws`) auto-restore to raw ASCII
+        // in any context without requiring manual `telex_passthrough` entry.
+        if crate::vi_telex::is_impossible_standalone_vi_syllable(composed_lower)
+            && self.is_known_english_or_personal_for_passthrough(&lower)
+        {
             return true;
         }
 
@@ -1677,12 +1679,7 @@ impl SmartKeySession {
                 ..
             } => {
                 if !buf.is_empty() {
-                    {
-                        let (vi_dict, store) = engine.vi_dict_and_store_mut();
-                        self.maybe_record_vi_passthrough_repair(
-                            vi_dict, store, &orig_word, &buf, events,
-                        );
-                    }
+                    self.maybe_record_vi_passthrough_repair(engine, &orig_word, &buf);
                     let lex = engine.registry.lexicon(self.lang.as_str());
                     let ev = record_manual_edit(
                         &mut engine.store,
@@ -2584,16 +2581,7 @@ impl SmartKeySession {
                                 w1: buf.clone(),
                             });
                         } else {
-                            {
-                                let (vi_dict, store) = engine.vi_dict_and_store_mut();
-                                self.maybe_record_vi_passthrough_repair(
-                                    vi_dict,
-                                    store,
-                                    &orig_word,
-                                    &buf,
-                                    &mut learn_events,
-                                );
-                            }
+                            self.maybe_record_vi_passthrough_repair(engine, &orig_word, &buf);
                             let lex = engine.registry.lexicon(self.lang.as_str());
                             let ev = record_manual_edit(
                                 &mut engine.store,
@@ -3027,23 +3015,36 @@ impl SmartKeySession {
         SessionOutput::with_events(learn_events)
     }
 
+    fn maybe_stage_vi_passthrough_candidate(
+        engine: &mut SmartKeyEngine,
+        cand_ascii: &str,
+        composed_lower: &str,
+    ) {
+        if crate::vi_telex::is_impossible_standalone_vi_syllable(composed_lower) {
+            return;
+        }
+        let cand_lower = cand_ascii.to_lowercase();
+        if !engine.is_known_english_or_personal_for_passthrough(&cand_lower) {
+            return;
+        }
+        let _ = stage_telex_passthrough_candidate(&mut engine.store, cand_ascii);
+    }
+
     fn maybe_record_vi_passthrough_repair(
         &mut self,
-        vi_dict: &[Box<str>],
-        store: &mut RuleStore,
+        engine: &mut SmartKeyEngine,
         orig_word: &str,
         new_buf: &str,
-        events: &mut Vec<LearnEvent>,
     ) {
         if self.lang.as_str() != "vi" || !crate::vi_telex::has_any_vietnamese_rune(orig_word) {
             return;
         }
-        let opts = store.lotus_options();
-        let buf_sim = crate::vi_telex::simulate_lotus_word_with_dict(new_buf, opts, vi_dict);
+        let opts = engine.store.lotus_options();
+        let buf_sim = engine.simulate_vi_lotus(new_buf, opts);
         let cand_ascii =
             if !buf_sim.is_composed_vietnamese && buf_sim.preedit_before_break.is_ascii() {
                 buf_sim.preedit_before_break.as_str()
-            } else if new_buf.is_ascii() {
+            } else if !self.lotus_composing && new_buf.is_ascii() {
                 new_buf
             } else {
                 return;
@@ -3051,12 +3052,10 @@ impl SmartKeySession {
         if cand_ascii.len() < 2 {
             return;
         }
-        let re_sim = crate::vi_telex::simulate_lotus_word_with_dict(cand_ascii, opts, vi_dict);
+        let re_sim = engine.simulate_vi_lotus(cand_ascii, opts);
         if re_sim.committed_at_break.eq_ignore_ascii_case(orig_word) {
-            let ev = record_telex_passthrough_repair(store, cand_ascii);
-            if !matches!(ev, LearnEvent::None) {
-                events.push(ev);
-            }
+            let composed_lower = re_sim.committed_at_break.to_lowercase();
+            Self::maybe_stage_vi_passthrough_candidate(engine, cand_ascii, &composed_lower);
         }
     }
 
@@ -3586,8 +3585,8 @@ impl SmartKeySession {
                 reason,
                 do_not_learn,
             } => {
-                // Detect deliberate Telex double-key undo escape (`"aurr "` -> `"aur"` on screen
-                // where `"aur"` alone composes `"ảu"`): 2x graduates `"aur"` to `telex_passthrough`!
+                // Stage deliberate Telex double-key undo escapes (`"didd "` -> `"did"` on screen
+                // where `"did"` composes `"đi"`) for explicit TUI review without silent graduation.
                 if let Some(sim) = &vi_sim {
                     if word.len() >= 3
                         && word.is_ascii()
@@ -3595,13 +3594,15 @@ impl SmartKeySession {
                         && sim.preedit_before_break.is_ascii()
                         && sim.preedit_before_break.len() + 1 == word.len()
                     {
-                        let base = &sim.preedit_before_break;
-                        let base_sim = engine.simulate_vi_lotus(base, lotus_opts);
+                        let base = sim.preedit_before_break.clone();
+                        let base_sim = engine.simulate_vi_lotus(&base, lotus_opts);
                         if base_sim.is_valid_vietnamese && base_sim.is_composed_vietnamese {
-                            let pt_ev = record_telex_passthrough_repair(&mut engine.store, base);
-                            if !matches!(pt_ev, LearnEvent::None) {
-                                learn_events.push(pt_ev);
-                            }
+                            let composed_lower = base_sim.committed_at_break.to_lowercase();
+                            Self::maybe_stage_vi_passthrough_candidate(
+                                engine,
+                                &base,
+                                &composed_lower,
+                            );
                         }
                     }
                 }

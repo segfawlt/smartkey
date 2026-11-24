@@ -243,6 +243,30 @@ fn build_store(
     }
 }
 
+fn build_store_readonly(
+    rules_path_utf8: *const c_char,
+    state_path_utf8: *const c_char,
+    preset: u8,
+) -> Result<RuleStore, ()> {
+    let p = decode_preset(preset);
+    let rules_opt = unsafe { parse_optional_path(rules_path_utf8)? };
+    let state_opt = unsafe { parse_optional_path(state_path_utf8)? };
+
+    match rules_opt {
+        None => Ok(RuleStore::in_memory(p)),
+        Some(rp) => {
+            let r_path = PathBuf::from(rp);
+            let s_path = match state_opt {
+                Some(sp) => PathBuf::from(sp),
+                None => r_path.with_file_name("learner_state.json"),
+            };
+            RuleStore::load_readonly_or_default(r_path, s_path, p)
+                .map(|(store, _)| store)
+                .map_err(|_| ())
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn smartkey_engine_new(
     rules_path_utf8: *const c_char,
@@ -251,6 +275,26 @@ pub unsafe extern "C" fn smartkey_engine_new(
 ) -> *mut SmartKeyEngineHandle {
     catch_unwind(|| {
         let Ok(store) = build_store(rules_path_utf8, state_path_utf8, preset) else {
+            return ptr::null_mut();
+        };
+
+        Box::into_raw(Box::new(SmartKeyEngineHandle {
+            inner: SmartKeyEngine::new_auto(store),
+            poisoned: false,
+            _not_send_sync: std::marker::PhantomData,
+        }))
+    })
+    .unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_new_readonly(
+    rules_path_utf8: *const c_char,
+    state_path_utf8: *const c_char,
+    preset: u8,
+) -> *mut SmartKeyEngineHandle {
+    catch_unwind(|| {
+        let Ok(store) = build_store_readonly(rules_path_utf8, state_path_utf8, preset) else {
             return ptr::null_mut();
         };
 
@@ -726,6 +770,20 @@ pub unsafe extern "C" fn smartkey_engine_is_english_word(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn smartkey_engine_is_vi_dict_word(
+    engine: *const SmartKeyEngineHandle,
+    word_utf8: *const c_char,
+) -> bool {
+    with_engine_ref(engine, false, |eng| {
+        let Some(word) = opt_cstr(word_utf8) else {
+            return false;
+        };
+        let lower = word.to_lowercase();
+        eng.is_vi_dict_word(&lower) || eng.is_vi_slang_word(&lower)
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn smartkey_engine_is_telex_passthrough(
     engine: *const SmartKeyEngineHandle,
     raw_ascii_utf8: *const c_char,
@@ -1062,5 +1120,37 @@ mod tests {
 
         unsafe { smartkey_engine_free(eng) };
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ffi_engine_readonly_and_vi_dict_lookup() {
+        let dir = std::env::temp_dir().join(format!(
+            "smartkey_ffi_readonly_{}_{}",
+            std::process::id(),
+            smartkey_core::event_log::current_epoch_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rules = dir.join("rules.toml");
+        let state = dir.join("state.json");
+        let c_rules = CString::new(rules.to_str().unwrap()).unwrap();
+        let c_state = CString::new(state.to_str().unwrap()).unwrap();
+
+        let eng = unsafe {
+            smartkey_engine_new_readonly(c_rules.as_ptr(), c_state.as_ptr(), SMARTKEY_PRESET_BALANCED)
+        };
+        assert!(!eng.is_null());
+        assert!(
+            !dir.exists(),
+            "smartkey_engine_new_readonly must not create missing config directory"
+        );
+
+        let anh = CString::new("anh").unwrap();
+        let thanh = CString::new("Thanh").unwrap();
+        let fomr = CString::new("fomr").unwrap();
+        assert!(unsafe { smartkey_engine_is_vi_dict_word(eng, anh.as_ptr()) });
+        assert!(unsafe { smartkey_engine_is_vi_dict_word(eng, thanh.as_ptr()) });
+        assert!(!unsafe { smartkey_engine_is_vi_dict_word(eng, fomr.as_ptr()) });
+
+        unsafe { smartkey_engine_free(eng) };
     }
 }

@@ -9,7 +9,7 @@ use crate::format_age_ago;
 
 use super::app::App;
 use super::theme::{panel, selected_style, truncate, warn_line, ACCENT, MUTED};
-use super::types::{Modal, ReviewTab, Screen};
+use super::types::{ActivityLayout, Modal, ReviewTab, Screen};
 
 impl App {
     pub(super) fn banner_lines(&self) -> Vec<Line<'static>> {
@@ -24,19 +24,14 @@ impl App {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             )));
         }
-        if self.screen == Screen::Activity {
-            if !self.fcitx5_running {
-                out.push(warn_line(
-                    "Fcitx5 is not running, so SmartKey is not fixing anything right now",
-                ));
-            } else if self.vi_lotus && !self.lotus_installed {
-                out.push(warn_line(
-                    "Vietnamese support is on, but fcitx5-lotus is not installed",
-                ));
-            }
-            if let Some(w) = self.env_warnings.first() {
-                out.push(warn_line(w));
-            }
+        if !self.fcitx5_running {
+            out.push(warn_line(
+                "Fcitx5 is not running, so SmartKey is not fixing anything right now",
+            ));
+        } else if self.vi_lotus && !self.lotus_installed {
+            out.push(warn_line(
+                "Vietnamese support is on, but fcitx5-lotus is not installed",
+            ));
         }
         out.truncate(2);
         out
@@ -243,7 +238,10 @@ impl App {
                 format!(" {}", t.text),
                 Style::default().fg(ACCENT),
             )),
-            None => Line::default(),
+            None => match self.env_warnings.first() {
+                Some(w) => warn_line(w),
+                None => Line::default(),
+            },
         };
         frame.render_widget(Paragraph::new(line), area);
     }
@@ -287,13 +285,24 @@ impl App {
             };
         }
         let mut pairs = match self.screen {
-            Screen::Activity => vec![
-                ("j k", "move"),
-                ("⏎", "actions"),
-                ("/", "search"),
-                ("f", "filter"),
-                ("z", "zoom"),
-            ],
+            Screen::Activity => match self.activity_layout {
+                ActivityLayout::List => vec![
+                    ("j k", "move"),
+                    ("⏎", "actions"),
+                    ("m", "split"),
+                    ("/", "search"),
+                    ("f", "filter"),
+                    ("z", "zoom"),
+                ],
+                ActivityLayout::Split => vec![
+                    ("j k", "move"),
+                    ("h l J K", "pane"),
+                    ("⏎", "actions"),
+                    ("m", "list"),
+                    ("/", "search"),
+                    ("z", "zoom"),
+                ],
+            },
             Screen::Review => match self.review_tab {
                 ReviewTab::Queue => vec![
                     ("h l", "tab"),

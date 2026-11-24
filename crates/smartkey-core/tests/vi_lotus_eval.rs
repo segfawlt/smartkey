@@ -645,3 +645,250 @@ fn test_vi_lotus_omitted_mark_and_dropped_ng_with_undo_and_corpus_shield() {
         );
     }
 }
+
+#[test]
+fn test_vi_lotus_tier1_impossible_standalone_vowel_restore_and_guards() {
+    let (mut engine, mut session) = make_vi_engine_and_session();
+
+    // 1. `"aws"` composes `"ắ"` (impossible toned open `ă` syllable) and is a known lexicon/dev word:
+    //    auto-restores to `"aws"` at sentence start, mid-Vietnamese, and mid-English WITHOUT
+    //    any `telex_passthrough` rule.
+    assert!(!engine.is_telex_passthrough("aws"));
+    let (start_buf, _) = type_sequence(&mut session, &mut engine, "aws ");
+    assert_eq!(start_buf, "aws ");
+
+    let _ = session.reset(&mut engine);
+    let (vi_ctx_buf, _) = type_sequence(&mut session, &mut engine, "dufng aws ");
+    assert_eq!(vi_ctx_buf, "dùng aws ");
+
+    let _ = session.reset(&mut engine);
+    let (en_ctx_buf, _) = type_sequence(&mut session, &mut engine, "use aws ");
+    assert_eq!(en_ctx_buf, "use aws ");
+    assert!(
+        !engine
+            .store()
+            .state()
+            .staged_telex_passthrough
+            .contains_key("aws"),
+        "Tier 1 auto-restored words need not be staged in staged_telex_passthrough"
+    );
+
+    // 2. Non-English `"awf"` stays `"ằ"`, and toneless `"aw"`, `"aa"`, `"dd"` stay Vietnamese:
+    let _ = session.reset(&mut engine);
+    let (non_en_buf, _) = type_sequence(&mut session, &mut engine, "chuw aw aa dd awf ");
+    assert_eq!(non_en_buf, "chư ă â đ ằ ");
+
+    // 3. Lotus Off mode (`lotus_composing = false`): `"aws "` stays `"aws "` via PassThrough.
+    let _ = session.reset(&mut engine);
+    session.set_lotus_composing(false);
+    let mut off_buf = String::new();
+    for (idx, ch) in "aws ".chars().enumerate() {
+        let key = KeyInput::Char(ch);
+        let out = session.process_key(&mut engine, key, 10_000 + (idx as u64) * 30);
+        assert_eq!(out.action, SessionAction::PassThrough);
+        apply_key_to_buffer(&mut off_buf, key, &out.action);
+    }
+    assert_eq!(off_buf, "aws ");
+    session.set_lotus_composing(true);
+
+    // 4. Stepwise BackSpace undo on Tier 1 `"aws "` (`2x BS` -> `"ắ"`, then Space) blocks `("ắ", "aws")`
+    //    so subsequent `"aws "` stays `"ắ "`.
+    let _ = session.reset(&mut engine);
+    let (mut undo_buf, _) = type_sequence(&mut session, &mut engine, "aws ");
+    assert_eq!(undo_buf, "aws ");
+    let bs1 = session.process_key(&mut engine, KeyInput::BackSpace, 1_500);
+    assert_eq!(bs1.action, SessionAction::PassThrough);
+    apply_key_to_buffer(&mut undo_buf, KeyInput::BackSpace, &bs1.action);
+    let bs2 = session.process_key(&mut engine, KeyInput::BackSpace, 1_540);
+    apply_key_to_buffer(&mut undo_buf, KeyInput::BackSpace, &bs2.action);
+    assert_eq!(undo_buf, "ắ");
+    let sp = session.process_key(&mut engine, KeyInput::Char(' '), 1_580);
+    apply_key_to_buffer(&mut undo_buf, KeyInput::Char(' '), &sp.action);
+    assert_eq!(undo_buf, "ắ ");
+    assert!(engine.store().is_pair_blocked("ắ", "aws"));
+
+    let _ = session.reset(&mut engine);
+    let (after_block, _) = type_sequence(&mut session, &mut engine, "aws ");
+    assert_eq!(after_block, "ắ ");
+}
+
+#[test]
+fn test_vi_lotus_tier2_passive_escapes_stage_only_without_hijacking_vietnamese() {
+    let (mut engine, mut session) = make_vi_engine_and_session();
+
+    // Typing `"Didd "` 3x in `vi-lotus` stages `"did"` for TUI review without silently graduating
+    // `"did"` into `telex_passthrough`:
+    for _ in 0..3 {
+        let _ = session.reset(&mut engine);
+        let (buf, _) = type_sequence(&mut session, &mut engine, "Didd ");
+        assert_eq!(buf, "Did ");
+    }
+    assert!(!engine.is_telex_passthrough("did"));
+    assert_eq!(
+        engine
+            .store()
+            .state()
+            .staged_telex_passthrough
+            .get("did")
+            .copied(),
+        Some(3)
+    );
+
+    // Vietnamese `"anh đi"` and sentence-start `"Đi"` remain protected, while Momentum Shield
+    // still restores `"what did "`:
+    let _ = session.reset(&mut engine);
+    let (vi_buf, _) = type_sequence(&mut session, &mut engine, "anh did ");
+    assert_eq!(vi_buf, "anh đi ");
+
+    let _ = session.reset(&mut engine);
+    let (start_buf, _) = type_sequence(&mut session, &mut engine, "Did ");
+    assert_eq!(start_buf, "Đi ");
+
+    let _ = session.reset(&mut engine);
+    let (mom_buf, _) = type_sequence(&mut session, &mut engine, "what did ");
+    assert_eq!(mom_buf, "what did ");
+
+    // Same for `"themee "` 3x: stages `"theme"` for review without hijacking `"thêm"`:
+    for _ in 0..3 {
+        let _ = session.reset(&mut engine);
+        let (buf, _) = type_sequence(&mut session, &mut engine, "themee ");
+        assert_eq!(buf, "theme ");
+    }
+    assert!(!engine.is_telex_passthrough("theme"));
+    assert_eq!(
+        engine
+            .store()
+            .state()
+            .staged_telex_passthrough
+            .get("theme")
+            .copied(),
+        Some(3)
+    );
+
+    let _ = session.reset(&mut engine);
+    let (them_buf, _) = type_sequence(&mut session, &mut engine, "chọn theem ");
+    assert_eq!(them_buf, "chọn thêm ");
+    let _ = session.reset(&mut engine);
+    let (theme_vi_buf, _) = type_sequence(&mut session, &mut engine, "chọn theme ");
+    assert_eq!(theme_vi_buf, "chọn thêm ");
+}
+
+#[test]
+fn test_vi_lotus_tier3_never_stages_pure_vietnamese_telex_repairs_or_escapes() {
+    let (mut engine, mut session) = make_vi_engine_and_session();
+
+    // 1. Backspacing `"thì "` into EditingPrevious and retyping `"thif "` (`"thì"`) in Lotus mode
+    //    must NOT stage `"thif"` in `staged_telex_passthrough`:
+    let (mut buf, _) = type_sequence(&mut session, &mut engine, "thif ");
+    assert_eq!(buf, "thì ");
+    let mut ts = 2_000u64;
+    for _ in 0..4 {
+        ts += 30;
+        let out = session.process_key(&mut engine, KeyInput::BackSpace, ts);
+        apply_key_to_buffer(&mut buf, KeyInput::BackSpace, &out.action);
+    }
+    assert_eq!(buf, "");
+    for ch in "thif ".chars() {
+        ts += 30;
+        if ch != ' ' {
+            let out = session.process_key(&mut engine, KeyInput::Char(ch), ts);
+            assert_eq!(out.action, SessionAction::PassThrough);
+        } else {
+            buf.push_str("thì");
+            let out = session.process_key(&mut engine, KeyInput::Char(' '), ts);
+            apply_key_to_buffer(&mut buf, KeyInput::Char(' '), &out.action);
+        }
+    }
+    assert_eq!(buf, "thì ");
+    assert!(
+        !engine
+            .store()
+            .state()
+            .staged_telex_passthrough
+            .contains_key("thif"),
+        "pure Vietnamese Telex retype must never stage in staged_telex_passthrough"
+    );
+
+    // 2. Accidental double-key escape on non-English Telex (`"thiff "`) must NOT stage `"thif"`:
+    let _ = session.reset(&mut engine);
+    let (esc_buf, _) = type_sequence(&mut session, &mut engine, "thiff ");
+    assert_eq!(esc_buf, "thif ");
+    assert!(
+        !engine
+            .store()
+            .state()
+            .staged_telex_passthrough
+            .contains_key("thif"),
+        "non-English Telex double-key escape must never stage in staged_telex_passthrough"
+    );
+}
+
+#[test]
+fn test_vi_lotus_undo_demotes_machine_learned_but_preserves_manual_telex_passthrough() {
+    // 1. Machine-learned `telex_passthrough` (`RuleOrigin::ManualFix2x`):
+    //    `2x BackSpace + Space` reverts `"did "` -> `"đi "`, deletes `"did"` from
+    //    `telex_passthrough`, clears any staged count, and permanently blocks `("đi", "did")`.
+    let (mut engine, mut session) = make_vi_engine_and_session();
+    engine.store_mut().add_telex_passthrough("did");
+    engine
+        .store_mut()
+        .state_mut()
+        .staged_telex_passthrough
+        .insert("did".to_string(), 2);
+    assert!(engine.is_telex_passthrough("did"));
+
+    let (mut buf, _) = type_sequence(&mut session, &mut engine, "anh did ");
+    assert_eq!(buf, "anh did ");
+    let bs1 = session.process_key(&mut engine, KeyInput::BackSpace, 3_000);
+    assert_eq!(bs1.action, SessionAction::PassThrough);
+    apply_key_to_buffer(&mut buf, KeyInput::BackSpace, &bs1.action);
+    let bs2 = session.process_key(&mut engine, KeyInput::BackSpace, 3_040);
+    apply_key_to_buffer(&mut buf, KeyInput::BackSpace, &bs2.action);
+    assert_eq!(buf, "anh đi");
+    let sp = session.process_key(&mut engine, KeyInput::Char(' '), 3_080);
+    apply_key_to_buffer(&mut buf, KeyInput::Char(' '), &sp.action);
+    assert_eq!(buf, "anh đi ");
+
+    assert!(
+        !engine.is_telex_passthrough("did"),
+        "undoing machine-learned telex_passthrough must demote it"
+    );
+    assert!(
+        !engine
+            .store()
+            .state()
+            .staged_telex_passthrough
+            .contains_key("did"),
+        "undoing telex_passthrough must clear staged_telex_passthrough count"
+    );
+    assert!(engine.store().is_pair_blocked("đi", "did"));
+    let _ = session.reset(&mut engine);
+    let (next_buf, _) = type_sequence(&mut session, &mut engine, "anh did ");
+    assert_eq!(next_buf, "anh đi ");
+
+    // 2. Manual `telex_passthrough` (`RuleOrigin::Manual`):
+    //    undo keeps `"did"` in `telex_passthrough`, but permanent block `("đi", "did")` stops it firing.
+    let (mut engine2, mut session2) = make_vi_engine_and_session();
+    engine2.store_mut().add_user_telex_passthrough("did").unwrap();
+    assert!(engine2.is_telex_passthrough("did"));
+
+    let (mut buf2, _) = type_sequence(&mut session2, &mut engine2, "anh did ");
+    assert_eq!(buf2, "anh did ");
+    let bs1 = session2.process_key(&mut engine2, KeyInput::BackSpace, 4_000);
+    apply_key_to_buffer(&mut buf2, KeyInput::BackSpace, &bs1.action);
+    let bs2 = session2.process_key(&mut engine2, KeyInput::BackSpace, 4_040);
+    apply_key_to_buffer(&mut buf2, KeyInput::BackSpace, &bs2.action);
+    assert_eq!(buf2, "anh đi");
+    let sp = session2.process_key(&mut engine2, KeyInput::Char(' '), 4_080);
+    apply_key_to_buffer(&mut buf2, KeyInput::Char(' '), &sp.action);
+    assert_eq!(buf2, "anh đi ");
+
+    assert!(
+        engine2.is_telex_passthrough("did"),
+        "manual telex_passthrough must stay preserved on undo"
+    );
+    assert!(engine2.store().is_pair_blocked("đi", "did"));
+    let _ = session2.reset(&mut engine2);
+    let (next_buf2, _) = type_sequence(&mut session2, &mut engine2, "anh did ");
+    assert_eq!(next_buf2, "anh đi ");
+}

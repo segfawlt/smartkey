@@ -44,12 +44,26 @@
 namespace fcitx::smartkey {
 
 inline std::string normalizeProgramId(std::string_view raw) {
-    if (const auto slash = raw.rfind('/'); slash != std::string_view::npos) {
+    while (!raw.empty() &&
+           (raw.front() == ' ' || raw.front() == '\t' ||
+            raw.front() == '\r' || raw.front() == '\n')) {
+        raw.remove_prefix(1);
+    }
+    while (!raw.empty() &&
+           (raw.back() == ' ' || raw.back() == '\t' ||
+            raw.back() == '\r' || raw.back() == '\n')) {
+        raw.remove_suffix(1);
+    }
+    if (const auto slash = raw.find_last_of("/\\");
+        slash != std::string_view::npos) {
         raw.remove_prefix(slash + 1);
     }
     std::string lower(raw);
     std::transform(lower.begin(), lower.end(), lower.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower.size() > 4 && lower.ends_with(".exe")) {
+        lower.resize(lower.size() - 4);
+    }
     return lower;
 }
 
@@ -145,7 +159,11 @@ inline uint8_t classifyProgramName(std::string_view rawProgram) {
             "idea", "clion", "pycharm", "rustrover", "goland", "webstorm",
             "datagrip", "phpstorm", "rider", "rubymine", "aqua", "fleet",
             "mps", "android-studio", "androidstudio", "rstudio", "qtcreator",
-            "geany", "lapce", "lite-xl", "kakoune", "micro"
+            "geany", "lapce", "lite-xl", "kakoune", "micro",
+            "cmd", "conhost", "openconsole", "powershell", "pwsh",
+            "wt", "windowsterminal", "mintty", "devenv", "notepad++",
+            "unikey", "unikeynt", "evkey", "evkey64", "evkey32",
+            "openkey", "openkey64", "openkey32"
         }) ||
         matchesAnySubstring(prog, {"terminal", "jetbrains-", "jetbrains.", "androidstudio"})) {
         return SMARTKEY_PROFILE_BYPASS;
@@ -167,7 +185,7 @@ inline uint8_t classifyProgramName(std::string_view rawProgram) {
             "discord", "vesktop", "legcord", "webcord", "telegram",
             "telegram-desktop", "org.telegram.desktop", "slack", "signal",
             "signal-desktop", "element", "element-desktop", "riot", "fractal",
-            "caprine"
+            "caprine", "teams", "ms-teams", "zalo"
         }) ||
         matchesAnySubstring(prog, {"discord", "telegram", "slack", "signal"})) {
         return SMARTKEY_PROFILE_CHAT;

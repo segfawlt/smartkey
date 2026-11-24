@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use ratatui::layout::{Constraint, Rect};
-use smartkey_core::{AppProfile, ConfidenceTier, DiagnosticEvent, LangId, RuleOrigin, RuleStat};
+use smartkey_core::{
+    AppProfile, ConfidenceTier, DiagnosticEvent, LangId, MatchKind, RuleOrigin, RuleStat,
+};
 
 use crate::LogFilter;
 
@@ -22,6 +24,11 @@ pub(super) const SPLIT_PCT_MAX: u16 = 80;
 pub(super) const INSPECT_PCT_DEFAULT: u16 = 62;
 pub(super) const INSPECT_PCT_MIN: u16 = 35;
 pub(super) const INSPECT_PCT_MAX: u16 = 80;
+pub(super) const GRID_PCT_DEFAULT: u16 = 50;
+pub(super) const GRID_PCT_MIN: u16 = 25;
+pub(super) const GRID_PCT_MAX: u16 = 75;
+pub(super) const SPLIT_GRID_MIN_WIDTH: u16 = 64;
+pub(super) const SPLIT_GRID_MIN_HEIGHT: u16 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Screen {
@@ -72,6 +79,7 @@ pub(super) enum ActivityFilter {
     Fixes,
     ByHand,
     Missed,
+    Apps,
 }
 
 impl ActivityFilter {
@@ -80,7 +88,8 @@ impl ActivityFilter {
             Self::All => Self::Fixes,
             Self::Fixes => Self::ByHand,
             Self::ByHand => Self::Missed,
-            Self::Missed => Self::All,
+            Self::Missed => Self::Apps,
+            Self::Apps => Self::All,
         }
     }
 
@@ -90,12 +99,13 @@ impl ActivityFilter {
             Self::Fixes => "fixes",
             Self::ByHand => "undos and hand fixes",
             Self::Missed => "missed words",
+            Self::Apps => "app focus",
         }
     }
 
     pub(super) fn matches(self, ev: &DiagnosticEvent) -> bool {
         match self {
-            Self::All => true,
+            Self::All => !matches!(ev, DiagnosticEvent::AppBypass { .. }),
             Self::Fixes => matches!(ev, DiagnosticEvent::AutocorrectApplied { .. }),
             Self::ByHand => matches!(
                 ev,
@@ -105,6 +115,7 @@ impl ActivityFilter {
                 ev,
                 DiagnosticEvent::UnfixedUnknown { .. } | DiagnosticEvent::RealWordDeclined { .. }
             ),
+            Self::Apps => matches!(ev, DiagnosticEvent::AppBypass { .. }),
         }
     }
 }
@@ -112,10 +123,106 @@ impl ActivityFilter {
 impl From<ActivityFilter> for LogFilter {
     fn from(value: ActivityFilter) -> Self {
         match value {
-            ActivityFilter::All => LogFilter::All,
+            ActivityFilter::All | ActivityFilter::Apps => LogFilter::All,
             ActivityFilter::Fixes => LogFilter::FixedOnly,
             ActivityFilter::ByHand => LogFilter::ManualOnly,
             ActivityFilter::Missed => LogFilter::UnfixedOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ActivityLayout {
+    #[default]
+    List,
+    Split,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ActivityPane {
+    #[default]
+    AutoFixes = 0,
+    Telex = 1,
+    ByHand = 2,
+    Learning = 3,
+}
+
+impl ActivityPane {
+    pub(super) const ALL: [ActivityPane; 4] = [
+        ActivityPane::AutoFixes,
+        ActivityPane::Telex,
+        ActivityPane::ByHand,
+        ActivityPane::Learning,
+    ];
+
+    pub(super) fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(super) fn from_index(i: usize) -> Self {
+        Self::ALL[i % 4]
+    }
+
+    pub(super) fn toggle_lr(self) -> Self {
+        match self {
+            Self::AutoFixes => Self::Telex,
+            Self::Telex => Self::AutoFixes,
+            Self::ByHand => Self::Learning,
+            Self::Learning => Self::ByHand,
+        }
+    }
+
+    pub(super) fn toggle_ud(self) -> Self {
+        match self {
+            Self::AutoFixes => Self::ByHand,
+            Self::ByHand => Self::AutoFixes,
+            Self::Telex => Self::Learning,
+            Self::Learning => Self::Telex,
+        }
+    }
+
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::AutoFixes => "Auto-fixes",
+            Self::Telex => "Telex / VI",
+            Self::ByHand => "Edits & undos",
+            Self::Learning => "Learning & missed",
+        }
+    }
+
+    pub(super) fn empty_msg(self) -> &'static str {
+        match self {
+            Self::AutoFixes => "No automatic English fixes yet.",
+            Self::Telex => "No Vietnamese or Telex activity yet.",
+            Self::ByHand => "No hand edits or undos yet.",
+            Self::Learning => "No learning notices or missed words yet.",
+        }
+    }
+
+    pub(super) fn classify(row: &ActivityRow) -> Option<Self> {
+        match &row.event {
+            DiagnosticEvent::AppBypass { .. } => None,
+            DiagnosticEvent::ManualBackspaceFix { .. } | DiagnosticEvent::BackspaceUndo { .. } => {
+                Some(Self::ByHand)
+            }
+            DiagnosticEvent::AutocorrectApplied { kind, .. } => {
+                if row.lang == "vi" || *kind == MatchKind::VietnameseTelexRescue {
+                    Some(Self::Telex)
+                } else {
+                    Some(Self::AutoFixes)
+                }
+            }
+            DiagnosticEvent::RuleLearned { rule, stage, .. } => {
+                if stage.contains("telex") || rule.starts_with("vi:") {
+                    Some(Self::Telex)
+                } else {
+                    Some(Self::Learning)
+                }
+            }
+            DiagnosticEvent::UnfixedUnknown { .. }
+            | DiagnosticEvent::RealWordDeclined { .. }
+            | DiagnosticEvent::WordUnchanged { .. }
+            | DiagnosticEvent::PackNotice { .. } => Some(Self::Learning),
         }
     }
 }
@@ -840,6 +947,8 @@ pub(super) struct LayoutState {
     pub(super) sidebar_width: u16,
     pub(super) split_pct: u16,
     pub(super) review_inspect_pct: u16,
+    pub(super) activity_grid_h_pct: u16,
+    pub(super) activity_grid_v_pct: u16,
     pub(super) zoomed: bool,
 }
 
@@ -849,6 +958,8 @@ impl Default for LayoutState {
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             split_pct: SPLIT_PCT_DEFAULT,
             review_inspect_pct: INSPECT_PCT_DEFAULT,
+            activity_grid_h_pct: GRID_PCT_DEFAULT,
+            activity_grid_v_pct: GRID_PCT_DEFAULT,
             zoomed: false,
         }
     }
@@ -859,6 +970,8 @@ pub(super) enum DragTarget {
     Sidebar,
     Split,
     ReviewVertical,
+    ActivityGridH,
+    ActivityGridV,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -871,6 +984,10 @@ pub(super) struct LayoutRects {
     pub(super) list_inner: Rect,
     pub(super) list_has_header: bool,
     pub(super) list_offset: usize,
+    pub(super) split_boxes: [Rect; 4],
+    pub(super) split_inners: [Rect; 4],
+    pub(super) split_offsets: [usize; 4],
+    pub(super) split_has_header: [bool; 4],
     pub(super) review_inspect: Rect,
     pub(super) header_strip: Rect,
     pub(super) review_title: Rect,
@@ -889,6 +1006,10 @@ impl Default for LayoutRects {
             list_inner: Rect::default(),
             list_has_header: false,
             list_offset: 0,
+            split_boxes: [Rect::default(); 4],
+            split_inners: [Rect::default(); 4],
+            split_offsets: [0; 4],
+            split_has_header: [false; 4],
             review_inspect: Rect::default(),
             header_strip: Rect::default(),
             review_title: Rect::default(),

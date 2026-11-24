@@ -390,6 +390,8 @@ impl App {
         out.extend(match self.screen {
             Screen::Activity => vec![
                 row("⏎ / b a w p", "act on fix, add word, set app mode"),
+                row("m", "toggle list ↔ 2×2 split view"),
+                row("h l J K / [ ]", "switch split pane (in split view)"),
                 row("/  f  x  e", "search, filter, explain word, on/off"),
             ],
             Screen::Review => vec![

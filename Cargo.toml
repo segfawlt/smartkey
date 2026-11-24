@@ -4,6 +4,7 @@ members = [
     "crates/smartkey-core",
     "crates/smartkey-cli",
     "crates/smartkey-ffi",
+    "adapters/windows-smartkey",
 ]
 
 [workspace.package]

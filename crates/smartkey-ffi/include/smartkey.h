@@ -74,6 +74,12 @@ SmartKeyEngineHandle* smartkey_engine_new(
     uint8_t preset
 );
 
+SmartKeyEngineHandle* smartkey_engine_new_readonly(
+    const char* rules_path_utf8,
+    const char* state_path_utf8,
+    uint8_t preset
+);
+
 SmartKeyEngineHandle* smartkey_engine_new_with_lexicon_bytes(
     const uint8_t* skdict_bytes,
     size_t skdict_len,
@@ -190,6 +196,11 @@ bool smartkey_engine_is_english_word(
     const SmartKeyEngineHandle* engine,
     const char* word_utf8,
     uint8_t* out_freq
+);
+
+bool smartkey_engine_is_vi_dict_word(
+    const SmartKeyEngineHandle* engine,
+    const char* word_utf8
 );
 
 bool smartkey_engine_is_telex_passthrough(

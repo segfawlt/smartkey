@@ -1181,6 +1181,35 @@ impl PackLexicon {
     }
 }
 
+pub(crate) fn system_dict_dirs() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut dirs = Vec::new();
+        if let Ok(pd) = std::env::var("PROGRAMDATA") {
+            let trimmed = pd.trim();
+            if !trimmed.is_empty() {
+                dirs.push(std::path::PathBuf::from(trimmed).join("smartkey").join("dicts"));
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let d = parent.join("dicts");
+                if !dirs.contains(&d) {
+                    dirs.push(d);
+                }
+            }
+        }
+        dirs
+    }
+    #[cfg(not(windows))]
+    {
+        vec![
+            std::path::PathBuf::from("/usr/local/share/smartkey/dicts"),
+            std::path::PathBuf::from("/usr/share/smartkey/dicts"),
+        ]
+    }
+}
+
 pub fn resolve_dict_path(lang: &str) -> Option<std::path::PathBuf> {
     if let Ok(dir) = std::env::var("SMARTKEY_DICT_DIR") {
         if !dir.trim().is_empty() {
@@ -1194,11 +1223,8 @@ pub fn resolve_dict_path(lang: &str) -> Option<std::path::PathBuf> {
     if user_pack.exists() {
         return Some(user_pack);
     }
-    for sys in [
-        "/usr/local/share/smartkey/dicts",
-        "/usr/share/smartkey/dicts",
-    ] {
-        let p = std::path::PathBuf::from(sys).join(format!("{lang}.skdict"));
+    for sys in system_dict_dirs() {
+        let p = sys.join(format!("{lang}.skdict"));
         if p.exists() {
             return Some(p);
         }
@@ -1212,6 +1238,29 @@ pub fn default_user_dict_dir() -> std::path::PathBuf {
             return std::path::PathBuf::from(xdg).join("smartkey/dicts");
         }
     }
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let trimmed = local.trim();
+            if !trimmed.is_empty() {
+                return std::path::PathBuf::from(trimmed).join("smartkey").join("dicts");
+            }
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let trimmed = appdata.trim();
+            if !trimmed.is_empty() {
+                return std::path::PathBuf::from(trimmed).join("smartkey").join("dicts");
+            }
+        }
+        if let Some(home) = crate::event_log::resolve_home_dir() {
+            return home
+                .join("AppData")
+                .join("Local")
+                .join("smartkey")
+                .join("dicts");
+        }
+    }
+    #[cfg(not(windows))]
     if let Some(home) = crate::event_log::resolve_home_dir() {
         return home.join(".local/share/smartkey/dicts");
     }

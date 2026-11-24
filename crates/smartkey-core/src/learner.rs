@@ -253,75 +253,81 @@ pub fn record_undo_keep_verbatim(
         return LearnEvent::None;
     }
 
-    if store.is_pinned(&typed_lower) {
-        // Pinned words never learn against their curated capitalization, accident or not.
-        return LearnEvent::None;
-    }
-    store.add_session_word_shield(&typed_lower);
-    store.add_session_pair_block(&typed_lower, &rejected_lower);
-    if typed_lower == rejected_lower && trimmed_raw.chars().any(char::is_uppercase) {
-        return LearnEvent::ShieldedWordSession { word: typed_lower };
-    }
-    store.sync_state_before_write();
-    let personal_target_lang = if lang.as_str() != "en"
-        && !store
-            .compiled()
-            .lang_personal_dict
-            .get(lang.as_str())
-            .is_some_and(|s| s.contains(&typed_lower))
-        && store.compiled().personal_dict.contains(&typed_lower)
-    {
-        LangId::en()
-    } else {
-        lang.clone()
-    };
-    if typed_lower == rejected_lower
-        && !trimmed_raw.chars().any(char::is_uppercase)
-        && store
-            .lookup_personal_canonical_for(&personal_target_lang, &typed_lower)
-            .is_some_and(|c| !allows_personal_proper_case(lexicon, &typed_lower, c))
-    {
-        store.remove_personal_word(&personal_target_lang, &typed_lower);
-    }
-    if !reject_pair_permanently(store, lexicon, lang, &typed_lower, &rejected_lower) {
-        // `1x` rejection of a curated contraction/proper-noun pair: session shield only, nothing permanent.
-        // Must return BEFORE touching `staged_undo_keep`: `RuleStore::is_undo_shielded` treats any
-        // persisted `staged_undo_keep` key for the word as a cross-session shield, which would
-        // silence the curated rule on the very next session and defeat the `2x` requirement.
-        return LearnEvent::ShieldedWordSession { word: typed_lower };
-    }
-
-    let key = format!("{}:{}->{}", lang.as_str(), typed_lower, rejected_lower);
-    let cnt = {
-        let entry = store.state_mut().staged_undo_keep.entry(key).or_insert(0);
-        *entry = entry.saturating_add(1);
-        *entry
-    };
-
-    if cnt >= 2 {
-        let word_to_save = if trimmed_raw.chars().any(char::is_uppercase)
-            && allows_personal_proper_case(lexicon, &typed_lower, trimmed_raw)
+    store.with_file_lock(|store| {
+        store.reload_if_modified();
+        if store.is_pinned(&typed_lower) {
+            // Pinned words never learn against their curated capitalization, accident or not.
+            return LearnEvent::None;
+        }
+        store.add_session_word_shield(&typed_lower);
+        store.add_session_pair_block(&typed_lower, &rejected_lower);
+        if typed_lower == rejected_lower && trimmed_raw.chars().any(char::is_uppercase) {
+            return LearnEvent::ShieldedWordSession { word: typed_lower };
+        }
+        store.sync_state_before_write();
+        let personal_target_lang = if lang.as_str() != "en"
+            && !store
+                .compiled()
+                .lang_personal_dict
+                .get(lang.as_str())
+                .is_some_and(|s| s.contains(&typed_lower))
+            && store.compiled().personal_dict.contains(&typed_lower)
         {
-            trimmed_raw
+            LangId::en()
         } else {
-            &typed_lower
+            lang.clone()
         };
-        if is_prose_word_token(&typed_lower) {
-            if typed_lower == rejected_lower && !trimmed_raw.chars().any(char::is_uppercase) {
-                store.downgrade_personal_word_case(&personal_target_lang, &typed_lower);
+        if typed_lower == rejected_lower
+            && !trimmed_raw.chars().any(char::is_uppercase)
+            && store
+                .lookup_personal_canonical_for(&personal_target_lang, &typed_lower)
+                .is_some_and(|c| !allows_personal_proper_case(lexicon, &typed_lower, c))
+        {
+            store.remove_personal_word(&personal_target_lang, &typed_lower);
+        }
+        if !reject_pair_permanently(store, lexicon, lang, &typed_lower, &rejected_lower) {
+            // `1x` rejection of a curated contraction/proper-noun pair: session shield only, nothing permanent.
+            // Must return BEFORE touching `staged_undo_keep`: `RuleStore::is_undo_shielded` treats any
+            // persisted `staged_undo_keep` key for the word as a cross-session shield, which would
+            // silence the curated rule on the very next session and defeat the `2x` requirement.
+            return LearnEvent::ShieldedWordSession { word: typed_lower };
+        }
+        if crate::vi_telex::has_any_vietnamese_rune(&typed_lower) && rejected_lower.is_ascii() {
+            store.remove_telex_passthrough_if_machine_learned(&rejected_lower);
+        }
+
+        let key = format!("{}:{}->{}", lang.as_str(), typed_lower, rejected_lower);
+        let cnt = {
+            let entry = store.state_mut().staged_undo_keep.entry(key).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+
+        if cnt >= 2 {
+            let word_to_save = if trimmed_raw.chars().any(char::is_uppercase)
+                && allows_personal_proper_case(lexicon, &typed_lower, trimmed_raw)
+            {
+                trimmed_raw
             } else {
-                store.add_personal_word_with_stage(lang, word_to_save, "undo_keep_2x");
+                &typed_lower
+            };
+            if is_prose_word_token(&typed_lower) {
+                if typed_lower == rejected_lower && !trimmed_raw.chars().any(char::is_uppercase) {
+                    store.downgrade_personal_word_case(&personal_target_lang, &typed_lower);
+                } else {
+                    store.add_personal_word_with_stage(lang, word_to_save, "undo_keep_2x");
+                }
             }
+            let _ = store.flush_state();
+            LearnEvent::GraduatedUndoKeep {
+                typed: typed_lower,
+                rejected: rejected_lower,
+            }
+        } else {
+            let _ = store.flush_state();
+            LearnEvent::ShieldedWordSession { word: typed_lower }
         }
-        let _ = store.flush_state();
-        LearnEvent::GraduatedUndoKeep {
-            typed: typed_lower,
-            rejected: rejected_lower,
-        }
-    } else {
-        let _ = store.flush_state();
-        LearnEvent::ShieldedWordSession { word: typed_lower }
-    }
+    })
 }
 
 /// Row 1 & Row 3: Resolves an `EditingRestored` word after an autocorrect undo (`1x BackSpace`).
@@ -341,93 +347,99 @@ pub fn resolve_restored_edit(
     rejected: &str,
     final_committed: &str,
 ) -> Vec<LearnEvent> {
-    let raw_lower = raw_typed.to_lowercase();
-    let rej_lower = rejected.to_lowercase();
-    let fin_lower = final_committed.to_lowercase();
+    store.with_file_lock(|store| {
+        let raw_lower = raw_typed.to_lowercase();
+        let rej_lower = rejected.to_lowercase();
+        let fin_lower = final_committed.to_lowercase();
 
-    // Case-only corrections (`polish -> Polish`) compare equal once lowercased, so Row 3 would
-    // swallow a deliberate keep-verbatim. Compare exact case for those pairs.
-    let case_only = raw_lower == rej_lower;
-    let final_is_rejected = if case_only {
-        final_committed == rejected
-    } else {
-        fin_lower == rej_lower
-    };
-    let final_is_raw = if case_only {
-        final_committed == raw_typed
-    } else {
-        fin_lower == raw_lower
-    };
-
-    // Row 3: Accidental BackSpace (`"chagnes " -> "changes " -> BS -> "changes "`)
-    if final_is_rejected {
-        store.resolve_pending_undo_log(raw_typed, rejected, UndoResolution::SelfConfirmCancelled);
-        return vec![LearnEvent::SelfConfirmCancelled];
-    }
-
-    // Row 2: Kept verbatim (`"hok " -> "hot " -> BS -> "hok "`)
-    if final_is_raw {
-        store.resolve_pending_undo_log(raw_typed, rejected, UndoResolution::KeptVerbatim);
-        return vec![record_undo_keep_verbatim(
-            store, lexicon, lang, raw_typed, rejected,
-        )];
-    }
-
-    // Row 1: Deliberately edited to a 3rd word (`"fomr " -> "foam " -> BS -> "form "`).
-    // Run `Delta-Span` / `MindChangeDistance` guards first so clearing a word at index 0 to write
-    // a brand-new sentence (`"chagnes" -> "hello"`) or completing an early-space suffix
-    // (`"prodcut" -> "product" -> BS -> "production"`) never poisons `blocklist`.
-    store.resolve_pending_undo_log(
-        raw_typed,
-        rejected,
-        UndoResolution::EditedToThird {
-            final_word: final_committed.to_string(),
-        },
-    );
-    let edit_ev = record_manual_edit(store, lexicon, lang, prev_word, raw_typed, final_committed);
-    if matches!(
-        edit_ev,
-        LearnEvent::Ignored(
-            SkipReason::DeltaSpanRewrite
-                | SkipReason::MindChangeDistance
-                | SkipReason::InvalidToken
-        )
-    ) {
-        return vec![edit_ev];
-    }
-    store.sync_state_before_write();
-    // Curated contraction pairs stage their rejection (`2x` -> permanent); other pairs keep the
-    // immediate `1x` block. Editing to a 3rd word (`"dont" -> "don't" -> BS -> "donut "`) is weak
-    // evidence against the contraction — it may simply have been a different intended word.
-    let pair_blocked = reject_pair_permanently(store, lexicon, lang, &raw_lower, &rej_lower);
-    let rej_in_lexicon = lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&rej_lower));
-    if !rej_in_lexicon && store.is_explicit_personal_word(lang, &rej_lower) {
-        let demote_key = format!("demote:{}:{}", lang.as_str(), rej_lower);
-        let cnt = {
-            let e = store
-                .state_mut()
-                .staged_undo_keep
-                .entry(demote_key)
-                .or_insert(0);
-            *e = e.saturating_add(1);
-            *e
+        // Case-only corrections (`polish -> Polish`) compare equal once lowercased, so Row 3 would
+        // swallow a deliberate keep-verbatim. Compare exact case for those pairs.
+        let case_only = raw_lower == rej_lower;
+        let final_is_rejected = if case_only {
+            final_committed == rejected
+        } else {
+            fin_lower == rej_lower
         };
-        if cnt >= 2 {
-            store.remove_personal_word(lang, &rej_lower);
+        let final_is_raw = if case_only {
+            final_committed == raw_typed
+        } else {
+            fin_lower == raw_lower
+        };
+
+        // Row 3: Accidental BackSpace (`"chagnes " -> "changes " -> BS -> "changes "`)
+        if final_is_rejected {
+            store.resolve_pending_undo_log(
+                raw_typed,
+                rejected,
+                UndoResolution::SelfConfirmCancelled,
+            );
+            return vec![LearnEvent::SelfConfirmCancelled];
         }
-        let _ = store.flush_state();
-    }
-    let mut events = vec![edit_ev];
-    if pair_blocked {
-        events.insert(
-            0,
-            LearnEvent::BlockedPairPermanent {
-                typed: raw_lower,
-                rejected: rej_lower,
+
+        // Row 2: Kept verbatim (`"hok " -> "hot " -> BS -> "hok "`)
+        if final_is_raw {
+            store.resolve_pending_undo_log(raw_typed, rejected, UndoResolution::KeptVerbatim);
+            return vec![record_undo_keep_verbatim(
+                store, lexicon, lang, raw_typed, rejected,
+            )];
+        }
+
+        // Row 1: Deliberately edited to a 3rd word (`"fomr " -> "foam " -> BS -> "form "`).
+        // Run `Delta-Span` / `MindChangeDistance` guards first so clearing a word at index 0 to write
+        // a brand-new sentence (`"chagnes" -> "hello"`) or completing an early-space suffix
+        // (`"prodcut" -> "product" -> BS -> "production"`) never poisons `blocklist`.
+        store.resolve_pending_undo_log(
+            raw_typed,
+            rejected,
+            UndoResolution::EditedToThird {
+                final_word: final_committed.to_string(),
             },
         );
-    }
-    events
+        let edit_ev = record_manual_edit(store, lexicon, lang, prev_word, raw_typed, final_committed);
+        if matches!(
+            edit_ev,
+            LearnEvent::Ignored(
+                SkipReason::DeltaSpanRewrite
+                    | SkipReason::MindChangeDistance
+                    | SkipReason::InvalidToken
+            )
+        ) {
+            return vec![edit_ev];
+        }
+        store.sync_state_before_write();
+        // Curated contraction pairs stage their rejection (`2x` -> permanent); other pairs keep the
+        // immediate `1x` block. Editing to a 3rd word (`"dont" -> "don't" -> BS -> "donut "`) is weak
+        // evidence against the contraction — it may simply have been a different intended word.
+        let pair_blocked = reject_pair_permanently(store, lexicon, lang, &raw_lower, &rej_lower);
+        let rej_in_lexicon = lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&rej_lower));
+        if !rej_in_lexicon && store.is_explicit_personal_word(lang, &rej_lower) {
+            let demote_key = format!("demote:{}:{}", lang.as_str(), rej_lower);
+            let cnt = {
+                let e = store
+                    .state_mut()
+                    .staged_undo_keep
+                    .entry(demote_key)
+                    .or_insert(0);
+                *e = e.saturating_add(1);
+                *e
+            };
+            if cnt >= 2 {
+                store.remove_personal_word(lang, &rej_lower);
+            }
+            let _ = store.flush_state();
+        }
+        let mut events = vec![edit_ev];
+        if pair_blocked {
+            events.insert(
+                0,
+                LearnEvent::BlockedPairPermanent {
+                    typed: raw_lower,
+                    rejected: rej_lower,
+                },
+            );
+        }
+        events
+    })
 }
 
 /// Row 4 & Row 6: Evaluates a manual edit (`orig -> fixed`) through `Delta-Span Check` + Guards 1–3,
@@ -440,29 +452,31 @@ pub fn record_manual_edit(
     orig_raw: &str,
     fixed_raw: &str,
 ) -> LearnEvent {
-    let ev = record_manual_edit_inner(store, lexicon, lang, prev_word, orig_raw, fixed_raw);
-    let label = match &ev {
-        LearnEvent::StagedCorrection { count, .. } => Some(format!("staged ({count}x)")),
-        LearnEvent::GraduatedCorrection { .. } => Some("graduated".to_string()),
-        LearnEvent::GraduatedPersonalWord { .. } => Some("graduated_case".to_string()),
-        LearnEvent::BlockedPairPermanent { .. } => Some("graduated_uncase".to_string()),
-        LearnEvent::StagedContextCorrection { count, .. } => {
-            Some(format!("staged_context ({count}x)"))
+    store.with_file_lock(|store| {
+        let ev = record_manual_edit_inner(store, lexicon, lang, prev_word, orig_raw, fixed_raw);
+        let label = match &ev {
+            LearnEvent::StagedCorrection { count, .. } => Some(format!("staged ({count}x)")),
+            LearnEvent::GraduatedCorrection { .. } => Some("graduated".to_string()),
+            LearnEvent::GraduatedPersonalWord { .. } => Some("graduated_case".to_string()),
+            LearnEvent::BlockedPairPermanent { .. } => Some("graduated_uncase".to_string()),
+            LearnEvent::StagedContextCorrection { count, .. } => {
+                Some(format!("staged_context ({count}x)"))
+            }
+            LearnEvent::GraduatedContextCorrection { .. } => Some("graduated_context".to_string()),
+            LearnEvent::Ignored(
+                reason @ (SkipReason::TargetNotValidWord
+                | SkipReason::DeltaSpanRewrite
+                | SkipReason::MindChangeDistance
+                | SkipReason::ValidWordNoContext
+                | SkipReason::WeakContextAsymmetry),
+            ) => Some(format!("skipped:{}", reason.as_str())),
+            _ => None,
+        };
+        if let Some(outcome_str) = label {
+            store.log_manual_backspace_fix(orig_raw, fixed_raw, &outcome_str);
         }
-        LearnEvent::GraduatedContextCorrection { .. } => Some("graduated_context".to_string()),
-        LearnEvent::Ignored(
-            reason @ (SkipReason::TargetNotValidWord
-            | SkipReason::DeltaSpanRewrite
-            | SkipReason::MindChangeDistance
-            | SkipReason::ValidWordNoContext
-            | SkipReason::WeakContextAsymmetry),
-        ) => Some(format!("skipped:{}", reason.as_str())),
-        _ => None,
-    };
-    if let Some(outcome_str) = label {
-        store.log_manual_backspace_fix(orig_raw, fixed_raw, &outcome_str);
-    }
-    ev
+        ev
+    })
 }
 
 fn is_intentional_cased_token(trimmed: &str) -> bool {
@@ -1112,152 +1126,187 @@ pub fn record_untouched_unknown(
         return LearnEvent::None;
     }
 
-    store.reload_if_modified();
+    store.with_file_lock(|store| {
+        store.reload_if_modified();
 
-    // Never pollute `personal_dict` with expressive stretches (`soooo`, `trờiiii`)
-    if is_expressive_stretch(&lower, |w| {
-        store.is_personal_word(w) || lexicon.is_some_and(|l| l.contains_any_variant_or_elided(w))
-    }) {
-        return LearnEvent::None;
-    }
+        // Never pollute `personal_dict` with expressive stretches (`soooo`, `trờiiii`)
+        if is_expressive_stretch(&lower, |w| {
+            store.is_personal_word(w)
+                || lexicon.is_some_and(|l| l.contains_any_variant_or_elided(w))
+        }) {
+            return LearnEvent::None;
+        }
 
-    let has_upper = word_trimmed.chars().any(char::is_uppercase);
-    let has_internal_upper = word_trimmed.chars().skip(1).any(char::is_uppercase);
-    let is_cased_tech_word = has_upper
-        && lexicon.is_some_and(|l| {
-            l.lookup_proper_noun(&lower).is_none()
-                && l.lookup_word(&lower).is_some_and(|m| m.is_tech())
-        });
+        let has_upper = word_trimmed.chars().any(char::is_uppercase);
+        let has_internal_upper = word_trimmed.chars().skip(1).any(char::is_uppercase);
+        let is_cased_tech_word = has_upper
+            && lexicon.is_some_and(|l| {
+                l.lookup_proper_noun(&lower).is_none()
+                    && l.lookup_word(&lower).is_some_and(|m| m.is_tech())
+            });
 
-    if store.is_personal_word(&lower) {
-        let canon = if lang.as_str() != "en" {
-            store
-                .compiled()
-                .lang_personal_dict_canonical
-                .get(lang.as_str())
-                .and_then(|m| m.get(&lower))
-                .or_else(|| store.compiled().personal_dict_canonical.get(&lower))
-        } else {
-            store.compiled().personal_dict_canonical.get(&lower)
-        };
-        if is_intentional_cased_token(word_trimmed)
-            && allows_personal_proper_case(lexicon, &lower, word_trimmed)
-            && canon.is_none_or(|c| !c.chars().any(char::is_uppercase))
-        {
-            let target_lang = if lang.as_str() != "en"
-                && !store.is_explicit_personal_word(lang, &lower)
-                && store.compiled().personal_dict.contains(&lower)
-            {
-                LangId::en()
+        if store.is_personal_word(&lower) {
+            let canon = if lang.as_str() != "en" {
+                store
+                    .compiled()
+                    .lang_personal_dict_canonical
+                    .get(lang.as_str())
+                    .and_then(|m| m.get(&lower))
+                    .or_else(|| store.compiled().personal_dict_canonical.get(&lower))
             } else {
-                lang.clone()
+                store.compiled().personal_dict_canonical.get(&lower)
             };
-            let up_key = format!("case_upgrade:{}:{}", target_lang.as_str(), lower);
-            let cnt = {
-                let e = store
-                    .state_mut()
-                    .untouched_unknowns
-                    .entry(up_key.clone())
-                    .or_insert(0);
-                *e = e.saturating_add(1);
-                *e
-            };
-            if cnt >= 2 {
-                store.state_mut().untouched_unknowns.remove(&up_key);
-                store.add_personal_word_with_stage(&target_lang, word_trimmed, "case_upgrade_2x");
+            if is_intentional_cased_token(word_trimmed)
+                && allows_personal_proper_case(lexicon, &lower, word_trimmed)
+                && canon.is_none_or(|c| !c.chars().any(char::is_uppercase))
+            {
+                let target_lang = if lang.as_str() != "en"
+                    && !store.is_explicit_personal_word(lang, &lower)
+                    && store.compiled().personal_dict.contains(&lower)
+                {
+                    LangId::en()
+                } else {
+                    lang.clone()
+                };
+                let up_key = format!("case_upgrade:{}:{}", target_lang.as_str(), lower);
+                let cnt = {
+                    let e = store
+                        .state_mut()
+                        .untouched_unknowns
+                        .entry(up_key.clone())
+                        .or_insert(0);
+                    *e = e.saturating_add(1);
+                    *e
+                };
+                if cnt >= 2 {
+                    store.state_mut().untouched_unknowns.remove(&up_key);
+                    store.add_personal_word_with_stage(
+                        &target_lang,
+                        word_trimmed,
+                        "case_upgrade_2x",
+                    );
+                    let _ = store.flush_state();
+                    return LearnEvent::GraduatedPersonalWord {
+                        lang: target_lang.0,
+                        word: word_trimmed.to_string(),
+                    };
+                }
                 let _ = store.flush_state();
-                return LearnEvent::GraduatedPersonalWord {
+                return LearnEvent::StagedUntouchedUnknown {
                     lang: target_lang.0,
                     word: word_trimmed.to_string(),
+                    count: cnt,
                 };
             }
-            let _ = store.flush_state();
-            return LearnEvent::StagedUntouchedUnknown {
-                lang: target_lang.0,
-                word: word_trimmed.to_string(),
-                count: cnt,
+            return LearnEvent::None;
+        }
+        if !has_internal_upper
+            && !is_cased_tech_word
+            && lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&lower))
+        {
+            return LearnEvent::None;
+        }
+
+        let undo_prefix = format!("{}:{}->", lang.as_str(), lower);
+        let has_prior_undo = store
+            .state()
+            .staged_undo_keep
+            .iter()
+            .any(|(k, &v)| v >= 1 && k.starts_with(&undo_prefix));
+        if !has_prior_undo && lexicon.is_some_and(|l| l.lookup_known_typos(&lower).is_some()) {
+            return LearnEvent::None;
+        }
+
+        let key = format!("{}:{}", lang.as_str(), lower);
+        if has_upper
+            && is_intentional_cased_token(word_trimmed)
+            && allows_personal_proper_case(lexicon, &lower, word_trimmed)
+        {
+            store
+                .state_mut()
+                .staged_personal_canonical
+                .insert(key.clone(), word_trimmed.to_string());
+        } else if !has_upper {
+            let lang_prefix = format!("{}:", lang.as_str());
+            let target_suffix = format!("->{lower}");
+            let case_key = format!("case:{}:{lower}", lang.as_str());
+            let has_active_manual_fix = store.state().staged_corrections.iter().any(|(k, &v)| {
+                v >= 1
+                    && (k == &case_key
+                        || (k.starts_with(&lang_prefix) && k.ends_with(&target_suffix)))
+            });
+            if !has_active_manual_fix {
+                store.state_mut().staged_personal_canonical.remove(&key);
+            }
+        }
+        let count = {
+            let e = store
+                .state_mut()
+                .untouched_unknowns
+                .entry(key.clone())
+                .or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        };
+
+        let required_count = if has_prior_undo { 1 } else { 3 };
+        let word_to_save =
+            if has_upper && allows_personal_proper_case(lexicon, &lower, word_trimmed) {
+                word_trimmed.to_string()
+            } else if let Some(canon) = store.state().staged_personal_canonical.get(&key).cloned() {
+                canon
+            } else {
+                lower.clone()
             };
-        }
-        return LearnEvent::None;
-    }
-    if !has_internal_upper
-        && !is_cased_tech_word
-        && lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&lower))
-    {
-        return LearnEvent::None;
-    }
 
-    let undo_prefix = format!("{}:{}->", lang.as_str(), lower);
-    let has_prior_undo = store
-        .state()
-        .staged_undo_keep
-        .iter()
-        .any(|(k, &v)| v >= 1 && k.starts_with(&undo_prefix));
-    if !has_prior_undo && lexicon.is_some_and(|l| l.lookup_known_typos(&lower).is_some()) {
+        if count >= required_count {
+            let stage = if has_prior_undo {
+                "undo_keep_2x"
+            } else {
+                "untouched_3x"
+            };
+            store.add_personal_word_with_stage(lang, &word_to_save, stage);
+            store.clear_untouched_unknown(lang, &lower);
+            let _ = store.flush_state();
+            LearnEvent::GraduatedPersonalWord {
+                lang: lang.0.clone(),
+                word: word_to_save,
+            }
+        } else {
+            let _ = store.flush_state();
+            LearnEvent::StagedUntouchedUnknown {
+                lang: lang.0.clone(),
+                word: word_to_save,
+                count,
+            }
+        }
+    })
+}
+
+/// Stages a candidate ASCII passthrough word for explicit review in `smartkey tui`
+/// without auto-graduating into `rules.toml`.
+pub fn stage_telex_passthrough_candidate(store: &mut RuleStore, raw_ascii: &str) -> LearnEvent {
+    let lower = raw_ascii.trim().to_lowercase();
+    if lower.len() < 2 || !lower.is_ascii() {
         return LearnEvent::None;
     }
-
-    let key = format!("{}:{}", lang.as_str(), lower);
-    if has_upper
-        && is_intentional_cased_token(word_trimmed)
-        && allows_personal_proper_case(lexicon, &lower, word_trimmed)
-    {
-        store
-            .state_mut()
-            .staged_personal_canonical
-            .insert(key.clone(), word_trimmed.to_string());
-    } else if !has_upper {
-        let lang_prefix = format!("{}:", lang.as_str());
-        let target_suffix = format!("->{lower}");
-        let case_key = format!("case:{}:{lower}", lang.as_str());
-        let has_active_manual_fix = store.state().staged_corrections.iter().any(|(k, &v)| {
-            v >= 1
-                && (k == &case_key || (k.starts_with(&lang_prefix) && k.ends_with(&target_suffix)))
-        });
-        if !has_active_manual_fix {
-            store.state_mut().staged_personal_canonical.remove(&key);
+    store.with_file_lock(|store| {
+        store.reload_if_modified();
+        store.sync_state_before_write();
+        if store.compiled().telex_passthrough.contains(&lower)
+            || store.is_pair_blocked(&lower, &lower)
+        {
+            return LearnEvent::None;
         }
-    }
-    let count = {
         let e = store
             .state_mut()
-            .untouched_unknowns
-            .entry(key.clone())
+            .staged_telex_passthrough
+            .entry(lower)
             .or_insert(0);
         *e = e.saturating_add(1);
-        *e
-    };
-
-    let required_count = if has_prior_undo { 1 } else { 3 };
-    let word_to_save = if has_upper && allows_personal_proper_case(lexicon, &lower, word_trimmed) {
-        word_trimmed.to_string()
-    } else if let Some(canon) = store.state().staged_personal_canonical.get(&key).cloned() {
-        canon
-    } else {
-        lower.clone()
-    };
-
-    if count >= required_count {
-        let stage = if has_prior_undo {
-            "undo_keep_2x"
-        } else {
-            "untouched_3x"
-        };
-        store.add_personal_word_with_stage(lang, &word_to_save, stage);
-        store.clear_untouched_unknown(lang, &lower);
         let _ = store.flush_state();
-        LearnEvent::GraduatedPersonalWord {
-            lang: lang.0.clone(),
-            word: word_to_save,
-        }
-    } else {
-        let _ = store.flush_state();
-        LearnEvent::StagedUntouchedUnknown {
-            lang: lang.0.clone(),
-            word: word_to_save,
-            count,
-        }
-    }
+        LearnEvent::None
+    })
 }
 
 /// Phase 2 (`fcitx5-lotus`): Records when a user repairs a Telex-composed token (`ảu`) back to raw ASCII (`aur`).
@@ -1267,24 +1316,27 @@ pub fn record_telex_passthrough_repair(store: &mut RuleStore, raw_ascii: &str) -
     if lower.len() < 2 || !lower.is_ascii() {
         return LearnEvent::None;
     }
-    store.sync_state_before_write();
-    let count = {
-        let e = store
-            .state_mut()
-            .staged_telex_passthrough
-            .entry(lower.clone())
-            .or_insert(0);
-        *e = e.saturating_add(1);
-        *e
-    };
-    if count >= 2 {
-        store.add_telex_passthrough(&lower);
-        let _ = store.flush_state();
-        LearnEvent::GraduatedTelexPassthrough { raw_ascii: lower }
-    } else {
-        let _ = store.flush_state();
-        LearnEvent::None
-    }
+    store.with_file_lock(|store| {
+        store.reload_if_modified();
+        store.sync_state_before_write();
+        let count = {
+            let e = store
+                .state_mut()
+                .staged_telex_passthrough
+                .entry(lower.clone())
+                .or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        };
+        if count >= 2 {
+            store.add_telex_passthrough(&lower);
+            let _ = store.flush_state();
+            LearnEvent::GraduatedTelexPassthrough { raw_ascii: lower }
+        } else {
+            let _ = store.flush_state();
+            LearnEvent::None
+        }
+    })
 }
 
 fn is_valid_prose_word_for_space(
@@ -1328,101 +1380,103 @@ pub fn record_manual_space_split(
     let w1_lower = w1_trimmed.to_lowercase();
     let w2_lower = w2_trimmed.to_lowercase();
 
-    let mut events = Vec::new();
-    let habit_count = store.record_space_habit(SpaceHabitKind::MissedSpace);
-    events.push(LearnEvent::RecordedSpaceHabit {
-        habit: SpaceHabitKind::MissedSpace,
-        count: habit_count,
-    });
+    store.with_file_lock(|store| {
+        let mut events = Vec::new();
+        let habit_count = store.record_space_habit(SpaceHabitKind::MissedSpace);
+        events.push(LearnEvent::RecordedSpaceHabit {
+            habit: SpaceHabitKind::MissedSpace,
+            count: habit_count,
+        });
 
-    if let Some(rejected) = rejected_autocorrect {
-        let final_phrase = format!("{w1_trimmed} {w2_trimmed}");
-        store.resolve_pending_undo_log(
-            orig_trimmed,
-            rejected,
-            UndoResolution::EditedToThird {
-                final_word: final_phrase,
-            },
-        );
-        let rej_lower = rejected.to_lowercase();
-        if reject_pair_permanently(store, lexicon, lang, &orig_lower, &rej_lower) {
-            events.push(LearnEvent::BlockedPairPermanent {
-                typed: orig_lower.clone(),
-                rejected: rej_lower,
+        if let Some(rejected) = rejected_autocorrect {
+            let final_phrase = format!("{w1_trimmed} {w2_trimmed}");
+            store.resolve_pending_undo_log(
+                orig_trimmed,
+                rejected,
+                UndoResolution::EditedToThird {
+                    final_word: final_phrase,
+                },
+            );
+            let rej_lower = rejected.to_lowercase();
+            if reject_pair_permanently(store, lexicon, lang, &orig_lower, &rej_lower) {
+                events.push(LearnEvent::BlockedPairPermanent {
+                    typed: orig_lower.clone(),
+                    rejected: rej_lower,
+                });
+            }
+        }
+
+        if !is_complete_fused {
+            store.log_manual_backspace_fix(
+                orig_trimmed,
+                &format!("{w1_trimmed} {w2_trimmed}"),
+                "space_split_partial",
+            );
+            return events;
+        }
+
+        store.reload_if_modified();
+        if !is_prose_word_token(&orig_lower)
+            || !is_prose_word_token(&w1_lower)
+            || !is_prose_word_token(&w2_lower)
+            || orig_lower.chars().count() < 4
+            || lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&orig_lower))
+            || !is_valid_prose_word_for_space(store, lexicon, &w1_lower)
+            || !is_valid_prose_word_for_space(store, lexicon, &w2_lower)
+        {
+            return events;
+        }
+
+        let w1_fmt = if w1_lower == "i"
+            && store.scorer_config().auto_capitalize_i
+            && lexicon.is_none_or(|l| l.rules().capitalize_standalone_i)
+        {
+            "I"
+        } else {
+            w1_lower.as_str()
+        };
+        let target = format!("{w1_fmt} {w2_lower}");
+        let target_lower = target.to_lowercase();
+
+        store.clear_undo_shield(lang, &orig_lower);
+
+        let stage_key = format!("{}:{}->{}", lang.as_str(), orig_lower, target_lower);
+        let count = {
+            let e = store
+                .state_mut()
+                .staged_corrections
+                .entry(stage_key)
+                .or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        };
+
+        if count >= 2 {
+            if store.is_explicit_personal_word(lang, &orig_lower) {
+                store.remove_personal_word(lang, &orig_lower);
+            }
+            store.add_correction(lang, &orig_lower, &target);
+            clear_pair_rejection(store, lexicon, lang, &orig_lower, &target);
+            let _ = store.flush_state();
+            store.log_manual_backspace_fix(orig_trimmed, &target, "graduated");
+            events.push(LearnEvent::GraduatedCorrection {
+                lang: lang.0.clone(),
+                orig: orig_lower,
+                fixed: target,
+            });
+        } else {
+            let _ = store.flush_state();
+            store.log_manual_backspace_fix(orig_trimmed, &target, "staged (1x)");
+            events.push(LearnEvent::StagedCorrection {
+                lang: lang.0.clone(),
+                orig: orig_lower,
+                fixed: target,
+                count,
             });
         }
-    }
 
-    if !is_complete_fused {
-        store.log_manual_backspace_fix(
-            orig_trimmed,
-            &format!("{w1_trimmed} {w2_trimmed}"),
-            "space_split_partial",
-        );
-        return events;
-    }
-
-    if !is_prose_word_token(&orig_lower)
-        || !is_prose_word_token(&w1_lower)
-        || !is_prose_word_token(&w2_lower)
-        || orig_lower.chars().count() < 4
-        || lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&orig_lower))
-        || !is_valid_prose_word_for_space(store, lexicon, &w1_lower)
-        || !is_valid_prose_word_for_space(store, lexicon, &w2_lower)
-    {
-        return events;
-    }
-
-    let w1_fmt = if w1_lower == "i"
-        && store.scorer_config().auto_capitalize_i
-        && lexicon.is_none_or(|l| l.rules().capitalize_standalone_i)
-    {
-        "I"
-    } else {
-        w1_lower.as_str()
-    };
-    let target = format!("{w1_fmt} {w2_lower}");
-    let target_lower = target.to_lowercase();
-
-    store.reload_if_modified();
-    store.clear_undo_shield(lang, &orig_lower);
-
-    let stage_key = format!("{}:{}->{}", lang.as_str(), orig_lower, target_lower);
-    let count = {
-        let e = store
-            .state_mut()
-            .staged_corrections
-            .entry(stage_key)
-            .or_insert(0);
-        *e = e.saturating_add(1);
-        *e
-    };
-
-    if count >= 2 {
-        if store.is_explicit_personal_word(lang, &orig_lower) {
-            store.remove_personal_word(lang, &orig_lower);
-        }
-        store.add_correction(lang, &orig_lower, &target);
-        clear_pair_rejection(store, lexicon, lang, &orig_lower, &target);
-        let _ = store.flush_state();
-        store.log_manual_backspace_fix(orig_trimmed, &target, "graduated");
-        events.push(LearnEvent::GraduatedCorrection {
-            lang: lang.0.clone(),
-            orig: orig_lower,
-            fixed: target,
-        });
-    } else {
-        let _ = store.flush_state();
-        store.log_manual_backspace_fix(orig_trimmed, &target, "staged (1x)");
-        events.push(LearnEvent::StagedCorrection {
-            lang: lang.0.clone(),
-            orig: orig_lower,
-            fixed: target,
-            count,
-        });
-    }
-
-    events
+        events
+    })
 }
 
 /// Records a manual cross-space shift or extra-space merge repair (`addi n -> add in`,
@@ -1455,41 +1509,44 @@ pub fn record_manual_space_shift(
         return LearnEvent::None;
     }
 
-    let orig_concat = format!("{ow1}{ow2}");
-    let (habit, fixed_display) = match new_w2 {
-        None => {
-            if nw1 != orig_concat || !is_valid_prose_word_for_space(store, lexicon, &nw1) {
-                return LearnEvent::None;
+    store.with_file_lock(|store| {
+        store.reload_if_modified();
+        let orig_concat = format!("{ow1}{ow2}");
+        let (habit, fixed_display) = match new_w2 {
+            None => {
+                if nw1 != orig_concat || !is_valid_prose_word_for_space(store, lexicon, &nw1) {
+                    return LearnEvent::None;
+                }
+                (SpaceHabitKind::ExtraSpace, new_w1.trim().to_string())
             }
-            (SpaceHabitKind::ExtraSpace, new_w1.trim().to_string())
-        }
-        Some(nw2_raw) => {
-            let nw2 = nw2_raw.trim().to_lowercase();
-            if nw2.is_empty() || !nw2.is_ascii() || !is_prose_word_token(&nw2) {
-                return LearnEvent::None;
+            Some(nw2_raw) => {
+                let nw2 = nw2_raw.trim().to_lowercase();
+                if nw2.is_empty() || !nw2.is_ascii() || !is_prose_word_token(&nw2) {
+                    return LearnEvent::None;
+                }
+                let new_concat = format!("{nw1}{nw2}");
+                if new_concat != orig_concat
+                    || ow1.len().abs_diff(nw1.len()) != 1
+                    || !is_valid_prose_word_for_space(store, lexicon, &nw1)
+                    || !is_valid_prose_word_for_space(store, lexicon, &nw2)
+                {
+                    return LearnEvent::None;
+                }
+                let habit = if ow1.len() > nw1.len() {
+                    SpaceHabitKind::LateSpace
+                } else {
+                    SpaceHabitKind::EarlySpace
+                };
+                (habit, format!("{} {}", new_w1.trim(), nw2_raw.trim()))
             }
-            let new_concat = format!("{nw1}{nw2}");
-            if new_concat != orig_concat
-                || ow1.len().abs_diff(nw1.len()) != 1
-                || !is_valid_prose_word_for_space(store, lexicon, &nw1)
-                || !is_valid_prose_word_for_space(store, lexicon, &nw2)
-            {
-                return LearnEvent::None;
-            }
-            let habit = if ow1.len() > nw1.len() {
-                SpaceHabitKind::LateSpace
-            } else {
-                SpaceHabitKind::EarlySpace
-            };
-            (habit, format!("{} {}", new_w1.trim(), nw2_raw.trim()))
-        }
-    };
+        };
 
-    let count = store.record_space_habit(habit);
-    store.log_manual_backspace_fix(
-        &format!("{} {}", orig_w1.trim(), orig_w2.trim()),
-        &fixed_display,
-        &format!("space_habit:{habit:?}"),
-    );
-    LearnEvent::RecordedSpaceHabit { habit, count }
+        let count = store.record_space_habit(habit);
+        store.log_manual_backspace_fix(
+            &format!("{} {}", orig_w1.trim(), orig_w2.trim()),
+            &fixed_display,
+            &format!("space_habit:{habit:?}"),
+        );
+        LearnEvent::RecordedSpaceHabit { habit, count }
+    })
 }

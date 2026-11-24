@@ -831,19 +831,30 @@ pub(super) fn describe_staged_rich(
                 tokens: vec![word.to_string(), shown.to_string()],
             })
         }
-        "telex_passthrough" => Some(StagedViewMeta {
-            type_badge: "Pending Telex keep (vi)".to_string(),
-            kind_noun: "Telex",
-            title: key.to_string(),
-            item_label: key.to_string(),
-            lang: "vi".to_string(),
-            problem: format!("Kept as raw ASCII {count} of {threshold} times in Telex"),
-            source: format!("Staging counter ({count}/{threshold})"),
-            detail: format!("kept as typed in Telex {progress}"),
-            keep_effect: "Keep raw in Telex".to_string(),
-            remove_effect: "Forget staged count".to_string(),
-            tokens: vec![key.to_string()],
-        }),
+        "telex_passthrough" => {
+            let sim = smartkey_core::simulate_lotus_word(key);
+            let problem = if sim.is_composed_vietnamese {
+                format!(
+                    "Kept as raw ASCII {count}× in Telex (collides with Vietnamese \"{}\")",
+                    sim.committed_at_break
+                )
+            } else {
+                format!("Kept as raw ASCII {count}× in Telex")
+            };
+            Some(StagedViewMeta {
+                type_badge: "Pending Telex keep (vi)".to_string(),
+                kind_noun: "Telex",
+                title: key.to_string(),
+                item_label: key.to_string(),
+                lang: "vi".to_string(),
+                problem,
+                source: format!("Review-only ({count}× observed)"),
+                detail: format!("kept as typed in Telex {count}×"),
+                keep_effect: "Keep raw in Telex".to_string(),
+                remove_effect: "Forget staged count".to_string(),
+                tokens: vec![key.to_string()],
+            })
+        }
         _ => None,
     }
 }

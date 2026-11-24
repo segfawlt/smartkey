@@ -1,0 +1,44 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Build, Test & Package (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace unit and integration tests
+        run: cargo test --workspace
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run corpus accuracy and zero-FP gate
+        run: cargo run --release -p smartkey-cli --bin smartkey-dev -- eval
+
+      - name: Check ARM64 Windows compilation
+        run: cargo check --workspace --target aarch64-pc-windows-msvc
+
+      - name: Build and package release zip
+        shell: pwsh
+        run: ./scripts/build-windows.ps1 -ArchLabel x86_64
+
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartkey-windows-x86_64
+          path: dist/smartkey-windows-x86_64.zip
