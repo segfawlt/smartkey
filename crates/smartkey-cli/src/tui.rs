@@ -7,10 +7,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders};
+use ratatui::widgets::{Block, BorderType, Borders};
 use ratatui::widgets::{
-    Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row, Table, TableState,
-    Wrap,
+    Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui::Frame;
 use smartkey_core::event_log::current_epoch_ms;
@@ -34,6 +33,9 @@ const ACTIVITY_WINDOW_MS: u64 = 3 * 86_400_000;
 const ACTIVITY_MAX_ROWS: usize = 400;
 const MAX_SEEN_APPS: usize = 15;
 const MAX_ALMOST: usize = 20;
+const SIDEBAR_WIDTH: u16 = 22;
+const SIDEBAR_MIN_TOTAL: u16 = 70;
+const DETAIL_MIN_WIDTH: u16 = 84;
 const AUTO_REFRESH: Duration = Duration::from_secs(4);
 
 // ---------------------------------------------------------------------------
@@ -624,6 +626,23 @@ enum ReviewSection {
 }
 
 impl ReviewSection {
+    fn actions_help(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Learned => (
+                "Marks this as your own rule so it is not flagged again.",
+                "Deletes the rule.",
+            ),
+            Self::Blocked => (
+                "Keeps SmartKey from making this fix, as your own choice.",
+                "Lets SmartKey make this fix again.",
+            ),
+            Self::Almost => (
+                "Learns it now instead of waiting for more repeats.",
+                "Forgets the count; SmartKey starts over.",
+            ),
+        }
+    }
+
     fn title(self) -> &'static str {
         match self {
             Self::Learned => "Learned rules to check",
@@ -1052,6 +1071,7 @@ pub(crate) struct App {
     screen: Screen,
     modal: Option<Modal>,
     filter_editing: bool,
+    focus_sidebar: bool,
     toast: Option<Toast>,
     undo: Option<(String, Vec<StoreOp>)>,
 
@@ -1204,6 +1224,7 @@ impl App {
             screen: Screen::Activity,
             modal: None,
             filter_editing: false,
+            focus_sidebar: false,
             toast: None,
             undo: None,
             parse_locked: false,
@@ -1742,14 +1763,17 @@ impl App {
             KeyCode::Char('q') => return true,
             KeyCode::Char(c @ '1'..='4') => {
                 self.screen = Screen::from_index((c as u8 - b'1') as usize);
+                self.focus_sidebar = false;
                 return false;
             }
             KeyCode::Tab => {
                 self.screen = Screen::from_index(self.screen.index() + 1);
+                self.focus_sidebar = false;
                 return false;
             }
             KeyCode::BackTab => {
                 self.screen = Screen::from_index(self.screen.index() + 3);
+                self.focus_sidebar = false;
                 return false;
             }
             KeyCode::Char('?') => {
@@ -1767,6 +1791,25 @@ impl App {
             }
             _ => {}
         }
+        if self.focus_sidebar {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.screen = Screen::from_index(self.screen.index() + 1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.screen = Screen::from_index(self.screen.index() + 3)
+                }
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') | KeyCode::Esc => {
+                    self.focus_sidebar = false
+                }
+                _ => {}
+            }
+            return false;
+        }
+        if key.code == KeyCode::Esc && !self.has_pending_filter() {
+            self.focus_sidebar = true;
+            return false;
+        }
         match self.screen {
             Screen::Activity => self.handle_activity_key(key),
             Screen::Review => self.handle_review_key(key),
@@ -1774,6 +1817,14 @@ impl App {
             Screen::Settings => self.handle_settings_key(key),
         }
         false
+    }
+
+    fn has_pending_filter(&self) -> bool {
+        match self.screen {
+            Screen::Activity => !self.activity_search.is_empty(),
+            Screen::Dictionary => !self.dict_filter.is_empty(),
+            _ => false,
+        }
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent) {
@@ -1819,6 +1870,15 @@ impl App {
 
     fn handle_activity_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Char(c @ ('b' | 'a' | 'w' | 'p' | 'v')) => {
+                let action = self
+                    .selected_activity()
+                    .and_then(|row| activity_actions(row).into_iter().find(|i| i.key == c))
+                    .map(|i| i.action);
+                if let Some(action) = action {
+                    self.run_action(action);
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 step(&mut self.activity_idx, 1, self.activity_view.len())
             }
@@ -2392,7 +2452,11 @@ impl App {
         }
 
         let banners = self.banner_lines();
-        let mut cons = vec![Constraint::Length(1), Constraint::Length(1)];
+        let compact = area.width < SIDEBAR_MIN_TOTAL;
+        let mut cons = Vec::new();
+        if compact {
+            cons.push(Constraint::Length(1));
+        }
         if !banners.is_empty() {
             cons.push(Constraint::Length(banners.len() as u16));
         }
@@ -2406,22 +2470,31 @@ impl App {
             .constraints(cons)
             .split(area);
 
-        self.render_header(frame, chunks[0]);
-        frame.render_widget(
-            Paragraph::new("─".repeat(area.width as usize)).style(Style::default().fg(RULE)),
-            chunks[1],
-        );
-        let mut i = 2;
+        let mut i = 0;
+        if compact {
+            self.render_header(frame, chunks[0]);
+            i = 1;
+        }
         if !banners.is_empty() {
             frame.render_widget(Paragraph::new(banners), chunks[i]);
             i += 1;
         }
         let body = chunks[i];
+        let main = if compact {
+            body
+        } else {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(20)])
+                .split(body);
+            self.render_sidebar(frame, cols[0]);
+            cols[1]
+        };
         match self.screen {
-            Screen::Activity => self.render_activity(frame, body),
-            Screen::Review => self.render_review(frame, body),
-            Screen::Dictionary => self.render_dictionary(frame, body),
-            Screen::Settings => self.render_settings(frame, body),
+            Screen::Activity => self.render_activity(frame, main),
+            Screen::Review => self.render_review(frame, main),
+            Screen::Dictionary => self.render_dictionary(frame, main),
+            Screen::Settings => self.render_settings(frame, main),
         }
         self.render_toast(frame, chunks[i + 1]);
         self.render_hints(frame, chunks[i + 2]);
@@ -2461,6 +2534,7 @@ impl App {
         out
     }
 
+    /// One-row screen switcher used when the window is too narrow for the sidebar.
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let short = area.width < 72;
         let mut spans = vec![Span::styled(
@@ -2497,6 +2571,89 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
+    fn render_sidebar(&self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(6), Constraint::Min(0)])
+            .split(area);
+
+        let items: Vec<ListItem> = Screen::ALL
+            .iter()
+            .map(|&s| {
+                let mut spans = vec![Span::raw(format!(" {} {}", s.index() + 1, s.label(false)))];
+                if s == Screen::Review && !self.review.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  {}", self.review.len()),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let nav_style = if self.focus_sidebar {
+            selected_style()
+        } else {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        };
+        let nav = List::new(items).highlight_style(nav_style).block(panel(
+            Line::from(Span::styled(
+                format!(" SmartKey {} ", if self.enabled { "●" } else { "○" }),
+                Style::default().fg(if self.enabled {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
+            )),
+            self.focus_sidebar,
+        ));
+        let mut state = ListState::default();
+        state.select(Some(self.screen.index()));
+        frame.render_stateful_widget(nav, rows[0], &mut state);
+
+        if rows[1].height >= 3 {
+            let state_line = if self.enabled {
+                Span::styled(" ● on", Style::default().fg(Color::Green))
+            } else {
+                Span::styled(" ● off", Style::default().fg(Color::Red))
+            };
+            let muted = Style::default().fg(MUTED);
+            let lines = vec![
+                Line::from(state_line),
+                Line::from(Span::styled(
+                    if self.fcitx5_running {
+                        " Fcitx5 running"
+                    } else {
+                        " Fcitx5 stopped"
+                    },
+                    if self.fcitx5_running {
+                        muted
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    },
+                )),
+                Line::from(Span::styled(
+                    format!(" Vietnamese {}", if self.vi_lotus { "on" } else { "off" }),
+                    muted,
+                )),
+                Line::from(""),
+                Line::from(Span::styled(" Last 24 hours", muted)),
+                Line::from(Span::styled(
+                    format!(" {} fixes", self.day_fixes),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(format!(" {} undone", self.day_undone), muted)),
+                Line::from(Span::styled(
+                    format!(" {} fixed by you", self.day_by_hand),
+                    muted,
+                )),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines).block(panel(Line::from(" Status "), false)),
+                rows[1],
+            );
+        }
+    }
+
     fn render_toast(&self, frame: &mut Frame, area: Rect) {
         let line = match &self.toast {
             Some(t) if t.error => Line::from(Span::styled(
@@ -2529,13 +2686,20 @@ impl App {
         if self.filter_editing {
             return vec![("type", "to filter"), ("⏎", "done"), ("esc", "clear")];
         }
+        if self.focus_sidebar {
+            return vec![
+                ("↑↓", "switch screen"),
+                ("⏎", "open"),
+                ("?", "help"),
+                ("q", "quit"),
+            ];
+        }
         let mut pairs = match self.screen {
             Screen::Activity => vec![
                 ("↑↓", "move"),
                 ("⏎", "actions"),
                 ("/", "search"),
                 ("f", "filter"),
-                ("x", "explain"),
                 ("e", if self.enabled { "turn off" } else { "turn on" }),
             ],
             Screen::Review => vec![
@@ -2558,7 +2722,7 @@ impl App {
         if self.undo.is_some() {
             pairs.push(("u", "undo"));
         }
-        pairs.extend([("tab", "screens"), ("?", "help"), ("q", "quit")]);
+        pairs.extend([("esc", "sidebar"), ("?", "help"), ("q", "quit")]);
         pairs
     }
 
@@ -2577,61 +2741,50 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    fn render_activity(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(area);
+    /// Splits a window into a list box and a detail box when there is room.
+    fn split_list_detail(area: Rect) -> (Rect, Option<Rect>) {
+        if area.width >= DETAIL_MIN_WIDTH {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+                .split(area);
+            (cols[0], Some(cols[1]))
+        } else {
+            (area, None)
+        }
+    }
 
-        let mut summary = vec![
-            Span::styled(
-                if self.fcitx5_running {
-                    " Fcitx5 running"
-                } else {
-                    " Fcitx5 stopped"
-                },
-                Style::default().fg(if self.fcitx5_running {
-                    MUTED
-                } else {
-                    Color::Yellow
-                }),
-            ),
-            Span::styled(
-                format!(" · Vietnamese {}", if self.vi_lotus { "on" } else { "off" }),
-                Style::default().fg(MUTED),
-            ),
-            Span::raw("   "),
-            Span::styled("Last 24 h: ", Style::default().fg(MUTED)),
-            Span::styled(
-                format!("{} fixes", self.day_fixes),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" · {} undone", self.day_undone),
-                Style::default().fg(MUTED),
-            ),
-            Span::styled(
-                format!(" · {} fixed by you", self.day_by_hand),
-                Style::default().fg(MUTED),
-            ),
-        ];
+    fn row_style(&self) -> Style {
+        if self.focus_sidebar {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            selected_style()
+        }
+    }
+
+    fn render_activity(&self, frame: &mut Frame, area: Rect) {
+        let focused = !self.focus_sidebar;
+        let (list_area, detail_area) = Self::split_list_detail(area);
+
+        let mut title = String::from(" Activity");
         if self.activity_filter != ActivityFilter::All {
-            summary.push(Span::styled(
-                format!("   showing {}", self.activity_filter.label()),
-                Style::default().fg(ACCENT),
-            ));
+            title.push_str(&format!(" · {}", self.activity_filter.label()));
         }
         if self.filter_editing || !self.activity_search.is_empty() {
-            summary.push(Span::styled(
-                format!(
-                    "   / {}{}",
-                    self.activity_search,
-                    if self.filter_editing { "▏" } else { "" }
-                ),
-                Style::default().fg(ACCENT),
+            title.push_str(&format!(
+                " · / {}{}",
+                self.activity_search,
+                if self.filter_editing { "▏" } else { "" }
             ));
         }
-        frame.render_widget(Paragraph::new(Line::from(summary)), chunks[0]);
+        title.push_str(&format!(" ({}) ", self.activity_view.len()));
+        let block = panel(Line::from(title), focused);
+        let inner = block.inner(list_area);
+        frame.render_widget(block, list_area);
+
+        if let Some(d) = detail_area {
+            self.render_activity_detail(frame, d);
+        }
 
         if self.activity_view.is_empty() {
             let text = if self.activity.is_empty() {
@@ -2639,11 +2792,11 @@ impl App {
             } else {
                 "Nothing matches. Press esc to clear the search or f to change the filter."
             };
-            frame.render_widget(empty_state(text), chunks[1]);
+            frame.render_widget(empty_state(text), inner);
             return;
         }
 
-        let narrow = area.width < 80;
+        let narrow = inner.width < 70;
         let now = current_epoch_ms();
         let rows: Vec<Row> = self
             .activity_view
@@ -2706,48 +2859,105 @@ impl App {
         .style(Style::default().fg(MUTED));
         let table = Table::new(rows, widths)
             .header(header)
-            .row_highlight_style(selected_style())
-            .highlight_symbol("▶ ")
-            .highlight_spacing(HighlightSpacing::Always);
+            .row_highlight_style(self.row_style());
         let mut state = TableState::default();
         state.select(Some(self.activity_idx));
-        frame.render_stateful_widget(table, chunks[1], &mut state);
+        frame.render_stateful_widget(table, inner, &mut state);
+    }
+
+    fn render_activity_detail(&self, frame: &mut Frame, area: Rect) {
+        let block = panel(Line::from(" Details "), false);
+        let muted = Style::default().fg(MUTED);
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(row) = self.selected_activity() {
+            let now = current_epoch_ms();
+            let kv = |k: &str, v: String| {
+                Line::from(vec![
+                    Span::styled(format!("{k:<6}"), Style::default().fg(MUTED)),
+                    Span::raw(v),
+                ])
+            };
+            lines.push(Line::from(Span::styled(
+                if row.change.is_empty() {
+                    row.why.clone()
+                } else {
+                    row.change.clone()
+                },
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            if !row.change.is_empty() {
+                lines.push(kv("Why", row.why.clone()));
+            }
+            if !row.note.is_empty() {
+                lines.push(kv("Note", row.note.clone()));
+            }
+            if row.ts_ms > 0 {
+                lines.push(kv(
+                    "When",
+                    format!("{} ago", format_age_ago(now, row.ts_ms)),
+                ));
+            }
+            if let Some(app) = row.app.as_deref().filter(|a| !a.is_empty()) {
+                let lang = if row.lang != "en" && row.lang != "-" {
+                    format!(" [{}]", row.lang)
+                } else {
+                    String::new()
+                };
+                lines.push(kv("App", format!("{app}{lang}")));
+            }
+            if row.repeat > 1 {
+                lines.push(kv("Seen", format!("{}× in a row", row.repeat)));
+            }
+            let actions = activity_actions(row);
+            if !actions.is_empty() {
+                lines.push(Line::from(""));
+            }
+            for a in actions {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}  ", a.key),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(a.label),
+                ]));
+                lines.push(Line::from(Span::styled(format!("   {}", a.hint), muted)));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                "Select a row to see what happened and what you can do about it.",
+                muted,
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(block),
+            area,
+        );
     }
 
     fn render_review(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(area);
-        let mut head = vec![Span::styled(
-            match self.review.len() {
-                0 => " Nothing needs a decision".to_string(),
-                1 => " 1 thing SmartKey is unsure about".to_string(),
-                n => format!(" {n} things SmartKey is unsure about"),
-            },
-            Style::default().add_modifier(Modifier::BOLD),
-        )];
-        if self.review_hidden > 0 {
-            head.push(Span::styled(
-                format!(
-                    "   +{} one-off typos being watched; they only become rules if you repeat them",
-                    self.review_hidden
-                ),
-                Style::default().fg(MUTED),
-            ));
-        }
+        let focused = !self.focus_sidebar;
+        let (list_area, detail_area) = Self::split_list_detail(area);
+
+        let mut title = format!(" Review ({})", self.review.len());
         if !self.review_marked.is_empty() {
-            head.push(Span::styled(
-                format!("   {} marked", self.review_marked.len()),
-                Style::default().fg(ACCENT),
-            ));
+            title.push_str(&format!(" · {} marked", self.review_marked.len()));
         }
-        frame.render_widget(Paragraph::new(Line::from(head)), chunks[0]);
+        title.push(' ');
+        let block = panel(Line::from(title), focused);
+        let inner = block.inner(list_area);
+        frame.render_widget(block, list_area);
+
+        if let Some(d) = detail_area {
+            self.render_review_detail(frame, d);
+        }
 
         if self.review.is_empty() {
             frame.render_widget(
-                empty_state("When SmartKey learns a rule, or a rule keeps getting undone, it shows up here for a yes or no."),
-                chunks[1],
+                empty_state("Nothing needs a decision. When SmartKey learns a rule, or a rule keeps getting undone, it shows up here for a yes or no."),
+                inner,
             );
             return;
         }
@@ -2776,38 +2986,95 @@ impl App {
             };
             let mut spans = vec![
                 Span::styled(mark, Style::default().fg(ACCENT)),
-                Span::raw(format!("{:<28} ", item.title)),
-                Span::styled(item.detail.clone(), Style::default().fg(MUTED)),
+                Span::raw(format!("{:<26} ", truncate(&item.title, 26))),
             ];
+            if detail_area.is_none() || inner.width >= 80 {
+                spans.push(Span::styled(
+                    item.detail.clone(),
+                    Style::default().fg(MUTED),
+                ));
+            }
             if let Some(w) = item.warning {
                 spans.push(Span::styled(
-                    format!("   {w}"),
+                    format!("  {w}"),
                     Style::default().fg(Color::Yellow),
                 ));
             }
             items.push(ListItem::new(Line::from(spans)));
         }
-        let list = List::new(items)
-            .highlight_style(selected_style())
-            .highlight_symbol("▶ ")
-            .highlight_spacing(HighlightSpacing::Always);
+        let list = List::new(items).highlight_style(self.row_style());
         let mut state = ListState::default();
         state.select(Some(selected_line));
-        frame.render_stateful_widget(list, chunks[1], &mut state);
+        frame.render_stateful_widget(list, inner, &mut state);
+    }
+
+    fn render_review_detail(&self, frame: &mut Frame, area: Rect) {
+        let block = panel(Line::from(" Details "), false);
+        let muted = Style::default().fg(MUTED);
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(item) = self.review.get(self.review_idx) {
+            lines.push(Line::from(Span::styled(
+                item.title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(item.detail.clone(), muted)));
+            if let Some(w) = item.warning {
+                lines.push(Line::from(Span::styled(
+                    w,
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            let (keep, remove) = item.section.actions_help();
+            lines.push(Line::from(""));
+            for (k, label, help) in [("a", "Keep", keep), ("d", "Remove", remove)] {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{k}  "),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(label),
+                ]));
+                lines.push(Line::from(Span::styled(format!("   {help}"), muted)));
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "space  ",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Mark, then A or D for all marked"),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "Nothing to review right now.",
+                muted,
+            )));
+        }
+        if self.review_hidden > 0 {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} one-off typos are being watched. They only become rules if you repeat them.",
+                    self.review_hidden
+                ),
+                muted,
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(block),
+            area,
+        );
     }
 
     fn render_dictionary(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(1),
-            ])
-            .split(area);
+        let focused = !self.focus_sidebar;
         let mut spans = vec![Span::raw(" ")];
-        for s in DictSection::ALL {
-            let style = if s == self.dict_section {
+        for (i, s) in DictSection::ALL.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" · ", Style::default().fg(RULE)));
+            }
+            let style = if *s == self.dict_section {
                 Style::default()
                     .fg(ACCENT)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -2818,19 +3085,21 @@ impl App {
                 format!("{} {}", s.label(), self.dict_counts[s.index()]),
                 style,
             ));
-            spans.push(Span::raw("   "));
         }
+        spans.push(Span::raw(" "));
+        let mut block = panel(Line::from(spans), focused);
         if self.filter_editing || !self.dict_filter.is_empty() {
-            spans.push(Span::styled(
+            block = block.title_bottom(Line::from(Span::styled(
                 format!(
-                    "/ {}{}",
+                    " / {}{} ",
                     self.dict_filter,
                     if self.filter_editing { "▏" } else { "" }
                 ),
                 Style::default().fg(ACCENT),
-            ));
+            )));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
 
         if self.dict_view.is_empty() {
             let text = if self.dict_filter.is_empty() {
@@ -2838,7 +3107,7 @@ impl App {
             } else {
                 "Nothing matches. Press esc to clear the filter."
             };
-            frame.render_widget(empty_state(text), chunks[2]);
+            frame.render_widget(empty_state(text), inner);
             return;
         }
         let rows: Vec<Row> = self
@@ -2865,33 +3134,39 @@ impl App {
             .header(
                 Row::new(self.dict_section.headers().to_vec()).style(Style::default().fg(MUTED)),
             )
-            .row_highlight_style(selected_style())
-            .highlight_symbol("▶ ")
-            .highlight_spacing(HighlightSpacing::Always);
+            .row_highlight_style(self.row_style());
         let mut state = TableState::default();
         state.select(Some(self.dict_idx));
-        frame.render_stateful_widget(table, chunks[2], &mut state);
+        frame.render_stateful_widget(table, inner, &mut state);
     }
 
     fn render_settings(&self, frame: &mut Frame, area: Rect) {
-        let wide = area.width >= 96;
-        let chunks = if wide {
-            Layout::default()
+        let focused = !self.focus_sidebar;
+        let (list_area, help_area) = if area.width >= DETAIL_MIN_WIDTH {
+            let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-                .split(area)
+                .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
+                .split(area);
+            (cols[0], cols[1])
         } else {
-            Layout::default()
+            let rows = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(3)])
-                .split(area)
+                .constraints([Constraint::Min(3), Constraint::Length(5)])
+                .split(area);
+            (rows[0], rows[1])
         };
 
-        let label_w = 24usize;
+        let block = panel(Line::from(" Settings "), focused);
+        let inner = block.inner(list_area);
+        frame.render_widget(block, list_area);
+
+        let label_w = 23usize;
+        let room_for_options = inner.width >= 54;
         let items: Vec<ListItem> = self
             .settings_rows
             .iter()
-            .map(|row| match row {
+            .enumerate()
+            .map(|(idx, row)| match row {
                 SettingsRow::Header(h) => ListItem::new(Line::from(Span::styled(
                     format!(" {h}"),
                     Style::default().add_modifier(Modifier::BOLD),
@@ -2903,7 +3178,11 @@ impl App {
                         .cloned()
                         .unwrap_or_default();
                     let mut spans = vec![Span::raw(format!("   {:<label_w$}", spec.label))];
-                    spans.extend(setting_value_spans(spec, &value, wide || area.width >= 70));
+                    spans.extend(setting_value_spans(
+                        spec,
+                        &value,
+                        room_for_options && idx == self.settings_idx,
+                    ));
                     ListItem::new(Line::from(spans))
                 }
                 SettingsRow::App {
@@ -2930,13 +3209,10 @@ impl App {
                 }
             })
             .collect();
-        let list = List::new(items)
-            .highlight_style(selected_style())
-            .highlight_symbol("▶")
-            .highlight_spacing(HighlightSpacing::Always);
+        let list = List::new(items).highlight_style(self.row_style());
         let mut state = ListState::default();
         state.select(Some(self.settings_idx));
-        frame.render_stateful_widget(list, chunks[0], &mut state);
+        frame.render_stateful_widget(list, inner, &mut state);
 
         let (title, body) = match self.settings_rows.get(self.settings_idx) {
             Some(SettingsRow::Setting(spec)) => (spec.label.to_string(), spec.help.to_string()),
@@ -2954,17 +3230,8 @@ impl App {
             Line::from(Span::styled(body, Style::default().fg(MUTED))),
         ])
         .wrap(Wrap { trim: true })
-        .block(if wide {
-            Block::default()
-                .borders(Borders::LEFT)
-                .border_style(Style::default().fg(RULE))
-                .padding(ratatui::widgets::Padding::horizontal(1))
-        } else {
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(RULE))
-        });
-        frame.render_widget(help, chunks[1]);
+        .block(panel(Line::from(" About this setting "), false));
+        frame.render_widget(help, help_area);
     }
 
     fn render_modal(&self, frame: &mut Frame, area: Rect, modal: &Modal) {
@@ -3091,6 +3358,7 @@ impl App {
         };
         let mut out = vec![
             row("1-4, tab", "switch screen"),
+            row("esc", "go to the sidebar (⏎ comes back)"),
             row("u", "undo the last change"),
             row("r", "reload from disk"),
             row("q", "quit"),
@@ -3102,6 +3370,7 @@ impl App {
                     "⏎",
                     "act on this fix: block it, keep it, add the word, explain",
                 ),
+                row("b a w p", "run that action directly (see Details)"),
                 row("/", "search"),
                 row("f", "show everything / fixes / undos / missed words"),
                 row("x", "explain any word"),
@@ -3130,6 +3399,23 @@ impl App {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn panel<'a>(title: Line<'a>, focused: bool) -> Block<'a> {
+    let (border, title_style) = if focused {
+        (
+            Style::default().fg(ACCENT),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (Style::default().fg(RULE), Style::default().fg(MUTED))
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border)
+        .title(title)
+        .title_style(title_style)
+}
 
 fn selected_style() -> Style {
     Style::default()
@@ -3651,7 +3937,7 @@ fn activity_actions(row: &ActivityRow) -> Vec<ActionItem> {
     if let Some(app) = app.filter(|a| !a.trim().is_empty()) {
         add(
             'p',
-            format!("Change how {app} is treated"),
+            format!("App mode for {app}"),
             "off, browser, chat, or prose".to_string(),
             RowAction::PickApp { app },
         );
@@ -4067,14 +4353,21 @@ mod tests {
         );
         let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
         let top = screen_text(&app, 110, 32);
-        let first_line = top.lines().next().unwrap();
         for label in ["1 Activity", "2 Review", "3 Dictionary", "4 Settings"] {
+            assert!(top.contains(label), "sidebar missing {label}:\n{top}");
+        }
+        assert!(top.contains("╭"), "panels should be drawn as boxes:\n{top}");
+        assert!(top.contains("Details"), "detail box missing:\n{top}");
+        assert!(top.contains("teh → the"), "activity row missing:\n{top}");
+
+        let compact = screen_text(&app, 60, 16);
+        let first_line = compact.lines().next().unwrap();
+        for label in ["1 Act", "2 Rev", "3 Dict", "4 Set"] {
             assert!(
                 first_line.contains(label),
-                "tab bar missing {label}: {first_line}"
+                "compact tab strip missing {label}: {first_line}"
             );
         }
-        assert!(top.contains("teh → the"), "activity row missing:\n{top}");
 
         for (w, h) in [(110u16, 32u16), (60, 16), (40, 12), (24, 8), (10, 4)] {
             for c in ['1', '2', '3', '4'] {
@@ -4377,6 +4670,59 @@ mod tests {
             app.settings_rows[app.settings_idx],
             SettingsRow::Header(_)
         ));
+    }
+
+    #[test]
+    fn sidebar_focus_switches_screens_and_letters_act_without_a_menu() {
+        let d = dirs("sidebar");
+        log_event(
+            &d.logs,
+            "kitty",
+            DiagnosticEvent::AutocorrectApplied {
+                typed: "coule".into(),
+                applied: "could".into(),
+                kind: MatchKind::KnownTypoDict,
+                total_count: 1,
+            },
+        );
+        let mut app = App::new(d.cfg.clone(), d.logs.clone(), test_reload);
+        assert!(!app.focus_sidebar);
+
+        press(&mut app, 'w');
+        assert!(app.modal.is_none());
+        assert!(store(&d).compiled().personal_dict.contains("coule"));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.focus_sidebar);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.screen, Screen::Review);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.screen, Screen::Settings);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.screen, Screen::Activity);
+
+        press(&mut app, 'e');
+        assert!(
+            store(&d).compiled().enabled,
+            "main keys must be ignored while the sidebar has focus"
+        );
+        let side = screen_text(&app, 110, 32);
+        assert!(side.contains("SmartKey"), "{side}");
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.focus_sidebar);
+        press(&mut app, '/');
+        type_text(&mut app, "zzz");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(
+            !app.focus_sidebar,
+            "esc clears a pending search before it leaves the window"
+        );
+        assert!(app.activity_search.is_empty());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.focus_sidebar);
     }
 
     #[test]
