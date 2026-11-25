@@ -42,39 +42,50 @@ Full command reference and app profiles: [docs/usage.md](./docs/usage.md).
 
 ## Install
 
-SmartKey runs inside Fcitx5 (>= 5.0.20). Install Fcitx5 from your distribution first (`sudo pacman -S fcitx5`, `sudo apt install fcitx5`, or `sudo dnf install fcitx5`), then route your session through it:
+```bash
+curl -fsSL https://github.com/segfawlt/smartkey/releases/latest/download/install.sh | bash
+```
+
+Requires Linux and **Fcitx5 (`>= 5.0.20`)**. Auto-detects Arch (`pacman`) or portable (`~/.local`, `glibc >= 2.36`, no root), verifies SHA-256, and handles install, update, uninstall, and status.
+
+<details>
+<summary>Fcitx5 setup &amp; manual install</summary>
+
+Install Fcitx5 from your distribution (`sudo pacman -S fcitx5`, `sudo apt install fcitx5`, or `sudo dnf install fcitx5`), then route your session through it:
 
 - **Wayland:** launch `fcitx5 -d` via autostart, set `XMODIFIERS=@im=fcitx`, and leave `GTK_IM_MODULE` unset so GTK4 apps use native Wayland text input.
 - **X11:** set `GTK_IM_MODULE=fcitx`, `QT_IM_MODULE=fcitx`, `XMODIFIERS=@im=fcitx` in `~/.xprofile` or `/etc/environment`.
 
-Run `smartkey status` after installing SmartKey to verify daemon, addon, and IM-environment routing.
+Run `smartkey status` after installing to verify the daemon, addon, and IM routing.
 
-### Prebuilt (recommended)
-
-Arch Linux (`x86_64`):
+#### Arch Linux (`x86_64`)
 
 ```bash
-curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.3.0-1-x86_64.pkg.tar.zst
-curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.3.0-1-x86_64.pkg.tar.zst.sha256
-sha256sum -c fcitx5-smartkey-0.3.0-1-x86_64.pkg.tar.zst.sha256
-sudo pacman -U ./fcitx5-smartkey-0.3.0-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.4.0-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.4.0-1-x86_64.pkg.tar.zst.sha256
+sha256sum -c fcitx5-smartkey-0.4.0-1-x86_64.pkg.tar.zst.sha256
+sudo pacman -U ./fcitx5-smartkey-0.4.0-1-x86_64.pkg.tar.zst
 fcitx5 -r -d
 smartkey status
 ```
 
-Generic Linux (`x86_64`, glibc >= 2.36; Debian 12+ / Ubuntu 24.04+ / Fedora 39+ / openSUSE), installs to `~/.local` with no root:
+#### Generic Linux (`x86_64`, glibc >= 2.36; Debian 12+ / Ubuntu 24.04+ / Fedora 39+ / openSUSE)
+
+Installs to `~/.local` with no root:
 
 ```bash
-curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.3.0-linux-x86_64.tar.zst
-curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.3.0-linux-x86_64.tar.zst.sha256
-sha256sum -c fcitx5-smartkey-0.3.0-linux-x86_64.tar.zst.sha256
-zstd -d -c fcitx5-smartkey-0.3.0-linux-x86_64.tar.zst | tar -xf -
-cd fcitx5-smartkey-0.3.0-linux-x86_64
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.4.0-linux-x86_64.tar.zst
+curl -LO https://github.com/segfawlt/smartkey/releases/latest/download/fcitx5-smartkey-0.4.0-linux-x86_64.tar.zst.sha256
+sha256sum -c fcitx5-smartkey-0.4.0-linux-x86_64.tar.zst.sha256
+zstd -d -c fcitx5-smartkey-0.4.0-linux-x86_64.tar.zst | tar -xf -
+cd fcitx5-smartkey-0.4.0-linux-x86_64
 ./install.sh
 smartkey status
 ```
 
 On older distros (e.g. Ubuntu 22.04 with glibc 2.35) or `aarch64`, build from source instead.
+
+</details>
 
 ## Build from source
 
@@ -83,15 +94,15 @@ Dependencies: Rust stable toolchain, `cmake >= 3.20`, and Fcitx5 development hea
 ```bash
 git clone https://github.com/segfawlt/smartkey.git
 cd smartkey
-./adapters/fcitx5-smartkey/scripts/install-local.sh   # user-local install to ~/.local (no root)
+./adapters/fcitx5-smartkey/scripts/install-local.sh   # or: ./scripts/install.sh --from-source
 smartkey status
-# To uninstall: ./adapters/fcitx5-smartkey/scripts/uninstall-local.sh
+# To uninstall: ./scripts/install.sh uninstall (or ./adapters/fcitx5-smartkey/scripts/uninstall-local.sh)
 ```
 
 Other build targets:
 
 - **Arch package:** `./scripts/build-arch-pkg.sh`, then `sudo pacman -U dist/fcitx5-smartkey-*.pkg.tar.zst`.
-- **Portable release bundle:** `./scripts/package-portable.sh --container` (builds inside Debian 12 for glibc >= 2.36 portability), outputs `dist/fcitx5-smartkey-0.3.0-linux-x86_64.tar.zst`.
+- **Portable release bundle:** `./scripts/package-portable.sh --container` (builds inside Debian 12 for glibc >= 2.36 portability), outputs `dist/fcitx5-smartkey-0.4.0-linux-x86_64.tar.zst`.
 - **Tests & corpus eval:** `cargo test --workspace` and `cargo run --release -p smartkey-cli --bin smartkey-dev -- eval`.
 
 ## Documentation

@@ -234,16 +234,18 @@ ${HIGHLIGHTS}
 
 ## Installation
 
-### Arch Linux (pacman)
+### Quick Install / Update (Recommended — Linux)
+Auto-detects Arch (\`pacman\`) or portable (\`~/.local\`), verifies SHA-256 checksums, and reloads Fcitx5:
+\`\`\`bash
+curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh | bash
+\`\`\`
+
+### Manual: Arch Linux (pacman)
 \`\`\`bash
 sudo pacman -U ${ARCH_ASSET}
 \`\`\`
-Or install/upgrade directly via the Arch release updater:
-\`\`\`bash
-curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install-release-arch.sh | bash
-\`\`\`
 
-### Portable Tarball (Any Linux distro with Fcitx5)
+### Manual: Portable Tarball (Any Linux distro with Fcitx5)
 \`\`\`bash
 tar -xf ${PORTABLE_ASSET}
 cd ${PKGNAME}-${NEW_VER}-${PORTABLE_ARCH}
@@ -261,6 +263,7 @@ if [ "${DRY_RUN}" -eq 1 ]; then
     echo "Release title   : ${RELEASE_TITLE}"
     echo "Local install   : $([ "${NO_LOCAL_INSTALL}" -eq 1 ] && echo 'skip' || echo 'yes')"
     echo "Artifacts       :"
+    echo "  - scripts/install.sh"
     echo "  - dist/${PORTABLE_ASSET}"
     echo "  - dist/${PORTABLE_ASSET}.sha256"
     echo "  - dist/${ARCH_ASSET}"
@@ -312,6 +315,7 @@ rm -f "${DIST_DIR}/${PKGNAME}-${NEW_VER}-"*
 "${SCRIPT_DIR}/build-arch-pkg.sh"
 
 ASSETS=(
+    "${SCRIPT_DIR}/install.sh"
     "${DIST_DIR}/${PORTABLE_ASSET}"
     "${DIST_DIR}/${PORTABLE_ASSET}.sha256"
     "${DIST_DIR}/${ARCH_ASSET}"
