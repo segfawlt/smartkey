@@ -7,6 +7,14 @@ use crate::scorer::{allows_personal_proper_case, is_staged_rejection_pair_for, U
 use crate::store::{RuleStore, UndoResolution};
 use crate::types::{LangId, SpaceHabitKind};
 
+#[inline]
+fn is_lexicon_known_word(lex: &PackLexicon, lower: &str) -> bool {
+    lex.contains_any_variant_or_elided(lower)
+        || (!lex.syllable_dict().is_empty()
+            && crate::vi_telex::is_dict_word_in(lex.syllable_dict(), lower))
+        || lex.is_slang_word(lower)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
@@ -411,7 +419,7 @@ pub fn resolve_restored_edit(
         // immediate `1x` block. Editing to a 3rd word (`"dont" -> "don't" -> BS -> "donut "`) is weak
         // evidence against the contraction — it may simply have been a different intended word.
         let pair_blocked = reject_pair_permanently(store, lexicon, lang, &raw_lower, &rej_lower);
-        let rej_in_lexicon = lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&rej_lower));
+        let rej_in_lexicon = lexicon.is_some_and(|l| is_lexicon_known_word(l, &rej_lower));
         if !rej_in_lexicon && store.is_explicit_personal_word(lang, &rej_lower) {
             let demote_key = format!("demote:{}:{}", lang.as_str(), rej_lower);
             let cnt = {
@@ -537,13 +545,13 @@ fn record_manual_edit_inner(
                     .is_some_and(|p| p == fixed_trimmed)
             }) && store.is_pair_blocked(&fixed_lower, &fixed_lower);
             let is_non_lex_word = active_lex.is_none_or(|l| {
-                !l.contains_any_variant_or_elided(&fixed_lower)
+                !is_lexicon_known_word(l, &fixed_lower)
                     && l.lookup_known_typos(&fixed_lower).is_none()
             });
             let is_stretch = !store.is_personal_word(&fixed_lower)
                 && is_expressive_stretch(&fixed_lower, |w| {
                     store.is_personal_word(w)
-                        || active_lex.is_some_and(|l| l.contains_any_variant_or_elided(w))
+                        || active_lex.is_some_and(|l| is_lexicon_known_word(l, w))
                 });
             if !is_stretch
                 && (has_internal_upper || is_tech_word || is_blocked_proper || is_non_lex_word)
@@ -878,14 +886,14 @@ fn record_manual_edit_inner(
     // or promoting a known typo like `recieve` into `personal_dict`).
     let mut target_is_novel_unknown = false;
     if let Some(lex) = active_lex {
-        if !lex.contains_any_variant_or_elided(&fixed_lower)
+        if !is_lexicon_known_word(lex, &fixed_lower)
             && !store.is_personal_word(&fixed_lower)
         {
             let is_key_bounce_extension = fixed_lower.starts_with(&orig_lower)
                 && fixed_chars.len() == orig_chars.len() + 1
                 && fixed_chars.last() == orig_chars.last();
             let is_stretch = is_expressive_stretch(&fixed_lower, |w| {
-                store.is_personal_word(w) || lex.contains_any_variant_or_elided(w)
+                store.is_personal_word(w) || is_lexicon_known_word(lex, w)
             });
             if fixed_chars.len() < 4
                 || is_key_bounce_extension
@@ -909,7 +917,7 @@ fn record_manual_edit_inner(
     // Guard 2: Valid-Word Shield (`"form" -> "from"` must NEVER learn as a global unigram rule!).
     // Core lexicon words are permanently shielded; `personal_dict`-only words can be un-dictionaried
     // if the user manually fixes them into another word `2x`.
-    let orig_in_lexicon = active_lex.is_some_and(|l| l.contains_any_variant_or_elided(&orig_lower));
+    let orig_in_lexicon = active_lex.is_some_and(|l| is_lexicon_known_word(l, &orig_lower));
 
     if !orig_in_lexicon {
         if orig_chars.len() < 2 {
@@ -1132,7 +1140,7 @@ pub fn record_untouched_unknown(
         // Never pollute `personal_dict` with expressive stretches (`soooo`, `trờiiii`)
         if is_expressive_stretch(&lower, |w| {
             store.is_personal_word(w)
-                || lexicon.is_some_and(|l| l.contains_any_variant_or_elided(w))
+                || lexicon.is_some_and(|l| is_lexicon_known_word(l, w))
         }) {
             return LearnEvent::None;
         }
@@ -1202,7 +1210,7 @@ pub fn record_untouched_unknown(
         }
         if !has_internal_upper
             && !is_cased_tech_word
-            && lexicon.is_some_and(|l| l.contains_any_variant_or_elided(&lower))
+            && lexicon.is_some_and(|l| is_lexicon_known_word(l, &lower))
         {
             return LearnEvent::None;
         }
@@ -1213,7 +1221,16 @@ pub fn record_untouched_unknown(
             .staged_undo_keep
             .iter()
             .any(|(k, &v)| v >= 1 && k.starts_with(&undo_prefix));
-        if !has_prior_undo && lexicon.is_some_and(|l| l.lookup_known_typos(&lower).is_some()) {
+        if char_count < 3 && !has_prior_undo {
+            return LearnEvent::None;
+        }
+        if !has_prior_undo
+            && lexicon.is_some_and(|l| {
+                l.lookup_known_typos(&lower).is_some()
+                    || l.rules().replacements.iter().any(|r| r.typed == lower)
+                    || l.lookup_shorthand(&lower).is_some()
+            })
+        {
             return LearnEvent::None;
         }
 
@@ -1352,7 +1369,7 @@ fn is_valid_prose_word_for_space(
         return false;
     }
     match lexicon {
-        Some(lex) => lex.contains_any_variant_or_elided(lower) || store.is_personal_word(lower),
+        Some(lex) => is_lexicon_known_word(lex, lower) || store.is_personal_word(lower),
         None => true,
     }
 }

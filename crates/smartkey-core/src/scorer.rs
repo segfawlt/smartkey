@@ -637,7 +637,14 @@ impl LatinScorer {
                     let exp_lower = r.fix.to_lowercase();
                     if !rules.is_pair_blocked(&core_lower, &exp_lower) {
                         let projected = project_case(&r.fix, cap_initial);
-                        let rep = wrap(&projected);
+                        let rep = if leading_quotes.is_empty()
+                            && !trailing_quotes.is_empty()
+                            && r.fix.contains('\'')
+                        {
+                            projected
+                        } else {
+                            wrap(&projected)
+                        };
                         if rep != token {
                             return (
                                 EvalOutcome::Autocorrect {

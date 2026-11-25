@@ -70,6 +70,7 @@ pub const CASING_EXCLUSIONS: &[&str] = &[
 /// Two-letter `xY` units/notations excluded from 2-char Caps Lock inversion (`iS -> Is`).
 const TWO_CHAR_CAPSLOCK_EXCLUSIONS: &[&str] = &[
     "pH", "dB", "kB", "mB", "gB", "tB", "mA", "mV", "mW", "kW", "kV", "nM", "uM", "mM", "iO",
+    "aI", "oS",
 ];
 
 use crate::lexicon::CasingRules;

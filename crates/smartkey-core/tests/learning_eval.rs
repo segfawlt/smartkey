@@ -2687,3 +2687,108 @@ fn space_shift_undo_blocks_pair_and_adjusts_habit_brake() {
         assert!(engine.store().space_habit_boost(SpaceHabitKind::LateSpace) < 0.0);
     }
 }
+
+#[test]
+fn vi_syllable_validation_untouched_guards_trailing_quote_and_ai_shift_slip() {
+    use smartkey_core::learner::{record_manual_edit, record_untouched_unknown};
+    use smartkey_core::PackLexicon;
+
+    // 1. VI manual fixes (<4 chars) validate against syllable_dict instead of failing TargetNotValidWord,
+    //    and untouched VI syllables/slang never graduate into personal_dict.
+    {
+        let mut store = RuleStore::in_memory(Preset::Balanced);
+        let vi_lex = PackLexicon::from_bundled_vi().expect("bundled vi lexicon");
+        let vi = LangId::vi();
+
+        let ev_di = record_manual_edit(&mut store, Some(&vi_lex), &vi, None, "đ", "đi");
+        assert!(
+            matches!(ev_di, LearnEvent::Ignored(SkipReason::ValidWordNoContext)),
+            "valid VI syllable `đ -> đi` without context must hit ValidWordNoContext, not TargetNotValidWord: {ev_di:?}"
+        );
+
+        let ev_truu = record_manual_edit(&mut store, Some(&vi_lex), &vi, None, "trừu", "trừ");
+        assert!(
+            matches!(ev_truu, LearnEvent::Ignored(SkipReason::ValidWordNoContext)),
+            "valid VI syllable `trừu -> trừ` without context must hit ValidWordNoContext: {ev_truu:?}"
+        );
+
+        let ev_tru = record_manual_edit(&mut store, Some(&vi_lex), &vi, None, "trùu", "trừ");
+        assert!(
+            matches!(ev_tru, LearnEvent::StagedCorrection { count: 1, .. }),
+            "typo `trùu` -> valid VI syllable `trừ` must stage at 1x: {ev_tru:?}"
+        );
+
+        assert_eq!(
+            record_untouched_unknown(&mut store, Some(&vi_lex), &vi, "đi"),
+            LearnEvent::None
+        );
+        assert_eq!(
+            record_untouched_unknown(&mut store, Some(&vi_lex), &vi, "ae"),
+            LearnEvent::None
+        );
+    }
+
+    // 2. EN untouched_unknowns blocks built-in contractions (`didnt`) and unconfirmed 2-char noise
+    //    (`od`, `sp`, `aj`) while keeping 3-char OOV brands (`dux`) eligible.
+    {
+        let mut store = RuleStore::in_memory(Preset::Balanced);
+        let en_lex = PackLexicon::from_bundled().expect("bundled en lexicon");
+        let en = LangId::en();
+
+        for blocked_tok in ["didnt", "od", "sp", "aj"] {
+            for _ in 0..3 {
+                assert_eq!(
+                    record_untouched_unknown(&mut store, Some(&en_lex), &en, blocked_tok),
+                    LearnEvent::None,
+                    "{blocked_tok:?} must not stage or graduate via untouched_3x"
+                );
+            }
+            assert!(!store.is_personal_word(blocked_tok));
+        }
+
+        for _ in 0..3 {
+            record_untouched_unknown(&mut store, Some(&en_lex), &en, "dux");
+        }
+        assert!(
+            store.is_personal_word("dux"),
+            "3-char brand `dux` must remain eligible for untouched_3x graduation"
+        );
+    }
+
+    // 3 & 4. Lone trailing apostrophe on contractions (`thats'` -> `that's`, preserving `'thats'` -> `'that's'`),
+    //        and 2-char shift-slip exclusions (`aI` stays unchanged, `iS` -> `Is`).
+    {
+        let store = RuleStore::in_memory(Preset::Balanced);
+        let engine = SmartKeyEngine::new_bundled(store).unwrap();
+        let ctx = EvalContext::default();
+
+        assert!(matches!(
+            engine.evaluate_token("thats'", &ctx),
+            EvalOutcome::Autocorrect {
+                ref replacement,
+                kind: MatchKind::Contraction,
+                ..
+            } if replacement == "that's"
+        ));
+        assert!(matches!(
+            engine.evaluate_token("'thats'", &ctx),
+            EvalOutcome::Autocorrect {
+                ref replacement,
+                kind: MatchKind::Contraction,
+                ..
+            } if replacement == "'that's'"
+        ));
+        assert!(matches!(
+            engine.evaluate_token("aI", &ctx),
+            EvalOutcome::Unchanged { .. }
+        ));
+        assert!(matches!(
+            engine.evaluate_token("iS", &ctx),
+            EvalOutcome::Autocorrect {
+                ref replacement,
+                kind: MatchKind::ShiftSlip,
+                ..
+            } if replacement == "Is"
+        ));
+    }
+}
