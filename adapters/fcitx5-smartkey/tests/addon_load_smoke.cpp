@@ -647,6 +647,51 @@ void verifyBackspaceCapabilityAndDroppedDeleteGuard() {
     }
 }
 
+void verifyMidwordPrefixReplaceGuard() {
+    using fcitx::smartkey::hasPrecedingWordChar;
+    using fcitx::smartkey::LotusBridgeTracker;
+    using fcitx::smartkey::SurroundingSyncTracker;
+
+    // Mid-word suffixes (must abort replacement):
+    assert(hasPrecedingWordChar("hocj", 4, 2));          // "ho" + "cj"
+    assert(hasPrecedingWordChar("đến hocj", 8, 2));      // multi-byte prefix + "ho" + "cj"
+    assert(hasPrecedingWordChar("insert", 6, 3));        // "ins" + "ert"
+    assert(hasPrecedingWordChar("100ms", 5, 2));         // "100" + "ms"
+    assert(hasPrecedingWordChar("tiếngteh", 8, 3));      // non-ASCII letter 'g'/'ế' before "teh"
+    assert(hasPrecedingWordChar("Đcj", 3, 2));           // 'Đ' before "cj"
+
+    // Whole-word boundaries (safe to replace):
+    assert(!hasPrecedingWordChar("cj", 2, 2));           // buffer start
+    assert(!hasPrecedingWordChar("đến cj", 6, 2));       // after space
+    assert(!hasPrecedingWordChar("(cj", 3, 2));          // after '('
+    assert(!hasPrecedingWordChar("\"cj", 3, 2));         // after '"'
+    assert(!hasPrecedingWordChar("“cj", 3, 2));          // after U+201C curly quote
+    assert(!hasPrecedingWordChar("foo-bar", 7, 3));      // after '-'
+    assert(!hasPrecedingWordChar("\xFF" "cj", 3, 2));  // malformed UTF-8 -> 0xFFFD fails open
+    assert(!hasPrecedingWordChar("cj", 2, 0));           // deleteChars == 0
+    assert(!hasPrecedingWordChar("cj", 20000, 2));       // cursor > 16384 bound
+
+    // Speculative burst clearing on untouched forwarded letters lets Wayland SurroundingText
+    // stay synced through `lotus_defer_boundary` so mid-word guards & atomic deletes fire.
+    LotusBridgeTracker lotus{};
+    SurroundingSyncTracker sync{};
+    lotus.armBurst(1000);
+    sync.markClientMutated();
+    assert(lotus.isInBurst(1004));
+    // Untouched forwarded char in PostInputMethod clears speculative burst:
+    if (!lotus.hasActivityInWord() && !lotus.hasPendingBoundary) {
+        lotus.clearBurst();
+    }
+    assert(!lotus.isInBurst(1004));
+    sync.markSurroundingUpdated();
+    assert(sync.surroundingSynced);
+    // `lotus_defer_boundary` arms burst & boundary without `markClientMutated()`:
+    lotus.armBurst(1050);
+    lotus.setBoundary(' ');
+    assert(sync.canUseDeleteSurrounding(true, true, 6, 2, "wayland_v2"));
+    assert(hasPrecedingWordChar("đến hocj", 8, 2));
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -655,6 +700,7 @@ int main(int argc, char *argv[]) {
     verifyWaylandSurroundingSyncAndDelayedTimer();
     verifyTraceRecorderHelpers();
     verifyBackspaceCapabilityAndDroppedDeleteGuard();
+    verifyMidwordPrefixReplaceGuard();
     if (argc < 2) {
         std::cerr << "usage: addon_load_smoke <libsmartkey.so>\n";
         return 2;

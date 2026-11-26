@@ -924,14 +924,14 @@ void SmartKeyAddon::applyReplaceAction(InputContext *ic, SmartKeyState *state,
             ic->capabilityFlags().test(CapabilityFlag::SurroundingText),
             ic->surroundingText().isValid(), ic->surroundingText().cursor(),
             act.delete_chars, ic->frontendName());
-        if (!surroundUsable && !fallbackAvailable) {
+        auto abortReplace = [&](std::string_view traceOut) {
             flushPendingDelayedCommit(ic, state);
             state->markClientMutated();
             disarmSessionJustAutocorrected(state, monotonicNowMs());
             if (canTraceContext(ic, normalizeProgramId(ic->program()))) {
                 TraceEventFields f{};
                 f.ev = "replace";
-                f.out = "aborted_no_delete";
+                f.out = traceOut;
                 f.hasDel = true;
                 f.del = act.delete_chars;
                 if (act.insert_utf8 != nullptr && act.insert_byte_len > 0) {
@@ -945,6 +945,16 @@ void SmartKeyAddon::applyReplaceAction(InputContext *ic, SmartKeyState *state,
                 emitTraceRecord(trace_, ic, state, appName, imName,
                                 monotonicNowMs(), f);
             }
+        };
+        if (surroundUsable &&
+            hasPrecedingWordChar(ic->surroundingText().text(),
+                                 ic->surroundingText().cursor(),
+                                 act.delete_chars)) {
+            abortReplace("aborted_midword_prefix");
+            return;
+        }
+        if (!surroundUsable && !fallbackAvailable) {
+            abortReplace("aborted_no_delete");
             return;
         }
     }
@@ -1044,6 +1054,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         if (rawKey.sym() == FcitxKey_Pause) {
             const bool lateEchoSuspect = state->takeLotusLateEchoSuspect(nowMs);
             state->markLotusActivity();
+            state->markClientMutated();
             state->rearmLotusBurstEcho(nowMs);
             state->setSuppressPostKey(true);
             if (trace) {
@@ -1066,6 +1077,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
              rawKey.sym() == FcitxKey_Left ||
              rawKey.sym() == FcitxKey_Delete)) {
             state->markLotusActivity();
+            state->markClientMutated();
             state->rearmLotusBurstEcho(nowMs);
             state->setSuppressPostKey(true);
             if (trace) {
@@ -1148,6 +1160,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         // types non-boundary letter(s) of the next word into `LotusState::bufferedKeys_`,
         // queue them for replay after `onCommitString` finishes evaluating the prior word.
         bool boundaryAbortedNav = false;
+        std::vector<uint32_t> orphanPostChars;
         if (state->hasPendingBoundary()) {
             if (keyKind == SMARTKEY_KEY_CHAR &&
                 !isSmartKeyBoundaryChar(codepoint) &&
@@ -1167,12 +1180,17 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
                 return;
             }
             boundaryAbortedNav = true;
+            orphanPostChars = state->takePostBoundaryChars();
             state->clearPendingBoundary();
             state->takeLotusActivityInWord();
+            state->markClientMutated();
             SmartKeyAction unused{};
             smartkey_session_process_key(state->session(), engine_,
                                          SMARTKEY_KEY_NAV_OR_CLICK, 0, nowMs,
                                          &unused);
+            if (keyKind == SMARTKEY_KEY_CHAR && !orphanPostChars.empty()) {
+                replayPostBoundaryChars(state, engine_, orphanPostChars, nowMs);
+            }
         }
 
         // Record non-boundary letters (`a..z`, etc.) passively in `PreInputMethod` so SmartKey
@@ -1237,7 +1255,6 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         // For word-break/lookahead chars (`Space`, `,`, `.`, `!`, `?`, etc.), `BackSpace`,
         // `Enter`, `Tab`, and cursor nav: defer to `onPostKeyEvent` (if Lotus forwards) or
         // `onCommitString` (if Lotus filters the boundary to restore/commit).
-        state->markClientMutated();
         std::string_view outLabel;
         if (keyKind == SMARTKEY_KEY_CHAR && isSmartKeyBoundaryChar(codepoint)) {
             state->armLotusBurst(nowMs);
@@ -1246,6 +1263,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
                            ? "boundary_aborted_nav+lotus_defer_boundary"
                            : "lotus_defer_boundary";
         } else {
+            state->markClientMutated();
             state->clearPendingBoundary();
             outLabel = boundaryAbortedNav
                            ? "boundary_aborted_nav+lotus_defer_other"
@@ -1395,8 +1413,16 @@ void SmartKeyAddon::onPostKeyEvent(KeyEvent &keyEvent) {
     }
 
     // Shortcut resets and non-boundary letters were already recorded in `onKeyEvent` (`PreInputMethod`).
-    if (isShortcutReset ||
-        (keyKind == SMARTKEY_KEY_CHAR && !isSmartKeyBoundaryChar(codepoint))) {
+    // Reaching `PostInputMethod` on a non-boundary char while `!hasLotusActivityInWord()` proves
+    // `LotusState::keyEvent` forwarded the key untouched without starting a uinput burst, so disarm
+    // the speculative `armLotusBurst` window to let Wayland `SurroundingTextUpdated` sync normally.
+    if (keyKind == SMARTKEY_KEY_CHAR && !isSmartKeyBoundaryChar(codepoint)) {
+        if (!state->hasLotusActivityInWord() && !state->hasPendingBoundary()) {
+            state->clearLotusBurst();
+        }
+        return;
+    }
+    if (isShortcutReset) {
         return;
     }
 

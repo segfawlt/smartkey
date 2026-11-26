@@ -260,3 +260,5 @@ telegram
 grab
 tiki
 zalopay
+cno
+elo

@@ -892,3 +892,40 @@ fn test_vi_lotus_undo_demotes_machine_learned_but_preserves_manual_telex_passthr
     let (next_buf2, _) = type_sequence(&mut session2, &mut engine2, "anh did ");
     assert_eq!(next_buf2, "anh đi ");
 }
+
+#[test]
+fn test_vi_lotus_shields_short_fuzzy_english_and_ascii_english_transpositions() {
+    let (mut engine, mut session) = make_vi_engine_and_session();
+
+    // 1. Short <=3-char tokens (`cno`, `cso`, `nso`, `ceo`, `prm`, `elo`) must NOT get hijacked by
+    //    English `FuzzyLexicon` guesses (`con`, `soc`, `son`, `eco`, `rpm`), while curated
+    //    `KnownTypoDict` (`teh -> the`) and contractions (`dont -> don't`) still work.
+    //    `cno` and `elo` are also shielded in `dicts/vi/slang.txt` (`do_not_learn`).
+    let (short_buf, _) = type_sequence(&mut session, &mut engine, "cno cso nso ceo prm elo teh dont ");
+    assert_eq!(short_buf, "cno cso nso ceo prm elo the don't ");
+    let _ = session.reset(&mut engine);
+    assert!(
+        !engine.store().state().untouched_unknowns.contains_key("vi:cno"),
+        "cno must be shielded by VI slang"
+    );
+    assert!(
+        !engine.store().state().untouched_unknowns.contains_key("vi:elo"),
+        "elo must be shielded by VI slang"
+    );
+
+    // 2. Pure-ASCII English transpositions (`dcos`, `lsit`, `msut`, `csat`, `tset`, `psat`) must
+    //    autocorrect to English (`docs`, `list`, `must`, `cast`, `test`, `past`) rather than
+    //    markless acute-tone Vietnamese (`dóc`, `lít`, `mút`, `cát`, `tét`, `pát`), while genuine
+    //    Vietnamese Telex rescues (`anfy -> này`, `hoagnf -> hoàng`, `ddeenes -> đến`, `scos -> sóc`,
+    //    `mcos -> móc`) still rescue to Vietnamese.
+    let _ = session.reset(&mut engine);
+    let (mixed_buf, _) = type_sequence(
+        &mut session,
+        &mut engine,
+        "dcos lsit msut csat tset psat anfy hoagnf ddeenes scos mcos ",
+    );
+    assert_eq!(
+        mixed_buf,
+        "docs list must cast test past này hoàng đến sóc móc "
+    );
+}

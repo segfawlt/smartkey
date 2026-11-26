@@ -722,6 +722,24 @@ impl SmartKeyEngine {
                     .store
                     .is_pair_blocked(&lower, &rescue.replacement.to_lowercase())
                 {
+                    let has_midword_vi_rune =
+                        sim.needs_uinput_restore_on_break || sim.is_composed_vietnamese;
+                    if !has_midword_vi_rune
+                        && !crate::vi_telex::has_vietnamese_mark(&rescue.replacement)
+                    {
+                        if let Some(scorer) = self.scorer() {
+                            if let outcome @ EvalOutcome::Autocorrect { kind, score, .. } =
+                                scorer.evaluate(token, ctx, self.store.scorer_config(), &self.store)
+                            {
+                                if score >= 0.34
+                                    && !(token.chars().count() <= 3
+                                        && kind == MatchKind::FuzzyLexicon)
+                                {
+                                    return outcome;
+                                }
+                            }
+                        }
+                    }
                     return EvalOutcome::Autocorrect {
                         replacement: rescue.replacement,
                         kind: MatchKind::VietnameseTelexRescue,
@@ -749,8 +767,26 @@ impl SmartKeyEngine {
         }
 
         // 5. Fallback to Layer 1 English scorer (`dont -> don't`, `teh -> the`, `chagnes -> changes`):
+        //    In `vi` mode, suppress `<= 3`-char statistical `FuzzyLexicon` guesses (`cno -> con`,
+        //    `cso -> soc`, `nso -> son`, `ceo -> eco`, `prm -> rpm`) while preserving `KnownTypoDict`,
+        //    contractions, shorthands, shift-slips, and `PersonalDict`.
         if let Some(scorer) = self.scorer() {
-            return scorer.evaluate(token, ctx, self.store.scorer_config(), &self.store);
+            let outcome = scorer.evaluate(token, ctx, self.store.scorer_config(), &self.store);
+            if token.chars().count() <= 3
+                && matches!(
+                    outcome,
+                    EvalOutcome::Autocorrect {
+                        kind: MatchKind::FuzzyLexicon,
+                        ..
+                    }
+                )
+            {
+                return EvalOutcome::Unchanged {
+                    reason: MatchKind::Bypass,
+                    do_not_learn: false,
+                };
+            }
+            return outcome;
         }
 
         EvalOutcome::Unchanged {

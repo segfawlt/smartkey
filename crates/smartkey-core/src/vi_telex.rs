@@ -1641,7 +1641,7 @@ fn apply_vietnamese_casing(raw_typed: &str, lower_vi: &str) -> String {
     lower_vi.to_string()
 }
 
-fn has_vietnamese_mark(word: &str) -> bool {
+pub(crate) fn has_vietnamese_mark(word: &str) -> bool {
     word.chars().any(|c| {
         let lower = c.to_lowercase().next().unwrap_or(c);
         let toneless = add_tone_to_char(lower, Tone::None);

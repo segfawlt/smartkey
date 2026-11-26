@@ -266,6 +266,93 @@ inline std::size_t stepUtf8Codepoint(std::string_view text, std::size_t idx) {
     return idx + len;
 }
 
+inline uint32_t decodeUtf8Codepoint(std::string_view text, std::size_t idx,
+                                    std::size_t &nextIdx) {
+    if (idx >= text.size()) {
+        nextIdx = text.size();
+        return 0xFFFD;
+    }
+    const unsigned char b0 = static_cast<unsigned char>(text[idx]);
+    if (b0 < 0x80) {
+        nextIdx = idx + 1;
+        return b0;
+    }
+    if (b0 >= 0xC2 && b0 <= 0xDF && idx + 1 < text.size()) {
+        const unsigned char b1 = static_cast<unsigned char>(text[idx + 1]);
+        if ((b1 & 0xC0) == 0x80) {
+            nextIdx = idx + 2;
+            return ((static_cast<uint32_t>(b0 & 0x1F) << 6) |
+                    static_cast<uint32_t>(b1 & 0x3F));
+        }
+    } else if (b0 >= 0xE0 && b0 <= 0xEF && idx + 2 < text.size()) {
+        const unsigned char b1 = static_cast<unsigned char>(text[idx + 1]);
+        const unsigned char b2 = static_cast<unsigned char>(text[idx + 2]);
+        const bool validLead =
+            (b0 != 0xE0 || b1 >= 0xA0) && (b0 != 0xED || b1 <= 0x9F);
+        if (validLead && (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80) {
+            nextIdx = idx + 3;
+            return ((static_cast<uint32_t>(b0 & 0x0F) << 12) |
+                    (static_cast<uint32_t>(b1 & 0x3F) << 6) |
+                    static_cast<uint32_t>(b2 & 0x3F));
+        }
+    } else if (b0 >= 0xF0 && b0 <= 0xF4 && idx + 3 < text.size()) {
+        const unsigned char b1 = static_cast<unsigned char>(text[idx + 1]);
+        const unsigned char b2 = static_cast<unsigned char>(text[idx + 2]);
+        const unsigned char b3 = static_cast<unsigned char>(text[idx + 3]);
+        const bool validLead =
+            (b0 != 0xF0 || b1 >= 0x90) && (b0 != 0xF4 || b1 <= 0x8F);
+        if (validLead && (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 &&
+            (b3 & 0xC0) == 0x80) {
+            nextIdx = idx + 4;
+            return ((static_cast<uint32_t>(b0 & 0x07) << 18) |
+                    (static_cast<uint32_t>(b1 & 0x3F) << 12) |
+                    (static_cast<uint32_t>(b2 & 0x3F) << 6) |
+                    static_cast<uint32_t>(b3 & 0x3F));
+        }
+    }
+    nextIdx = idx + 1;
+    return 0xFFFD;
+}
+
+inline bool isUnicodeWordCodepoint(uint32_t cp) {
+    if (cp < 0x80) {
+        return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') ||
+               (cp >= '0' && cp <= '9') || cp == '_';
+    }
+    if (cp < 0x00C0 || cp == 0x00D7 || cp == 0x00F7) {
+        return false;
+    }
+    if ((cp >= 0x2000 && cp <= 0x206F) || (cp >= 0x20A0 && cp <= 0x2BFF) ||
+        (cp >= 0x3000 && cp <= 0x303F) || (cp >= 0xFF01 && cp <= 0xFF0F) ||
+        (cp >= 0xFF1A && cp <= 0xFF20) || (cp >= 0xFF3B && cp <= 0xFF40) ||
+        (cp >= 0xFF5B && cp <= 0xFF65) || (cp >= 0xFFF0 && cp <= 0xFFFF)) {
+        return false;
+    }
+    return true;
+}
+
+inline bool hasPrecedingWordChar(std::string_view text, uint32_t cursorChars,
+                                 uint32_t deleteChars) {
+    if (deleteChars == 0 || cursorChars <= deleteChars ||
+        cursorChars > 16384) {
+        return false;
+    }
+    const uint32_t precedingCharIdx = cursorChars - deleteChars - 1;
+    std::size_t byteIdx = 0;
+    for (uint32_t cp = 0; cp < precedingCharIdx; ++cp) {
+        if (byteIdx >= text.size()) {
+            return false;
+        }
+        byteIdx = stepUtf8Codepoint(text, byteIdx);
+    }
+    if (byteIdx >= text.size()) {
+        return false;
+    }
+    std::size_t nextIdx = byteIdx;
+    const uint32_t prevCp = decodeUtf8Codepoint(text, byteIdx, nextIdx);
+    return isUnicodeWordCodepoint(prevCp);
+}
+
 inline bool isWaylandFrontend(std::string_view frontend) {
     return frontend == "wayland" || frontend == "wayland_v2";
 }
