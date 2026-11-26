@@ -1,5 +1,5 @@
 /*
- * SmartKey C/C++ FFI Header (v0.4.0)
+ * SmartKey C/C++ FFI Header (v0.4.1)
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 

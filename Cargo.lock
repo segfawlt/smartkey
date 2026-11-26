@@ -1458,7 +1458,7 @@ checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
 
 [[package]]
 name = "smartkey-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crossterm",
  "libc",
@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "smartkey-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "fst",
  "levenshtein_automata",
@@ -1484,14 +1484,14 @@ dependencies = [
 
 [[package]]
 name = "smartkey-ffi"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "smartkey-core",
 ]
 
 [[package]]
 name = "smartkey-tsf"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde_json",
  "smartkey-core",
