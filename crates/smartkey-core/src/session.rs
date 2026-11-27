@@ -2221,12 +2221,35 @@ impl SmartKeySession {
                             peak_before_bs = Some(buf.clone());
                         }
                     }
-                    buf.pop();
-                    self.mode = Mode::Composing {
-                        buf,
-                        peak_before_bs,
-                        origin,
-                    };
+                    if self.lang.as_str() == "vi" && self.lotus_composing {
+                        let opts = engine.store.lotus_options();
+                        let before_screen = engine
+                            .simulate_vi_lotus(&buf, opts)
+                            .preedit_before_break
+                            .chars()
+                            .count();
+                        buf.pop();
+                        while !buf.is_empty() {
+                            let after_screen = engine
+                                .simulate_vi_lotus(&buf, opts)
+                                .preedit_before_break
+                                .chars()
+                                .count();
+                            if after_screen < before_screen {
+                                break;
+                            }
+                            buf.pop();
+                        }
+                    } else {
+                        buf.pop();
+                    }
+                    if !(buf.is_empty() && self.lang.as_str() == "vi" && self.lotus_composing) {
+                        self.mode = Mode::Composing {
+                            buf,
+                            peak_before_bs,
+                            origin,
+                        };
+                    }
                 }
                 SessionOutput::passthrough()
             }

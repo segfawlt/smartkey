@@ -222,10 +222,64 @@ pub(crate) fn inspect_im_environment() -> (bool, Vec<String>) {
     }
 }
 
+#[cfg(not(windows))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LotusConfigSummary {
+    mode: String,
+    prefer_virtual_keyboard: bool,
+}
+
+#[cfg(not(windows))]
+fn parse_lotus_conf(contents: &str) -> Option<LotusConfigSummary> {
+    let mut mode: Option<String> = None;
+    let mut prefer_vk = true;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        if key == "Mode" && !val.is_empty() {
+            mode = Some(val.to_string());
+        } else if key == "PreferVirtualKeyboard" {
+            prefer_vk = !val.eq_ignore_ascii_case("false");
+        }
+    }
+    mode.map(|mode| LotusConfigSummary {
+        mode,
+        prefer_virtual_keyboard: prefer_vk,
+    })
+}
+
+#[cfg(not(windows))]
+fn inspect_lotus_config() -> Option<LotusConfigSummary> {
+    let config_root = env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| smartkey_core::resolve_home_dir().map(|h| h.join(".config")))?;
+    let path = config_root.join("fcitx5/conf/lotus.conf");
+    let contents = fs::read_to_string(path).ok()?;
+    parse_lotus_conf(&contents)
+}
+
+#[cfg(not(windows))]
+fn is_wayland_session() -> bool {
+    env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        || env::var("XDG_SESSION_TYPE")
+            .map(|s| s.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+}
+
 #[derive(Serialize)]
 struct StatusJson {
     enabled: bool,
     vi_lotus_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lotus_mode: Option<String>,
     trace_log: bool,
     fcitx5_running: bool,
     addon_library: Option<String>,
@@ -282,6 +336,12 @@ fn cmd_status(args: &[String]) -> CliResult {
     let fcitx_up = detect_fcitx5_running();
     let addon_so = detect_installed_addon();
     let (im_env_ok, im_env_warnings) = inspect_im_environment();
+    #[cfg(not(windows))]
+    let lotus_cfg = inspect_lotus_config();
+    #[cfg(windows)]
+    let lotus_mode_str: Option<String> = None;
+    #[cfg(not(windows))]
+    let lotus_mode_str = lotus_cfg.as_ref().map(|cfg| cfg.mode.clone());
 
     let total_applied: u32 = st.applied_counts.values().copied().sum();
     let total_undos: u32 = st.undo_counts.values().copied().sum();
@@ -305,6 +365,7 @@ fn cmd_status(args: &[String]) -> CliResult {
         let payload = StatusJson {
             enabled: c.enabled,
             vi_lotus_enabled: c.vi_lotus_enabled,
+            lotus_mode: lotus_mode_str,
             trace_log: c.diagnostics.trace_log,
             fcitx5_running: fcitx_up,
             addon_library: addon_so.map(|p| p.display().to_string()),
@@ -339,6 +400,28 @@ fn cmd_status(args: &[String]) -> CliResult {
             "DISABLED (vi-lotus)"
         }
     );
+    #[cfg(not(windows))]
+    if let Some(cfg) = lotus_cfg {
+        let mode_detail = if cfg.mode == "Preedit" && c.vi_lotus_enabled {
+            "Preedit (warning: vi-lotus bridge is inactive in Preedit mode; use Surrounding Text or Uinput)"
+                .to_string()
+        } else if cfg.mode == "Uinput (Super Smooth)" && is_wayland_session() {
+            if c.enabled && c.vi_lotus_enabled {
+                if cfg.prefer_virtual_keyboard {
+                    "Uinput (Super Smooth) | Wayland 0ms pacer=active (5ms)".to_string()
+                } else {
+                    "Uinput (Super Smooth) | uinput-server | Wayland 0ms pacer=active (5ms)"
+                        .to_string()
+                }
+            } else {
+                "Uinput (Super Smooth) (warning: enable SmartKey or use Surrounding Text / Uinput (Smooth) to avoid 0ms wireless key-roll races)"
+                    .to_string()
+            }
+        } else {
+            cfg.mode
+        };
+        println!("Lotus Mode           : {mode_detail}");
+    }
     println!(
         "Trace Recorder       : {}",
         if c.diagnostics.trace_log {
@@ -5658,5 +5741,27 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn parse_lotus_conf_handles_quoted_unquoted_and_comments() {
+        assert_eq!(parse_lotus_conf("# comment only\n"), None);
+        assert_eq!(
+            parse_lotus_conf(
+                "# Mode\nMode=\"Uinput (Super Smooth)\"\n# PreferVirtualKeyboard=False\n"
+            ),
+            Some(LotusConfigSummary {
+                mode: "Uinput (Super Smooth)".to_string(),
+                prefer_virtual_keyboard: true,
+            })
+        );
+        assert_eq!(
+            parse_lotus_conf("Mode=Preedit\nPreferVirtualKeyboard=False\n"),
+            Some(LotusConfigSummary {
+                mode: "Preedit".to_string(),
+                prefer_virtual_keyboard: false,
+            })
+        );
     }
 }

@@ -235,6 +235,22 @@ struct ScopedSelfCommit {
     ScopedSelfCommit &operator=(const ScopedSelfCommit &) = delete;
 };
 
+struct ScopedPacedReplay {
+    SmartKeyState *state;
+    explicit ScopedPacedReplay(SmartKeyState *s) : state(s) {
+        if (state != nullptr) {
+            state->setReplayingPacedKey(true);
+        }
+    }
+    ~ScopedPacedReplay() {
+        if (state != nullptr) {
+            state->setReplayingPacedKey(false);
+        }
+    }
+    ScopedPacedReplay(const ScopedPacedReplay &) = delete;
+    ScopedPacedReplay &operator=(const ScopedPacedReplay &) = delete;
+};
+
 } // namespace
 
 SmartKeyAddon::SmartKeyAddon(Instance *instance)
@@ -428,6 +444,7 @@ void SmartKeyAddon::focusOutContext(InputContext *ic) {
              s0 != "Idle" || state->hasPendingBoundary() ||
              state->isInLotusBurst(nowMs));
         flushPendingDelayedCommit(ic, state);
+        state->cancelPacedKeys();
         state->clearSelfReplaceGuard();
         state->resetLotusTracking();
         state->resetSurroundingTrust();
@@ -542,6 +559,7 @@ void SmartKeyAddon::resetContext(InputContext *ic) {
     auto *state = ic->propertyFor(&factory_);
     if (state != nullptr) {
         state->cancelPendingDelayedCommit();
+        state->cancelPacedKeys();
         state->clearSelfReplaceGuard();
         state->resetLotusTracking();
         state->resetSurroundingSync();
@@ -769,6 +787,65 @@ void SmartKeyAddon::flushPendingDelayedCommit(InputContext *ic,
     }
 }
 
+void SmartKeyAddon::scheduleNextPacedKey(InputContext *ic,
+                                         SmartKeyState *state) {
+    if (ic == nullptr || state == nullptr || !state->hasPacedKeys()) {
+        return;
+    }
+    if (instance_ == nullptr) {
+        replayNextPacedKey(ic, state);
+        return;
+    }
+    auto timer = instance_->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC,
+        fcitx::now(CLOCK_MONOTONIC) + LotusSameBatchPacer::kPaceDelayUsec, 0,
+        [this, icRef = ic->watch()](EventSourceTime *, uint64_t) {
+            if (auto *liveIc = icRef.get()) {
+                if (factory_.registered()) {
+                    if (auto *st = liveIc->propertyFor(&factory_)) {
+                        replayNextPacedKey(liveIc, st);
+                    }
+                }
+            }
+            return false;
+        });
+    if (timer) {
+        state->setPacedKeyTimer(std::move(timer));
+    } else {
+        replayNextPacedKey(ic, state);
+    }
+}
+
+void SmartKeyAddon::replayNextPacedKey(InputContext *ic,
+                                       SmartKeyState *state) {
+    if (ic == nullptr || state == nullptr) {
+        return;
+    }
+    if (!ic->hasFocus() || !isLotusActive(ic) ||
+        !isWaylandFrontend(ic->frontendName())) {
+        state->cancelPacedKeys();
+        return;
+    }
+    LotusSameBatchPacer::QueuedKey item{};
+    if (!state->popPacedKey(item)) {
+        return;
+    }
+    {
+        ScopedPacedReplay guard(state);
+        KeyEvent replayed(ic, item.rawKey, false, item.time);
+        const bool accepted = ic->keyEvent(replayed);
+        if (!accepted && !replayed.filtered()) {
+            ic->forwardKey(item.rawKey, false, item.time);
+            if (item.releaseSeen) {
+                ic->forwardKey(item.rawKey, true, item.releaseTime);
+            }
+        }
+    }
+    if (state->hasPacedKeys() && ic->hasFocus() && isLotusActive(ic)) {
+        scheduleNextPacedKey(ic, state);
+    }
+}
+
 void SmartKeyAddon::disarmSessionJustAutocorrected(SmartKeyState *state,
                                                    uint64_t nowMs) {
     if (state == nullptr || state->session() == nullptr || engine_ == nullptr) {
@@ -963,7 +1040,20 @@ void SmartKeyAddon::applyReplaceAction(InputContext *ic, SmartKeyState *state,
 }
 
 void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
-    if (engine_ == nullptr || keyEvent.isRelease()) {
+    if (engine_ == nullptr) {
+        return;
+    }
+    if (keyEvent.isRelease()) {
+        if (auto *ic = keyEvent.inputContext();
+            ic != nullptr && factory_.registered()) {
+            if (auto *state = ic->propertyFor(&factory_);
+                state != nullptr && state->hasPacedKeys() &&
+                !state->isReplayingPacedKey() &&
+                state->interceptPacedRelease(keyEvent.rawKey(),
+                                             keyEvent.time())) {
+                keyEvent.filterAndAccept();
+            }
+        }
         return;
     }
 
@@ -1015,6 +1105,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
     }
     if (profile == SMARTKEY_PROFILE_BYPASS) {
         state->cancelPendingDelayedCommit();
+        state->cancelPacedKeys();
         state->resetLotusTracking();
         state->resetSurroundingSync();
         return;
@@ -1140,10 +1231,29 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
             return;
         }
 
+        if (isWaylandFrontend(ic->frontendName()) && !isShortcutReset &&
+            !isModKey && !state->isReplayingPacedKey()) {
+            const bool isCharOrBoundary = (keyKind == SMARTKEY_KEY_CHAR);
+            if (state->shouldPaceLotusPress(nowMs, isCharOrBoundary)) {
+                const bool wasEmpty = !state->hasPacedKeys();
+                state->enqueuePacedKey(rawKey, keyEvent.time());
+                keyEvent.filterAndAccept();
+                state->setSuppressPostKey(true);
+                if (wasEmpty) {
+                    scheduleNextPacedKey(ic, state);
+                }
+                if (trace) {
+                    emitPreKey("lotus_paced_defer", s0, s0, chUtf8);
+                }
+                return;
+            }
+        }
+
         flushPendingDelayedCommit(ic, state);
 
         if (isShortcutReset) {
             state->markClientMutated();
+            state->cancelPacedKeys();
             state->resetLotusTracking();
             SmartKeyAction unused{};
             smartkey_session_process_key(state->session(), engine_,
@@ -1199,6 +1309,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         // Lotus has already modified the current word (covers mid-word English fallbacks and
         // tone-target shifts).
         if (keyKind == SMARTKEY_KEY_CHAR && !isSmartKeyBoundaryChar(codepoint)) {
+            state->noteForwardedLotusChar(nowMs);
             if (isTelexBurstTriggerChar(codepoint) ||
                 state->hasLotusActivityInWord()) {
                 state->armLotusBurst(nowMs);
@@ -1256,6 +1367,7 @@ void SmartKeyAddon::onKeyEvent(KeyEvent &keyEvent) {
         // `Enter`, `Tab`, and cursor nav: defer to `onPostKeyEvent` (if Lotus forwards) or
         // `onCommitString` (if Lotus filters the boundary to restore/commit).
         std::string_view outLabel;
+        state->clearLastForwardedLotusChar();
         if (keyKind == SMARTKEY_KEY_CHAR && isSmartKeyBoundaryChar(codepoint)) {
             state->armLotusBurst(nowMs);
             state->setPendingBoundary(codepoint);

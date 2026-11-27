@@ -692,6 +692,53 @@ void verifyMidwordPrefixReplaceGuard() {
     assert(hasPrecedingWordChar("đến hocj", 8, 2));
 }
 
+void verifyLotusSameBatchPacer() {
+    using fcitx::Key;
+    using fcitx::smartkey::LotusSameBatchPacer;
+
+    LotusSameBatchPacer pacer{};
+    assert(!pacer.hasQueued());
+    assert(!pacer.shouldPacePress(1000, true));
+
+    // 1. 0 ms, 1 ms, 2 ms char/boundary after noteForwardedChar(1000) -> paced; >= 3 ms -> not paced.
+    pacer.noteForwardedChar(1000);
+    assert(pacer.shouldPacePress(1000, true));
+    assert(pacer.shouldPacePress(1001, true));
+    assert(pacer.shouldPacePress(1002, true));
+    assert(!pacer.shouldPacePress(1003, true));
+    assert(!pacer.shouldPacePress(1001, false));
+
+    // 2. FIFO queue ordering: once queued, even BackSpace/Return (isCharOrBoundary=false) at 1004
+    //    must queue behind earlier entries instead of leapfrogging.
+    const Key keyA(FcitxKey_a, fcitx::KeyStates(), 38);
+    const Key keyD(FcitxKey_d, fcitx::KeyStates(), 40);
+    const Key keyBs(FcitxKey_BackSpace, fcitx::KeyStates(), 22);
+    pacer.enqueue(keyD, 100);
+    assert(pacer.hasQueued());
+    assert(pacer.shouldPacePress(1004, false));
+    pacer.enqueue(keyBs, 101);
+
+    // 3. Early release interception matches queued keyD, ignores already-forwarded keyA.
+    assert(!pacer.interceptRelease(keyA, 105));
+    assert(pacer.interceptRelease(keyD, 106));
+    assert(!pacer.interceptRelease(keyD, 107)); // already matched
+
+    // 4. `replaying = true` bypasses pacing so replayed keys flow cleanly through PreInputMethod.
+    pacer.replaying = true;
+    assert(!pacer.shouldPacePress(1000, true));
+    pacer.replaying = false;
+
+    LotusSameBatchPacer::QueuedKey popped{};
+    assert(pacer.popFront(popped));
+    assert(popped.rawKey.sym() == FcitxKey_d);
+    assert(popped.releaseSeen && popped.releaseTime == 106);
+
+    // 5. cancelAll clears remaining queue and lastPassChar timestamp.
+    pacer.cancelAll();
+    assert(!pacer.hasQueued());
+    assert(!pacer.shouldPacePress(1001, true));
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -701,6 +748,7 @@ int main(int argc, char *argv[]) {
     verifyTraceRecorderHelpers();
     verifyBackspaceCapabilityAndDroppedDeleteGuard();
     verifyMidwordPrefixReplaceGuard();
+    verifyLotusSameBatchPacer();
     if (argc < 2) {
         std::cerr << "usage: addon_load_smoke <libsmartkey.so>\n";
         return 2;

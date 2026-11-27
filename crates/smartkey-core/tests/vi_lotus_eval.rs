@@ -929,3 +929,49 @@ fn test_vi_lotus_shields_short_fuzzy_english_and_ascii_english_transpositions() 
         "docs list must cast test past này hoàng đến sóc móc "
     );
 }
+
+#[test]
+fn test_vi_lotus_backspace_on_multikey_telex_pops_to_screen_boundary() {
+    let (mut engine, mut session) = make_vi_engine_and_session();
+
+    // 1. `chuw` renders 3 screen chars (`chư`). Pressing BackSpace 3x must clear `buf`
+    //    completely rather than leaving stale `c` so `ko ` expands to `không `.
+    let mut screen = String::new();
+    for ch in ['c', 'h', 'u', 'w'] {
+        let out = session.process_key(&mut engine, KeyInput::Char(ch), 100);
+        apply_key_to_buffer(&mut screen, KeyInput::Char(ch), &out.action);
+    }
+    for _ in 0..3 {
+        let out = session.process_key(&mut engine, KeyInput::BackSpace, 250);
+        apply_key_to_buffer(&mut screen, KeyInput::BackSpace, &out.action);
+    }
+    let (after_ko, _) = type_sequence(&mut session, &mut engine, "ko ");
+    assert_eq!(after_ko, "không ");
+
+    // 2. `cos` renders 2 screen chars (`có`). 1x BackSpace deletes `ó` down to `c`, so
+    //    `buf` is `"c"` and subsequent `as ` forms `cas` (`cá`), NOT stale `coas` (`cáo`).
+    let _ = session.reset(&mut engine);
+    for ch in ['c', 'o', 's'] {
+        let _ = session.process_key(&mut engine, KeyInput::Char(ch), 500);
+    }
+    let _ = session.process_key(&mut engine, KeyInput::BackSpace, 650);
+    assert_eq!(session.debug_snapshot().active_buf, "c");
+    for ch in ['a', 's'] {
+        let _ = session.process_key(&mut engine, KeyInput::Char(ch), 700);
+    }
+    let out_sp = session.process_key(&mut engine, KeyInput::Char(' '), 740);
+    assert_eq!(out_sp.action, SessionAction::PassThrough);
+    assert_eq!(session.debug_snapshot().active_buf, "cas");
+
+    // 3. `dduowjc` renders 4 screen chars (`được`). 4x BackSpace clears `buf`, so `dc `
+    //    expands cleanly to `được `.
+    let _ = session.reset(&mut engine);
+    for ch in ['d', 'd', 'u', 'o', 'w', 'j', 'c'] {
+        let _ = session.process_key(&mut engine, KeyInput::Char(ch), 900);
+    }
+    for _ in 0..4 {
+        let _ = session.process_key(&mut engine, KeyInput::BackSpace, 1_050);
+    }
+    let (after_dc, _) = type_sequence(&mut session, &mut engine, "dc ");
+    assert_eq!(after_dc, "được ");
+}

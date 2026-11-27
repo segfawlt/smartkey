@@ -734,6 +734,99 @@ struct LotusBridgeTracker {
     }
 };
 
+/// Smooths same-packet (`<= 2 ms`) key rolls on Wayland when `fcitx5-lotus` is active so
+/// Fcitx5 flushes an unfiltered key on the IM Wayland socket before Lotus triggers a
+/// synchronous `zwp_virtual_keyboard_v1` roundtrip on its separate socket.
+struct LotusSameBatchPacer {
+    static constexpr uint64_t kSameBatchThresholdMs = 2;
+    static constexpr uint64_t kPaceDelayUsec = 5000;
+    static constexpr std::size_t kMaxQueueLen = 32;
+
+    struct QueuedKey {
+        Key rawKey{};
+        int time = 0;
+        bool releaseSeen = false;
+        int releaseTime = 0;
+    };
+
+    uint64_t lastPassCharMs = 0;
+    bool hasLastPassChar = false;
+    bool replaying = false;
+    std::vector<QueuedKey> queue{};
+    std::unique_ptr<EventSourceTime> timer{};
+
+    void noteForwardedChar(uint64_t nowMs) {
+        hasLastPassChar = true;
+        lastPassCharMs = nowMs;
+    }
+
+    void clearLastForwardedChar() {
+        hasLastPassChar = false;
+        lastPassCharMs = 0;
+    }
+
+    bool shouldPacePress(uint64_t nowMs, bool isCharOrBoundary) const {
+        if (replaying || queue.size() >= kMaxQueueLen) {
+            return false;
+        }
+        if (!queue.empty()) {
+            return true;
+        }
+        return hasLastPassChar && isCharOrBoundary &&
+               nowMs >= lastPassCharMs &&
+               (nowMs - lastPassCharMs) <= kSameBatchThresholdMs;
+    }
+
+    void enqueue(const Key &rawKey, int time) {
+        queue.push_back(QueuedKey{rawKey, time, false, 0});
+    }
+
+    bool interceptRelease(const Key &rawKey, int time) {
+        for (auto &entry : queue) {
+            if (entry.releaseSeen) {
+                continue;
+            }
+            const bool matches =
+                (rawKey.code() != 0 && entry.rawKey.code() == rawKey.code()) ||
+                (rawKey.code() == 0 && entry.rawKey.sym() == rawKey.sym());
+            if (matches) {
+                entry.releaseSeen = true;
+                entry.releaseTime = time;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool hasQueued() const { return !queue.empty(); }
+
+    bool popFront(QueuedKey &out) {
+        if (queue.empty()) {
+            return false;
+        }
+        out = queue.front();
+        queue.erase(queue.begin());
+        return true;
+    }
+
+    void setTimer(std::unique_ptr<EventSourceTime> nextTimer) {
+        if (timer) {
+            timer->setEnabled(false);
+        }
+        timer = std::move(nextTimer);
+    }
+
+    void cancelAll() {
+        if (timer) {
+            timer->setEnabled(false);
+            timer.reset();
+        }
+        queue.clear();
+        hasLastPassChar = false;
+        lastPassCharMs = 0;
+    }
+};
+
 /// Appends RFC 8259 JSON-escaped UTF-8 to `out`, substituting `\ufffd` for invalid UTF-8 bytes
 /// so every emitted trace line is guaranteed valid UTF-8 JSON.
 inline void appendJsonEscaped(std::string &out, std::string_view sv) {
@@ -1135,6 +1228,7 @@ public:
     }
     ~SmartKeyState() override {
         cancelPendingDelayedCommit();
+        cancelPacedKeys();
         if (session_ != nullptr) {
             smartkey_session_free(session_);
             session_ = nullptr;
@@ -1198,6 +1292,32 @@ public:
     void setSelfCommitting(bool v) { lotus_.selfCommitting = v; }
 
     void resetLotusTracking() { lotus_.reset(); }
+
+    void noteForwardedLotusChar(uint64_t nowMs) {
+        lotusPacer_.noteForwardedChar(nowMs);
+    }
+    void clearLastForwardedLotusChar() {
+        lotusPacer_.clearLastForwardedChar();
+    }
+    bool shouldPaceLotusPress(uint64_t nowMs, bool isCharOrBoundary) const {
+        return lotusPacer_.shouldPacePress(nowMs, isCharOrBoundary);
+    }
+    void enqueuePacedKey(const Key &rawKey, int time) {
+        lotusPacer_.enqueue(rawKey, time);
+    }
+    bool interceptPacedRelease(const Key &rawKey, int time) {
+        return lotusPacer_.interceptRelease(rawKey, time);
+    }
+    bool hasPacedKeys() const { return lotusPacer_.hasQueued(); }
+    bool popPacedKey(LotusSameBatchPacer::QueuedKey &out) {
+        return lotusPacer_.popFront(out);
+    }
+    void setPacedKeyTimer(std::unique_ptr<EventSourceTime> timer) {
+        lotusPacer_.setTimer(std::move(timer));
+    }
+    void cancelPacedKeys() { lotusPacer_.cancelAll(); }
+    bool isReplayingPacedKey() const { return lotusPacer_.replaying; }
+    void setReplayingPacedKey(bool v) { lotusPacer_.replaying = v; }
 
     void markClientMutated() { surroundingSync_.markClientMutated(); }
     void markSurroundingUpdated() { surroundingSync_.markSurroundingUpdated(); }
@@ -1295,6 +1415,7 @@ private:
     SmartKeySessionHandle *session_ = nullptr;
     uint32_t icId_ = 0;
     LotusBridgeTracker lotus_{};
+    LotusSameBatchPacer lotusPacer_{};
     SurroundingSyncTracker surroundingSync_{};
     SurroundingTraceDedup surroundDedup_{};
     SelfReplaceResetGuard selfReplaceGuard_{};
@@ -1337,6 +1458,8 @@ private:
     bool isTraceActive();
     bool canTraceContext(InputContext *ic, std::string_view appName);
     void flushPendingDelayedCommit(InputContext *ic, SmartKeyState *state);
+    void scheduleNextPacedKey(InputContext *ic, SmartKeyState *state);
+    void replayNextPacedKey(InputContext *ic, SmartKeyState *state);
     void disarmSessionJustAutocorrected(SmartKeyState *state, uint64_t nowMs);
     void applyDeleteAndCommit(InputContext *ic, SmartKeyState *state,
                               const SmartKeyAction &act);
